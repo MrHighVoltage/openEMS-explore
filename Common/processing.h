@@ -71,6 +71,8 @@ public:
 	void AddFrequency(std::vector<double> *freqs);
 
 	bool CheckTimestep();
+	//! Whether this processing would act at timestep \a ts, without CheckTimestep()'s side effects.
+	virtual bool IsDueAt(unsigned int ts) const;
 
 	//! Process data prior to the simulation run.
 	virtual void PreProcess() {};
@@ -188,6 +190,8 @@ public:
 
 	//! Invoke Process() on all Processings. Will return the smallest next iteration interval.
 	int Process();
+	//! Whether any processing would act at timestep \a ts (see Processing::IsDueAt()).
+	bool IsDueAt(unsigned int ts) const;
 
 	//! Invoke PostProcess() on all Processings.
 	void PostProcess();

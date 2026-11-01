@@ -104,6 +104,23 @@ bool Processing::CheckTimestep()
 	return false;
 }
 
+bool Processing::IsDueAt(unsigned int ts) const
+{
+	if (Enabled==false)
+		return false;
+	if (ts<startTS || ts>stopTS)
+		return false;
+	// CheckTimestep() consumes the step list in order; any step still ahead of
+	// m_PS_pos may come up.
+	if (find(m_ProcessSteps.begin() + std::min(m_PS_pos, m_ProcessSteps.size()), m_ProcessSteps.end(), ts) != m_ProcessSteps.end())
+		return true;
+	if (ProcessInterval && (ts%ProcessInterval==0))
+		return true;
+	if (m_FD_Interval && (ts%m_FD_Interval==0))
+		return true;
+	return false;
+}
+
 int Processing::GetNextInterval() const
 {
 	if (Enabled==false) return -1;
@@ -363,6 +380,14 @@ int ProcessingArray::Process()
 			nextProcess=step;
 	}
 	return nextProcess;
+}
+
+bool ProcessingArray::IsDueAt(unsigned int ts) const
+{
+	for (size_t i=0; i<ProcessArray.size(); ++i)
+		if (ProcessArray.at(i)->IsDueAt(ts))
+			return true;
+	return false;
 }
 
 void ProcessingArray::PostProcess()
