@@ -2051,6 +2051,11 @@ void openEMS::RunFDTD()
 			if (bench)
 				tsLeft = bench->Clamp(tsLeft, currTS);
 			if (speculativeNow > tsLeft) speculativeNow = tsLeft;
+			// `step` is the interval that led to this timestep; the next one is
+			// only reported by the PA->Process() below.  Stop at the next
+			// timestep a processing is due at, so that no batch runs past it.
+			for (int s = 1; s < speculativeNow; ++s)
+				if (PA->IsDueAt((unsigned int)currTS + s)) { speculativeNow = s; break; }
 			if (speculativeNow < 1) break;
 			// This call lands exactly on the next processing horizon iff
 			// speculativeNow == step; remember that now, since `step` is
