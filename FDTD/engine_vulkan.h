@@ -15,6 +15,9 @@
 #include "engine.h"
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <deque>
+#include <climits>
+#include <complex>
 #include <functional>
 #include <algorithm>
 #include <string>
@@ -120,13 +123,13 @@ public:
 	//! return from the CPU-side probe cache instead of VRAM.
 	void EnablePipelinedReading(bool enable) { m_pipelinedReading = enable; }
 	//! Check if pipelined processing is active and usable.
-	//! Probes use the probe cache; field dumps use the async download pipeline
-	//! (BeginAsyncFieldDownload). Either alone is enough to make the
-	//! speculative-submission loop worthwhile -- it's the submit-ahead
-	//! structure (next batch queued before this state's data is consumed)
-	//! that lets both overlap with GPU compute, not just the probe cache.
+	//! Probes read the probe cache and field dumps the cells the GPU gathered
+	//! at their timestep (RegisterDumpGather()), so neither needs the GPU to
+	//! still hold the timestep being processed, and the next batch can run
+	//! meanwhile.  A dump the GPU cannot serve reads the whole fields, which
+	//! only holds that timestep until the next batch is submitted.
 	bool HasPipelinedProcessing() const
-	{ return (m_hasGPU_Probes || m_hasFieldDumps) && !m_hasCPUExtensions; }
+	{ return (m_hasGPU_Probes || !m_dumps.empty()) && !m_hasCPUExtensions && !m_hostFieldReaders; }
 	//! Submit a speculative batch that does NOT advance the public numTS.
 	void SubmitSpeculative(unsigned int nTS);
 	//! Drain the speculative batch and advance numTS.
@@ -135,23 +138,16 @@ public:
 	void DrainGPU() const;
 
 	// --- Field access (lazy sync from GPU) --------------------------------
-	// Pure-GPU mode with ReBAR: DrainGPU() (typically a no-op since the
-	// ~50 µs compute is already done) then read directly from the
-	// persistently mapped VRAM pointer — zero copies.
-	// Hybrid mode / no-ReBAR fallback: download via staging buffer.
+	// Once the host copy is current, reads come from it.  Before that, a few
+	// scattered reads go straight to the ReBAR mapping; a bulk reader would pay
+	// an uncached PCIe read per value there (about 25 MB/s on an RX 6800), so
+	// past BarReadLimit() of them the fields come over by DMA instead.
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
 		if (m_recordingProbeAccess)
-		{
 			m_recordedCells.push_back((uint64_t)0 << 48 | linIdx);
-			// still need to return a value — use zero during recording
-			if (!m_gpuDrained) DrainGPU();
-			if (m_voltMapped) return m_voltMapped[linIdx];
-			if (m_hostDirty) SyncFieldsToHost();
-			return Engine::GetVolt(n,x,y,z);
-		}
-		if (m_pipelinedReading)
+		else if (m_pipelinedReading)
 		{
 			const uint64_t key = (uint64_t)0 << 48 | linIdx;
 			auto it = std::lower_bound(m_probeCacheKeys.begin(), m_probeCacheKeys.end(), key);
@@ -164,9 +160,15 @@ public:
 			// Fallback: not in cache — must drain GPU
 		}
 		if (!m_gpuDrained) DrainGPU();
-		if (m_voltMapped)
-			return m_voltMapped[linIdx];
-		if (m_hostDirty) SyncFieldsToHost();
+		if (m_hostDirty)
+		{
+			if (m_voltMapped && m_barReads < BarReadLimit())
+			{
+				++m_barReads;
+				return m_voltMapped[linIdx];
+			}
+			SyncFieldsToHost();
+		}
 		return Engine::GetVolt(n,x,y,z);
 	}
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
@@ -175,14 +177,8 @@ public:
 	{
 		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
 		if (m_recordingProbeAccess)
-		{
 			m_recordedCells.push_back((uint64_t)1 << 48 | linIdx);
-			if (!m_gpuDrained) DrainGPU();
-			if (m_currMapped) return m_currMapped[linIdx];
-			if (m_hostDirty) SyncFieldsToHost();
-			return Engine::GetCurr(n,x,y,z);
-		}
-		if (m_pipelinedReading)
+		else if (m_pipelinedReading)
 		{
 			const uint64_t key = (uint64_t)1 << 48 | linIdx;
 			auto it = std::lower_bound(m_probeCacheKeys.begin(), m_probeCacheKeys.end(), key);
@@ -194,9 +190,15 @@ public:
 			m_probeCacheMisses++;
 		}
 		if (!m_gpuDrained) DrainGPU();
-		if (m_currMapped)
-			return m_currMapped[linIdx];
-		if (m_hostDirty) SyncFieldsToHost();
+		if (m_hostDirty)
+		{
+			if (m_currMapped && m_barReads < BarReadLimit())
+			{
+				++m_barReads;
+				return m_currMapped[linIdx];
+			}
+			SyncFieldsToHost();
+		}
 		return Engine::GetCurr(n,x,y,z);
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
@@ -216,21 +218,43 @@ public:
 	//! Copy CPU shadow → GPU buffers (after CPU-side extension modifications).
 	void SyncFieldsToDevice();
 
-	// --- Async field-dump download (overlaps large dump readback with GPU compute) ---
-	//! Tell the engine whether any GPU field dumps (ProcessFields) are registered.
-	//! Gates the speculative pre-fetch below; a no-op (safe) when left false.
-	void SetHasFieldDumps(bool v) { m_hasFieldDumps = v; }
-	bool HasFieldDumps() const { return m_hasFieldDumps; }
-	//! True if a second, independent hardware queue is available for the
-	//! dump download pipeline (see SetupDumpTransferQueue()).
-	bool HasDumpTransferQueue() const { return m_hasDumpQueue; }
-	//! Kick off (non-blocking on the CPU) a snapshot + download of the
-	//! current committed field state for an upcoming dump, so the slow PCIe
-	//! leg runs concurrently with the next speculative GPU batch and with
-	//! CPU-side processing. SyncFieldsToHost() picks up the result lazily.
-	//! Safe to call even when no dump is imminent (self-flushes any stale
-	//! pending request first) or when the dump queue isn't available (no-op).
-	void BeginAsyncFieldDownload();
+	// --- Field dumps ------------------------------------------------------
+	//! The raw cells a field dump reads: all three components of one field
+	//! (volt or curr) on the tensor product of three sorted lists of grid lines.
+	struct DumpFootprint
+	{
+		bool curr = false;
+		std::vector<uint32_t> lines[3];
+		uint64_t Count() const { return 3ull * lines[0].size() * lines[1].size() * lines[2].size(); }
+	};
+	//! Register a time-domain dump.  Every batch that ends on a timestep ts
+	//! with due(ts) gathers the footprint into a host-visible ring slot, so the
+	//! dump needs neither a drain nor the whole fields.  Returns the dump's id,
+	//! or -1 if the engine cannot serve it (the dump then reads whole fields).
+	//! Registration closes when the first batch is recorded.
+	int RegisterDumpGather(const DumpFootprint& fp, std::function<bool(unsigned int)> due);
+	//! Register a frequency-domain dump: at every timestep ts with due(ts) the
+	//! GPU adds raw(ts) * w_k(ts) to a running sum for each of numFreq
+	//! frequencies, weights(ts, w) supplying the w_k.  Returns -1 if the sums
+	//! do not fit, or the engine cannot serve the dump.
+	int RegisterDumpDFT(const DumpFootprint& fp, unsigned int numFreq,
+	                    std::function<bool(unsigned int)> due,
+	                    std::function<void(unsigned int, std::complex<float>*)> weights);
+	//! The footprint of dump `id` at timestep ts, as [n][a][b][c] floats, or
+	//! nullptr if the GPU no longer holds that timestep.
+	const float* AcquireDumpGather(int id, unsigned int ts);
+	//! Account for timestep ts in the DFT of dump `id`: the batch ending there
+	//! normally added it already, otherwise it is added now.  False if the GPU
+	//! no longer holds that timestep.
+	bool AddDumpDFTSample(int id, unsigned int ts);
+	//! The DFT sums of dump `id`, as [k][n][a][b][c] complex values, and the
+	//! number of timesteps they hold.
+	bool ReadDumpDFT(int id, std::vector<std::complex<float>>& sums, unsigned int& samples);
+	//! True if the host copy of the fields is timestep ts.
+	bool HostFieldsAt(unsigned int ts) const { return !m_hostDirty && m_liveTS == ts; }
+	//! Whether any enabled field dump reads the whole fields, so that the run
+	//! must not compute ahead of the processing (see HasPipelinedProcessing()).
+	void SetHostFieldReaders(bool v) { m_hostFieldReaders = v; }
 
 protected:
 	Engine_Vulkan(const Operator* op);
@@ -298,9 +322,7 @@ private:
 	// ---- Command / sync -----------------------------------------------
 	// Double-buffered command submission: IterateTS records pure FDTD
 	// compute into m_cmdBufs[m_cmdIdx] and submits fire-and-forget.
-	// The next call uses the other slot. GetVolt/GetCurr calls DrainGPU()
-	// (usually a no-op, ~50 µs compute already done) then reads directly
-	// from the ReBAR-mapped VRAM pointer — zero copies, zero stalls.
+	// The next call uses the other slot.
 	VkCommandPool   m_cmdPool;
 	VkCommandBuffer m_cmdBufs[CMD_RING_SIZE];   //!< Ring-buffered FDTD + copy command buffers
 	VkCommandBuffer m_utilCmdBuf;   //!< Utility cmd buf (uploads, hybrid path)
@@ -308,6 +330,9 @@ private:
 	VkFence         m_utilFence;    //!< Fence for utility (upload/download) work
 	int             m_cmdIdx;       //!< Index into m_cmdBufs/m_fences ring
 	mutable bool    m_gpuInFlight[CMD_RING_SIZE]; //!< Whether m_cmdBufs[i] is submitted but not waited
+	uint64_t        m_submitSerial[CMD_RING_SIZE] = {}; //!< m_submitCount at m_cmdBufs[i]'s last submit
+	uint64_t        m_submitCount = 0;
+	int             m_iterateDepth = 0; //!< IterateTS() nesting (it splits long batches)
 
 	// Optional transfer-queue path for probe output copies
 	VkCommandPool   m_transferCmdPool;
@@ -317,7 +342,15 @@ private:
 	mutable bool    m_probeTransferInFlight[CMD_RING_SIZE];
 
 	// ---- State --------------------------------------------------------
+	//! The host copy differs from the device fields.
 	mutable bool m_hostDirty;
+	//! The timestep the device fields hold once the submitted batches are
+	//! done; ahead of numTS while a speculative batch is uncommitted.
+	unsigned int m_liveTS = 0;
+	//! Scattered field reads served from the ReBAR mapping since the fields
+	//! last changed; see GetVolt().
+	mutable size_t m_barReads = 0;
+	size_t BarReadLimit() const { return std::max<size_t>(1024, (size_t)m_fieldN / 256); }
 	bool         m_deviceDirty;
 	bool         m_hasCPUExtensions;
 	bool         m_hasGPUExcitation;
@@ -837,55 +870,77 @@ private:
 	                                   const VkBuffer* bufs, const VkDeviceSize* sizes,
 	                                   uint32_t count);
 
-	// ---- Async field-dump download --------------------------------------
-	// Full-field dumps (ProcessFields) need the *entire* volt/curr buffers,
-	// not the sparse cells the probe cache covers. On a discrete GPU that
-	// download is large (hundreds of MB) and, before this, was a single
-	// blocking copy on the compute queue: DrainGPU() + vkCmdCopyBuffer +
-	// vkWaitForFences with nothing else in flight. The pipeline below
-	// replaces that with two stages on an independent hardware queue:
-	//   1. live buffers -> device-local "snapshot" buffers (VRAM-VRAM, fast,
-	//      bandwidth-bound only; must finish before the *next* speculative
-	//      batch overwrites the live buffers in place).
-	//   2. snapshot -> host-visible staging (PCIe, slow) -- runs fully
-	//      concurrently with subsequent GPU compute and CPU-side PA::Process()
-	//      work, since stage 1 already froze the source.
-	// FinishAsyncFieldDownload() (called lazily from SyncFieldsToHost) just
-	// waits on stage 2's fence and memcpy's into the CPU shadow arrays.
-	bool     m_hasFieldDumps = false;   //!< Set via SetHasFieldDumps() by the caller
-	bool     m_hasDumpQueue  = false;   //!< True once a 2nd hw queue was found & buffers created
-	uint32_t m_dumpQueueFamily = 0;
-	VkQueue  m_dumpQueue = VK_NULL_HANDLE;
-	VkCommandPool m_dumpCmdPool     = VK_NULL_HANDLE; //!< On m_computeQueueFamily (stage 1)
-	VkCommandPool m_dumpXferCmdPool = VK_NULL_HANDLE; //!< On m_dumpQueueFamily (stage 2)
+	// ---- Field dumps ------------------------------------------------------
+	// A dump registers the raw cells it reads (its footprint).  Every batch
+	// that ends on a timestep where a dump is due gathers those cells at its
+	// end, in the same command buffer, into a host-visible ring slot, or adds
+	// them to the dump's DFT sums.  Nothing waits for that: the dump reads the
+	// slot after the batch's fence, while the next batch runs.  A full-field
+	// dump moves one field instead of volt and curr, a plane dump a few planes.
+	struct DumpReg
+	{
+		bool curr = false;
+		bool dft = false;
+		uint32_t n[3] = {0, 0, 0};
+		uint32_t lineOff = 0;     //!< first of its n[0]+n[1]+n[2] lines in m_dumpLinesBuf
+		uint32_t count = 0;       //!< 3*n[0]*n[1]*n[2]
+		std::vector<uint32_t> lines;
+		std::function<bool(unsigned int)> due;
+		uint64_t slotOff = 0;     //!< gather: floats into a ring slot
+		// DFT
+		uint32_t numFreq = 0;
+		uint32_t weightOff = 0;   //!< complex weights into one weight region
+		std::function<void(unsigned int, std::complex<float>*)> weights;
+		GpuBuf sums;              //!< numFreq*count complex floats, device-local
+		VkDescriptorSet set = VK_NULL_HANDLE;
+		std::deque<unsigned int> recorded; //!< timesteps added on the GPU, not yet accounted for
+		unsigned int samples = 0; //!< timesteps accounted for
+	};
+	struct DumpSlot
+	{
+		GpuBuf buf;
+		float* mapped = nullptr;
+		VkDescriptorSet set = VK_NULL_HANDLE;
+		unsigned int ts = UINT_MAX; //!< timestep held, UINT_MAX = none
+		int cmdSlot = -1;           //!< m_cmdBufs slot whose batch writes it, -1 = written
+		uint64_t serial = 0;        //!< that batch's m_submitSerial
+		std::vector<char> has;      //!< per dump: gathered into this slot
+	};
+	static constexpr size_t MAX_DUMP_SLOTS = 8;
+	std::vector<DumpReg>  m_dumps;
+	std::vector<DumpSlot> m_dumpSlots;
+	bool         m_dumpReady = false;    //!< buffers, pipelines and sets exist; registration closed
+	bool         m_hostFieldReaders = false;
+	unsigned int m_dumpKeepFrom = 0;     //!< ring slots from this timestep on may still be read
+	uint64_t     m_dumpSlotFloats = 0;   //!< all gathered footprints, one ring slot
+	uint32_t     m_dumpFreqs = 0;        //!< all DFT weights, one weight region
+	VkDeviceSize m_dumpSumBytes = 0;     //!< all DFT sums
+	GpuBuf       m_dumpLinesBuf;
+	GpuBuf       m_dumpWeightBuf;        //!< CMD_RING_SIZE+1 weight regions, host-visible
+	std::complex<float>* m_dumpWeightMapped = nullptr;
+	VkDescriptorSetLayout m_dumpDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout      m_dumpPipeLayout = VK_NULL_HANDLE;
+	VkPipeline            m_dumpGatherPipeline = VK_NULL_HANDLE;
+	VkPipeline            m_dumpDFTPipeline = VK_NULL_HANDLE;
+	VkDescriptorPool      m_dumpDescPool = VK_NULL_HANDLE;
+	mutable bool m_warnedStaleRead = false;
+	bool         m_warnedDumpSlots = false;
+	struct DumpPC { uint32_t n0, n1, n2, lineOff, curr, NyNz, Nz, N, outOff, numFreq, weightOff, count; };
 
-	static constexpr int DUMP_RING = 2; //!< Double-buffered so a still-in-flight
-	                                     //!< previous request never blocks a new one.
-	VkCommandBuffer m_dumpSnapshotCmdBuf[DUMP_RING] = {};
-	VkCommandBuffer m_dumpStagingCmdBuf[DUMP_RING]  = {};
-	VkFence     m_dumpSnapshotFence[DUMP_RING] = {};
-	VkFence     m_dumpStagingFence[DUMP_RING]  = {};
-	VkSemaphore m_dumpSnapshotSem[DUMP_RING]   = {}; //!< stage1 signal -> stage2 wait
-	bool        m_dumpSlotInFlight[DUMP_RING]  = {}; //!< stage2 submitted, fence not yet waited
-
-	// Snapshot buffers must be readable from both queue families, so they
-	// use VK_SHARING_MODE_CONCURRENT (avoids manual ownership-transfer
-	// barriers for what is a rare, non-hot-path transfer).
-	GpuBuf m_dumpSnapVolt[DUMP_RING];
-	GpuBuf m_dumpSnapCurr[DUMP_RING];
-	GpuBuf m_dumpStageVolt[DUMP_RING]; //!< Host-visible+coherent, persistently mapped
-	GpuBuf m_dumpStageCurr[DUMP_RING];
-	FDTD_FLOAT* m_dumpStageVoltMapped[DUMP_RING] = {};
-	FDTD_FLOAT* m_dumpStageCurrMapped[DUMP_RING] = {};
-
-	bool m_dumpBuffersReady  = false; //!< Lazily created on first BeginAsyncFieldDownload()
-	bool m_dumpAsyncPending  = false;
-	int  m_dumpAsyncIdx      = 0;     //!< Slot currently holding the pending request
-	int  m_dumpNextIdx       = 0;     //!< Slot to use for the next request
-
-	void EnsureDumpBuffers();
-	void FinishAsyncFieldDownload();
-	void CleanupDumpAsync();
+	bool CheckDumpFootprint(const DumpFootprint& fp, const char* what) const;
+	int  AddDump(const DumpFootprint& fp, std::function<bool(unsigned int)> due);
+	//! Create the lines buffer, the pipelines and the DFT sums' sets, once.
+	void EnsureDumpResources();
+	VkDescriptorSet AllocDumpSet(VkBuffer out, VkDeviceSize outBytes);
+	//! The ring slot for timestep ts: the one holding it already, else an
+	//! empty one or one older than keepFrom.  Null if no slot can be made.
+	DumpSlot* TakeDumpSlot(unsigned int ts, unsigned int keepFrom);
+	void WaitDumpSlot(DumpSlot& slot) const;
+	DumpPC DumpPushConstants(const DumpReg& d) const;
+	//! Gather and DFT dispatches for the dumps due at ts, at the end of a batch.
+	void RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts);
+	void RecordDumpDFT(VkCommandBuffer cmd, DumpReg& d, uint32_t region, unsigned int ts);
+	void CleanupDumps();
 };
 
 #endif // WITH_GPU

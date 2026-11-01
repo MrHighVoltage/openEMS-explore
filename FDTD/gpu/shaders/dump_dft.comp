@@ -1,0 +1,49 @@
+/*
+ * Frequency-domain field-dump shader.
+ *
+ * One thread per footprint value (see dump_gather.comp): reads the value
+ * and adds value * w[k] to the running sum of every frequency k, laid out
+ * [k][n][a][b][c].  The host computes the weights w[k] for the timestep,
+ * exactly as the CPU dump does, and interpolates the dump from the sums
+ * once at the end.  The interpolation is linear, so that is the same as
+ * summing the interpolated fields.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly buffer VoltBuf   { float volt[];  };
+layout(set=0, binding=1) readonly buffer CurrBuf   { float curr[];  };
+layout(set=0, binding=2) readonly buffer LineBuf   { uint  lines[]; };
+layout(set=0, binding=3)          buffer SumBuf    { vec2  sums[];  };
+layout(set=0, binding=4) readonly buffer WeightBuf { vec2  w[];     };
+
+layout(push_constant) uniform PC {
+    uint n0, n1, n2;
+    uint lineOff;
+    uint useCurr;
+    uint NyNz, Nz, N;
+    uint outOff;       // unused here
+    uint numFreq;
+    uint weightOff;    // first weight in w[]
+    uint count;        // 3*n0*n1*n2, the stride between frequencies
+};
+
+void main()
+{
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= count) return;
+
+    uint plane = n1 * n2;
+    uint n = e / (n0 * plane);
+    uint r = e - n * n0 * plane;
+    uint a = r / plane;
+    r -= a * plane;
+    uint b = r / n2;
+    uint c = r - b * n2;
+
+    uint src = n * N + lines[lineOff + a] * NyNz + lines[lineOff + n0 + b] * Nz + lines[lineOff + n0 + n1 + c];
+    float v = (useCurr != 0u) ? curr[src] : volt[src];
+    for (uint k = 0u; k < numFreq; ++k)
+        sums[k * count + e] += v * w[weightOff + k];
+}

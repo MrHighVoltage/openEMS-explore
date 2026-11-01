@@ -1,0 +1,43 @@
+/*
+ * Field-dump gather shader.
+ *
+ * One thread per footprint value: copies all three components of one field
+ * (volt or curr) on the tensor product of three lists of grid lines into a
+ * compact, host-visible ring slot, laid out [n][a][b][c].  The host then
+ * interpolates the dump from that instead of from the whole fields.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly  buffer VoltBuf { float volt[];  };
+layout(set=0, binding=1) readonly  buffer CurrBuf { float curr[];  };
+layout(set=0, binding=2) readonly  buffer LineBuf { uint  lines[]; };  // a-lines, b-lines, c-lines
+layout(set=0, binding=3) writeonly buffer OutBuf  { float outv[];  };
+
+layout(push_constant) uniform PC {
+    uint n0, n1, n2;   // lines per direction
+    uint lineOff;      // first a-line in lines[]
+    uint useCurr;      // 0 = volt, 1 = curr
+    uint NyNz, Nz, N;  // grid strides, N = cells per component
+    uint outOff;       // first value in outv[]
+    uint numFreq, weightOff;  // unused here
+    uint count;        // 3*n0*n1*n2
+};
+
+void main()
+{
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= count) return;
+
+    uint plane = n1 * n2;
+    uint n = e / (n0 * plane);
+    uint r = e - n * n0 * plane;
+    uint a = r / plane;
+    r -= a * plane;
+    uint b = r / n2;
+    uint c = r - b * n2;
+
+    uint src = n * N + lines[lineOff + a] * NyNz + lines[lineOff + n0 + b] * Nz + lines[lineOff + n0 + n1 + c];
+    outv[outOff + e] = (useCurr != 0u) ? curr[src] : volt[src];
+}

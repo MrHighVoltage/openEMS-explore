@@ -678,6 +678,7 @@ void Engine_Vulkan::Init()
 
 	m_hostDirty  = false;
 	m_deviceDirty = false;
+	m_liveTS = numTS;
 
 	// Print GPU info
 	VkPhysicalDeviceProperties props;
@@ -711,7 +712,7 @@ void Engine_Vulkan::Init()
 			     << " (tables: " << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
 	}
 	if (m_voltMapped)
-		cout << "  ReBAR active — zero-copy CPU field reads from VRAM" << endl;
+		cout << "  ReBAR active — scattered CPU field reads from VRAM, bulk reads by DMA" << endl;
 	else
 		cout << "  ReBAR not available — using staging buffer for field sync" << endl;
 	if (!s_preferReBARFieldBuffers)
@@ -896,48 +897,6 @@ void Engine_Vulkan::InitVulkan()
 	m_transferQueueFamily = m_computeQueueFamily;
 	m_hasDedicatedTransferQueue = false;
 
-	bool dumpAsyncDisabled = false;
-	if (const char* env = std::getenv("OPENEMS_GPU_DISABLE_DUMP_ASYNC"))
-	{
-		char* endPtr = nullptr;
-		long v = std::strtol(env, &endPtr, 10);
-		dumpAsyncDisabled = (endPtr && *endPtr == '\0' && v != 0);
-	}
-
-	// A second, genuinely independent queue for the large field-dump download
-	// pipeline (see SetupDumpTransferQueue()). Unlike the probe/transfer queue
-	// above, dump downloads move hundreds of MB, so a real concurrent hardware
-	// queue is worth the extra device-queue setup. Prefer a family that has
-	// COMPUTE+TRANSFER but not GRAPHICS (an async-compute/DMA-capable family
-	// on most discrete GPUs) and more than one queue, distinct from whichever
-	// family m_computeQueueFamily landed on above.
-	uint32_t qfCount = 0;
-	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, nullptr);
-	std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-	vkGetPhysicalDeviceQueueFamilyProperties(m_physDevice, &qfCount, qfProps.data());
-
-	bool haveDumpFamily = false;
-	uint32_t bestScore = 0;
-	for (uint32_t i = 0; i < qfCount && !dumpAsyncDisabled; i++)
-	{
-		if (i == m_computeQueueFamily) continue;
-		const auto& p = qfProps[i];
-		if (!(p.queueFlags & VK_QUEUE_TRANSFER_BIT) && !(p.queueFlags & VK_QUEUE_COMPUTE_BIT))
-			continue;
-		bool noGraphics = !(p.queueFlags & VK_QUEUE_GRAPHICS_BIT);
-		uint32_t score = (noGraphics ? 2u : 0u) + ((p.queueFlags & VK_QUEUE_COMPUTE_BIT) ? 1u : 0u);
-		if (!haveDumpFamily || score > bestScore)
-		{
-			m_dumpQueueFamily = i;
-			haveDumpFamily = true;
-			bestScore = score;
-		}
-	}
-	// m_hasDumpQueue is only latched true once the device/queue/pool below
-	// are actually created; EnsureDumpBuffers() checks it again before
-	// touching any of this, so a failure anywhere just disables the feature.
-	m_hasDumpQueue = haveDumpFamily;
-
 	// --- Logical device ---
 	float priority = 1.0f;
 	std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -955,15 +914,6 @@ void Engine_Vulkan::InitVulkan()
 		transferQueueInfo.queueCount = 1;
 		transferQueueInfo.pQueuePriorities = &priority;
 		queueInfos.push_back(transferQueueInfo);
-	}
-	if (m_hasDumpQueue)
-	{
-		VkDeviceQueueCreateInfo dumpQueueInfo{};
-		dumpQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-		dumpQueueInfo.queueFamilyIndex = m_dumpQueueFamily;
-		dumpQueueInfo.queueCount = 1;
-		dumpQueueInfo.pQueuePriorities = &priority;
-		queueInfos.push_back(dumpQueueInfo);
 	}
 
 	// --- Negotiate optional features ---------------------------------------
@@ -1034,22 +984,6 @@ void Engine_Vulkan::InitVulkan()
 
 	vkGetDeviceQueue(m_device, m_computeQueueFamily, 0, &m_computeQueue);
 	vkGetDeviceQueue(m_device, m_transferQueueFamily, 0, &m_transferQueue);
-	if (m_hasDumpQueue)
-	{
-		vkGetDeviceQueue(m_device, m_dumpQueueFamily, 0, &m_dumpQueue);
-
-		VkCommandPoolCreateInfo dumpPoolInfo{};
-		dumpPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-		dumpPoolInfo.queueFamilyIndex = m_computeQueueFamily;
-		dumpPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-		VkCommandPoolCreateInfo dumpXferPoolInfo = dumpPoolInfo;
-		dumpXferPoolInfo.queueFamilyIndex = m_dumpQueueFamily;
-		if (vkCreateCommandPool(m_device, &dumpPoolInfo, nullptr, &m_dumpCmdPool) != VK_SUCCESS ||
-		    vkCreateCommandPool(m_device, &dumpXferPoolInfo, nullptr, &m_dumpXferCmdPool) != VK_SUCCESS)
-		{
-			m_hasDumpQueue = false;
-		}
-	}
 
 	// --- Command pool + buffer ---
 	VkCommandPoolCreateInfo poolInfo{};
@@ -4050,28 +3984,25 @@ void Engine_Vulkan::DrainGPU() const
 
 void Engine_Vulkan::SyncFieldsToHost() const
 {
-	if (m_dumpAsyncPending)
-	{
-		// A BeginAsyncFieldDownload() request is already in flight (or done) on
-		// the dump queue -- just wait for it and copy into the CPU shadow, no
-		// need to also drain/re-copy on the compute queue.
-		const_cast<Engine_Vulkan*>(this)->FinishAsyncFieldDownload();
-		return;
-	}
 	DrainGPU();  // ensure all pending GPU work is complete
 	if (!m_hostDirty) return;
-	if (m_voltMapped && m_currMapped)
+	// After SubmitSpeculative() the buffers hold a later timestep than the one
+	// being processed, and the processed one is gone.  Field dumps avoid this
+	// by gathering at their timestep; whatever still gets here reads ahead.
+	if (m_speculativeTS > 0 && !m_warnedStaleRead)
 	{
-		std::memcpy(volt_ptr->data(), m_voltMapped, m_fieldBufSize);
-		std::memcpy(curr_ptr->data(), m_currMapped, m_fieldBufSize);
+		cerr << "Engine_Vulkan: warning: whole-field read during a speculative batch; "
+		     << "the values are from timestep " << (numTS + m_speculativeTS)
+		     << ", not " << numTS << "." << endl;
+		m_warnedStaleRead = true;
 	}
-	else
-	{
-		const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
-			m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-		const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
-			m_currBuf, curr_ptr->data(), m_fieldBufSize);
-	}
+	// Always by DMA into the cached staging buffer, even with ReBAR: a CPU
+	// read of mapped VRAM is an uncached PCIe read per load, about 25 MB/s on
+	// an RX 6800, which made a 64^3 field sync take 250 ms.
+	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+		m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
+		m_currBuf, curr_ptr->data(), m_fieldBufSize);
 	m_hostDirty = false;
 }
 
@@ -4092,249 +4023,533 @@ void Engine_Vulkan::SyncFieldsToDevice()
 	m_deviceDirty = false;
 }
 
-void Engine_Vulkan::EnsureDumpBuffers()
+// ===========================================================================
+// Field dumps: the footprint gathered, or Fourier-summed, on the GPU
+// ===========================================================================
+
+// OPENEMS_GPU_DUMP_GATHER=0 sends every dump through the whole-field path,
+// OPENEMS_GPU_DUMP_DFT=0 makes frequency-domain dumps gather each sample and
+// sum on the host as the CPU engines do.  Both are for A/B comparisons.
+static bool DumpEnvOff(const char* name)
 {
-	if (m_dumpBuffersReady || !m_hasDumpQueue) return;
-	// ReBAR fields are already directly host-mapped -- the async pipeline's
-	// whole point is to hide a staging-buffer PCIe copy, so there is nothing
-	// to gain here (and DrainGPU() + memcpy is already fast in that case).
-	if (m_voltMapped && m_currMapped) { m_hasDumpQueue = false; return; }
+	const char* env = std::getenv(name);
+	return env && std::string(env) == "0";
+}
 
-	VkBufferUsageFlags snapUsage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	VkMemoryPropertyFlags dLoc    = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	VkMemoryPropertyFlags host    = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	// HOST_VISIBLE|HOST_COHERENT alone is satisfied by write-combined memory
-	// on this driver -- fine for the CPU *writing* into GPU-visible memory
-	// (the upload path elsewhere), catastrophic for *reading* it back: a
-	// plain memcpy() out of uncached mapped memory measured ~260 MB/s here
-	// (2+ seconds for a 564 MB dump) vs. the ~26 ms the underlying PCIe copy
-	// itself takes. HOST_CACHED turns that memcpy into an ordinary cached
-	// read. Try it first; fall back to the plain flags on drivers that don't
-	// expose a cached host-visible type.
-	VkMemoryPropertyFlags hostCached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-
-	uint32_t sharingFamilies[2] = {m_computeQueueFamily, m_dumpQueueFamily};
-
-	auto createStaging = [&](GpuBuf& gb) -> bool
+bool Engine_Vulkan::CheckDumpFootprint(const DumpFootprint& fp, const char* what) const
+{
+	for (int d = 0; d < 3; ++d)
 	{
-		return TryCreateBufferWithMemory(m_fieldBufSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		                                  hostCached, gb.buffer, gb.memory) ||
-		       TryCreateBufferWithMemory(m_fieldBufSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		                                  host, gb.buffer, gb.memory);
+		const std::vector<uint32_t>& l = fp.lines[d];
+		for (size_t i = 0; i < l.size(); ++i)
+			if (l[i] >= numLines[d] || (i > 0 && l[i] <= l[i-1]))
+			{
+				cerr << "Engine_Vulkan::" << what << ": footprint lines out of order or range" << endl;
+				return false;
+			}
+		if (l.empty())
+			return false;
+	}
+	// The shaders index the footprint with 32 bits.
+	return fp.Count() < (1ull << 32);
+}
+
+int Engine_Vulkan::AddDump(const DumpFootprint& fp, std::function<bool(unsigned int)> due)
+{
+	DumpReg d;
+	d.curr = fp.curr;
+	for (int k = 0; k < 3; ++k)
+	{
+		d.n[k] = (uint32_t)fp.lines[k].size();
+		d.lines.insert(d.lines.end(), fp.lines[k].begin(), fp.lines[k].end());
+	}
+	d.count = (uint32_t)fp.Count();
+	d.due = std::move(due);
+	m_dumps.push_back(std::move(d));
+	return (int)m_dumps.size() - 1;
+}
+
+int Engine_Vulkan::RegisterDumpGather(const DumpFootprint& fp, std::function<bool(unsigned int)> due)
+{
+	if (m_dumpReady || DumpEnvOff("OPENEMS_GPU_DUMP_GATHER") || !CheckDumpFootprint(fp, "RegisterDumpGather"))
+		return -1;
+	// One ring slot holds the footprints of all gathered dumps.
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(m_physDevice, &props);
+	if ((m_dumpSlotFloats + fp.Count()) * sizeof(float) > props.limits.maxStorageBufferRange)
+		return -1;
+	const int id = AddDump(fp, std::move(due));
+	m_dumps[id].slotOff = m_dumpSlotFloats;
+	m_dumpSlotFloats += m_dumps[id].count;
+	return id;
+}
+
+int Engine_Vulkan::RegisterDumpDFT(const DumpFootprint& fp, unsigned int numFreq,
+                                   std::function<bool(unsigned int)> due,
+                                   std::function<void(unsigned int, std::complex<float>*)> weights)
+{
+	if (m_dumpReady || numFreq == 0 || DumpEnvOff("OPENEMS_GPU_DUMP_GATHER") || DumpEnvOff("OPENEMS_GPU_DUMP_DFT") ||
+	    !CheckDumpFootprint(fp, "RegisterDumpDFT"))
+		return -1;
+	const VkDeviceSize bytes = (VkDeviceSize)numFreq * fp.Count() * sizeof(std::complex<float>);
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(m_physDevice, &props);
+	if (bytes > props.limits.maxStorageBufferRange)
+		return -1;
+	// The sums may take a quarter of the device-local heap.  Beyond that the
+	// dump gathers every sample and sums on the host instead.
+	VkPhysicalDeviceMemoryProperties mp;
+	vkGetPhysicalDeviceMemoryProperties(m_physDevice, &mp);
+	VkDeviceSize heap = 0;
+	for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
+		if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+			heap = std::max(heap, mp.memoryHeaps[i].size);
+	if (m_dumpSumBytes + bytes > heap / 4)
+		return -1;
+	GpuBuf sums;
+	if (!TryCreateBufferWithMemory(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+	                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	                               sums.buffer, sums.memory))
+		return -1;
+	const int id = AddDump(fp, std::move(due));
+	DumpReg& d = m_dumps[id];
+	d.dft = true;
+	d.numFreq = numFreq;
+	d.weightOff = m_dumpFreqs;
+	d.weights = std::move(weights);
+	d.sums = sums;
+	m_dumpFreqs += numFreq;
+	m_dumpSumBytes += bytes;
+	return id;
+}
+
+VkDescriptorSet Engine_Vulkan::AllocDumpSet(VkBuffer out, VkDeviceSize outBytes)
+{
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_dumpDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts        = &m_dumpDescLayout;
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (vkAllocateDescriptorSets(m_device, &ai, &set) != VK_SUCCESS)
+		return VK_NULL_HANDLE;
+	VkBuffer bufs[5] = {m_voltBuf, m_currBuf, m_dumpLinesBuf.buffer, out, m_dumpWeightBuf.buffer};
+	VkDeviceSize sizes[5] = {m_fieldBufSize, m_fieldBufSize, VK_WHOLE_SIZE, outBytes, VK_WHOLE_SIZE};
+	WriteDescriptorBuffers(m_device, set, bufs, sizes, 5);
+	return set;
+}
+
+void Engine_Vulkan::EnsureDumpResources()
+{
+	if (m_dumpReady || m_dumps.empty())
+		return;
+	m_dumpReady = true;  // closes registration
+
+	std::vector<uint32_t> lines;
+	for (DumpReg& d : m_dumps)
+	{
+		d.lineOff = (uint32_t)lines.size();
+		lines.insert(lines.end(), d.lines.begin(), d.lines.end());
+	}
+	// A few KB, read only at dump timesteps: host-visible, written in place
+	// (the staging buffer is one field, which a tiny grid's lines may exceed).
+	const VkDeviceSize linesBytes = lines.size() * sizeof(uint32_t);
+	CreateGpuBuf(m_dumpLinesBuf, linesBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	void* linesMapped = nullptr;
+	VK_CHECK(vkMapMemory(m_device, m_dumpLinesBuf.memory, 0, linesBytes, 0, &linesMapped));
+	std::memcpy(linesMapped, lines.data(), linesBytes);
+	vkUnmapMemory(m_device, m_dumpLinesBuf.memory);
+
+	// A weight region per command slot, written as its batch is recorded, and
+	// one for the synchronous path.
+	const VkDeviceSize weightBytes = (VkDeviceSize)std::max<uint32_t>(1, m_dumpFreqs) * (CMD_RING_SIZE + 1) *
+	                                 sizeof(std::complex<float>);
+	CreateGpuBuf(m_dumpWeightBuf, weightBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	VK_CHECK(vkMapMemory(m_device, m_dumpWeightBuf.memory, 0, weightBytes, 0, (void**)&m_dumpWeightMapped));
+
+	// volt, curr, lines, output (a ring slot or the DFT sums), weights
+	VkDescriptorSetLayoutBinding bindings[5];
+	for (uint32_t i = 0; i < 5; ++i)
+		bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+	VkDescriptorSetLayoutCreateInfo lci{};
+	lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	lci.bindingCount = 5;
+	lci.pBindings    = bindings;
+	VK_CHECK(vkCreateDescriptorSetLayout(m_device, &lci, nullptr, &m_dumpDescLayout));
+
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC)};
+	VkPipelineLayoutCreateInfo pli{};
+	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pli.setLayoutCount         = 1;
+	pli.pSetLayouts            = &m_dumpDescLayout;
+	pli.pushConstantRangeCount = 1;
+	pli.pPushConstantRanges    = &pcRange;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_dumpPipeLayout));
+
+	auto makePipeline = [&](const unsigned char* code, size_t size, VkPipeline& pipe)
+	{
+		VkShaderModule mod = CreateShaderModule(code, size);
+		VkComputePipelineCreateInfo ci{};
+		ci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		ci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		ci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+		ci.stage.module = mod;
+		ci.stage.pName  = "main";
+		ci.layout       = m_dumpPipeLayout;
+		VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &pipe));
+		vkDestroyShaderModule(m_device, mod, nullptr);
 	};
+	makePipeline(gpu_spirv::dump_gather_data, gpu_spirv::dump_gather_size, m_dumpGatherPipeline);
+	makePipeline(gpu_spirv::dump_dft_data, gpu_spirv::dump_dft_size, m_dumpDFTPipeline);
 
-	auto createConcurrent = [&](GpuBuf& gb, VkDeviceSize size) -> bool
+	uint32_t numSets = (uint32_t)MAX_DUMP_SLOTS;
+	for (const DumpReg& d : m_dumps)
+		numSets += d.dft ? 1 : 0;
+	VkDescriptorPoolSize poolSz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * numSets};
+	VkDescriptorPoolCreateInfo dpi{};
+	dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpi.maxSets       = numSets;
+	dpi.poolSizeCount = 1;
+	dpi.pPoolSizes    = &poolSz;
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_dumpDescPool));
+
+	bool anyDFT = false;
+	for (DumpReg& d : m_dumps)
 	{
-		VkBufferCreateInfo ci{};
-		ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		ci.size  = size;
-		ci.usage = snapUsage;
-		ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
-		ci.queueFamilyIndexCount = 2;
-		ci.pQueueFamilyIndices   = sharingFamilies;
-		if (vkCreateBuffer(m_device, &ci, nullptr, &gb.buffer) != VK_SUCCESS)
-			return false;
-		VkMemoryRequirements memReq;
-		vkGetBufferMemoryRequirements(m_device, gb.buffer, &memReq);
-		uint32_t memType = FindMemoryTypeSoft(memReq.memoryTypeBits, dLoc);
-		if (memType == UINT32_MAX)
+		if (!d.dft)
+			continue;
+		d.set = AllocDumpSet(d.sums.buffer, VK_WHOLE_SIZE);
+		anyDFT = true;
+	}
+	if (anyDFT)
+		RunSingleCommand([&](VkCommandBuffer cmd)
 		{
-			vkDestroyBuffer(m_device, gb.buffer, nullptr);
-			gb.buffer = VK_NULL_HANDLE;
-			return false;
-		}
-		VkMemoryAllocateInfo ai{};
-		ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		ai.allocationSize  = memReq.size;
-		ai.memoryTypeIndex = memType;
-		if (vkAllocateMemory(m_device, &ai, nullptr, &gb.memory) != VK_SUCCESS)
+			for (const DumpReg& d : m_dumps)
+				if (d.dft)
+					vkCmdFillBuffer(cmd, d.sums.buffer, 0, VK_WHOLE_SIZE, 0);
+		});
+
+	uint64_t gathered = 0, summed = 0;
+	for (const DumpReg& d : m_dumps)
+		(d.dft ? summed : gathered) += (uint64_t)d.count * (d.dft ? d.numFreq : 1);
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "Engine_Vulkan: " << m_dumps.size() << " field dump(s) on the GPU: "
+		     << (gathered * sizeof(float) >> 10) << " KB gathered per dump timestep, "
+		     << (summed * sizeof(std::complex<float>) >> 10) << " KB of DFT sums" << endl;
+}
+
+Engine_Vulkan::DumpSlot* Engine_Vulkan::TakeDumpSlot(unsigned int ts, unsigned int keepFrom)
+{
+	for (DumpSlot& s : m_dumpSlots)
+		if (s.ts == ts)
+			return &s;
+
+	// The emptiest, then oldest, slot nobody will read again.
+	auto age = [](const DumpSlot& s) { return s.ts == UINT_MAX ? 0ull : (unsigned long long)s.ts + 1; };
+	DumpSlot* pick = nullptr;
+	for (DumpSlot& s : m_dumpSlots)
+		if ((s.ts == UINT_MAX || s.ts < keepFrom) && (!pick || age(s) < age(*pick)))
+			pick = &s;
+	if (!pick && m_dumpSlots.size() < MAX_DUMP_SLOTS)
+	{
+		DumpSlot s;
+		const VkDeviceSize bytes = std::max<uint64_t>(1, m_dumpSlotFloats) * sizeof(float);
+		// The host reads all of it; a cached type keeps that an ordinary read.
+		const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		if (!TryCreateBufferWithMemory(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+		                               s.buf.buffer, s.buf.memory) &&
+		    !TryCreateBufferWithMemory(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, s.buf.buffer, s.buf.memory))
+			return nullptr;
+		VK_CHECK(vkMapMemory(m_device, s.buf.memory, 0, bytes, 0, (void**)&s.mapped));
+		s.set = AllocDumpSet(s.buf.buffer, bytes);
+		m_dumpSlots.push_back(std::move(s));
+		pick = &m_dumpSlots.back();
+	}
+	if (!pick)
+	{
+		// More dump timesteps in flight than slots: overwrite the oldest.
+		for (DumpSlot& s : m_dumpSlots)
+			if (!pick || age(s) < age(*pick))
+				pick = &s;
+		if (!m_warnedDumpSlots)
+			cerr << "Engine_Vulkan: warning: field-dump ring full, timestep " << pick->ts
+			     << " is overwritten before it was dumped." << endl;
+		m_warnedDumpSlots = true;
+	}
+	pick->ts = ts;
+	pick->cmdSlot = -1;
+	pick->has.assign(m_dumps.size(), 0);
+	return pick;
+}
+
+void Engine_Vulkan::WaitDumpSlot(DumpSlot& slot) const
+{
+	if (slot.cmdSlot < 0)
+		return;
+	// A newer serial means the batch was waited for before its slot was reused.
+	if (m_gpuInFlight[slot.cmdSlot] && m_submitSerial[slot.cmdSlot] == slot.serial)
+		vkWaitForFences(m_device, 1, &m_fences[slot.cmdSlot], VK_TRUE, UINT64_MAX);
+	slot.cmdSlot = -1;
+}
+
+Engine_Vulkan::DumpPC Engine_Vulkan::DumpPushConstants(const DumpReg& d) const
+{
+	DumpPC pc;
+	pc.n0 = d.n[0];
+	pc.n1 = d.n[1];
+	pc.n2 = d.n[2];
+	pc.lineOff = d.lineOff;
+	pc.curr = d.curr ? 1u : 0u;
+	pc.NyNz = m_strideYZ;
+	pc.Nz = numLines[2];
+	pc.N = m_fieldN;
+	pc.outOff = (uint32_t)d.slotOff;
+	pc.numFreq = d.numFreq;
+	pc.weightOff = 0;
+	pc.count = d.count;
+	return pc;
+}
+
+// Everything written before, the fields above all, is visible to the dump
+// shaders, and the dump shaders finish before anything after them writes.
+static void CmdDumpBarrier(VkCommandBuffer cmd)
+{
+	VkMemoryBarrier b{};
+	b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+	b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+static void CmdDumpHostBarrier(VkCommandBuffer cmd)
+{
+	VkMemoryBarrier b{};
+	b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+	                     0, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+void Engine_Vulkan::RecordDumpDFT(VkCommandBuffer cmd, DumpReg& d, uint32_t region, unsigned int ts)
+{
+	const uint32_t weightOff = region * m_dumpFreqs + d.weightOff;
+	d.weights(ts, m_dumpWeightMapped + weightOff);
+	DumpPC pc = DumpPushConstants(d);
+	pc.weightOff = weightOff;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpPipeLayout, 0, 1, &d.set, 0, nullptr);
+	vkCmdPushConstants(cmd, m_dumpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC), &pc);
+	vkCmdDispatch(cmd, (d.count + 255) / 256, 1, 1);
+	++d.samples;
+}
+
+void Engine_Vulkan::RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts)
+{
+	if (!m_dumpReady)
+		return;
+	bool gather = false, dft = false;
+	std::vector<char> due(m_dumps.size(), 0);
+	for (size_t i = 0; i < m_dumps.size(); ++i)
+		if ((due[i] = m_dumps[i].due(ts) ? 1 : 0))
+			(m_dumps[i].dft ? dft : gather) = true;
+	if (!gather && !dft)
+		return;
+
+	CmdDumpBarrier(cmd);
+	if (gather)
+	{
+		DumpSlot* slot = TakeDumpSlot(ts, m_dumpKeepFrom);
+		if (slot)
 		{
-			vkDestroyBuffer(m_device, gb.buffer, nullptr);
-			gb.buffer = VK_NULL_HANDLE;
-			return false;
+			slot->cmdSlot = m_cmdIdx;
+			slot->serial = m_submitCount + 1;  // the submit right after this recording
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpGatherPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpPipeLayout, 0, 1, &slot->set, 0, nullptr);
+			for (size_t i = 0; i < m_dumps.size(); ++i)
+			{
+				if (!due[i] || m_dumps[i].dft)
+					continue;
+				const DumpPC pc = DumpPushConstants(m_dumps[i]);
+				vkCmdPushConstants(cmd, m_dumpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC), &pc);
+				vkCmdDispatch(cmd, (m_dumps[i].count + 255) / 256, 1, 1);
+				slot->has[i] = 1;
+			}
+			CmdDumpHostBarrier(cmd);
 		}
-		vkBindBufferMemory(m_device, gb.buffer, gb.memory, 0);
+	}
+	if (dft)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpDFTPipeline);
+		for (size_t i = 0; i < m_dumps.size(); ++i)
+		{
+			if (!due[i] || !m_dumps[i].dft)
+				continue;
+			RecordDumpDFT(cmd, m_dumps[i], (uint32_t)m_cmdIdx, ts);
+			m_dumps[i].recorded.push_back(ts);
+		}
+	}
+	// The next batch writes the fields read here, and its DFT adds to these sums.
+	CmdDumpBarrier(cmd);
+}
+
+const float* Engine_Vulkan::AcquireDumpGather(int id, unsigned int ts)
+{
+	if (id < 0 || id >= (int)m_dumps.size() || m_dumps[id].dft)
+		return nullptr;
+	const DumpReg& d = m_dumps[id];
+	for (DumpSlot& s : m_dumpSlots)
+		if (s.ts == ts && s.has[id])
+		{
+			WaitDumpSlot(s);
+			return s.mapped + d.slotOff;
+		}
+
+	// No batch ended at ts with this dump due (timestep 0, the hybrid path):
+	// gather now, if the GPU still holds ts.
+	DrainGPU();
+	if (m_liveTS != ts)
+	{
+		cerr << "Engine_Vulkan: field dump for timestep " << ts << " was not gathered, and the GPU is at "
+		     << m_liveTS << " already." << endl;
+		return nullptr;
+	}
+	if (m_deviceDirty)
+		SyncFieldsToDevice();
+	EnsureDumpResources();
+	DumpSlot* slot = TakeDumpSlot(ts, ts);
+	if (!slot)
+		return nullptr;
+	WaitDumpSlot(*slot);
+	const DumpPC pc = DumpPushConstants(d);
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		CmdDumpBarrier(cmd);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpGatherPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpPipeLayout, 0, 1, &slot->set, 0, nullptr);
+		vkCmdPushConstants(cmd, m_dumpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC), &pc);
+		vkCmdDispatch(cmd, (d.count + 255) / 256, 1, 1);
+		CmdDumpHostBarrier(cmd);
+	});
+	slot->has[id] = 1;
+	return slot->mapped + d.slotOff;
+}
+
+bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)
+{
+	if (id < 0 || id >= (int)m_dumps.size() || !m_dumps[id].dft)
+		return false;
+	DumpReg& d = m_dumps[id];
+	while (!d.recorded.empty() && d.recorded.front() < ts)
+	{
+		cerr << "Engine_Vulkan: warning: the GPU added timestep " << d.recorded.front()
+		     << " to a frequency-domain dump that did not process it." << endl;
+		d.recorded.pop_front();
+	}
+	if (!d.recorded.empty() && d.recorded.front() == ts)
+	{
+		d.recorded.pop_front();
 		return true;
-	};
-
-	bool ok = true;
-	for (int i = 0; i < DUMP_RING && ok; ++i)
-	{
-		ok = ok && createConcurrent(m_dumpSnapVolt[i], m_fieldBufSize);
-		ok = ok && createConcurrent(m_dumpSnapCurr[i], m_fieldBufSize);
-		if (!ok) break;
-
-		// Staging is only ever touched by m_dumpQueue (writer) and the host
-		// (reader), so it can stay VK_SHARING_MODE_EXCLUSIVE.
-		ok = ok && createStaging(m_dumpStageVolt[i]);
-		ok = ok && createStaging(m_dumpStageCurr[i]);
-		if (!ok) break;
-
-		if (vkMapMemory(m_device, m_dumpStageVolt[i].memory, 0, m_fieldBufSize, 0,
-		                 (void**)&m_dumpStageVoltMapped[i]) != VK_SUCCESS) { ok = false; break; }
-		if (vkMapMemory(m_device, m_dumpStageCurr[i].memory, 0, m_fieldBufSize, 0,
-		                 (void**)&m_dumpStageCurrMapped[i]) != VK_SUCCESS) { ok = false; break; }
-
-		VkCommandBufferAllocateInfo snapAlloc{};
-		snapAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		snapAlloc.commandPool = m_dumpCmdPool;
-		snapAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		snapAlloc.commandBufferCount = 1;
-		if (vkAllocateCommandBuffers(m_device, &snapAlloc, &m_dumpSnapshotCmdBuf[i]) != VK_SUCCESS) { ok = false; break; }
-
-		VkCommandBufferAllocateInfo xferAlloc = snapAlloc;
-		xferAlloc.commandPool = m_dumpXferCmdPool;
-		if (vkAllocateCommandBuffers(m_device, &xferAlloc, &m_dumpStagingCmdBuf[i]) != VK_SUCCESS) { ok = false; break; }
-
-		VkFenceCreateInfo fenceInfo{};
-		fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled: slot is initially idle
-		if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_dumpSnapshotFence[i]) != VK_SUCCESS) { ok = false; break; }
-		if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_dumpStagingFence[i]) != VK_SUCCESS) { ok = false; break; }
-
-		VkSemaphoreCreateInfo semInfo{};
-		semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		if (vkCreateSemaphore(m_device, &semInfo, nullptr, &m_dumpSnapshotSem[i]) != VK_SUCCESS) { ok = false; break; }
 	}
 
-	if (!ok)
+	// Not added by a batch (timestep 0, the hybrid path): add it now, if the
+	// GPU still holds ts.
+	DrainGPU();
+	if (m_liveTS != ts)
 	{
-		cerr << "Engine_Vulkan: dump-queue buffer setup failed, falling back to "
-		        "synchronous field-dump downloads." << endl;
-		CleanupDumpAsync();
-		m_hasDumpQueue = false;
-		return;
+		cerr << "Engine_Vulkan: frequency-domain dump misses timestep " << ts << ": the GPU is at "
+		     << m_liveTS << " already." << endl;
+		return false;
 	}
-	m_dumpBuffersReady = true;
+	if (m_deviceDirty)
+		SyncFieldsToDevice();
+	EnsureDumpResources();
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		CmdDumpBarrier(cmd);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpDFTPipeline);
+		RecordDumpDFT(cmd, d, CMD_RING_SIZE, ts);
+		CmdDumpBarrier(cmd);
+	});
+	return true;
 }
 
-void Engine_Vulkan::BeginAsyncFieldDownload()
+bool Engine_Vulkan::ReadDumpDFT(int id, std::vector<std::complex<float>>& sums, unsigned int& samples)
 {
-	// Flush any request from a previous call that nothing has consumed yet,
-	// so the data SyncFieldsToHost() eventually returns is never more than
-	// one BeginAsyncFieldDownload() cycle stale.
-	if (m_dumpAsyncPending)
-		FinishAsyncFieldDownload();
+	if (id < 0 || id >= (int)m_dumps.size() || !m_dumps[id].dft)
+		return false;
+	DumpReg& d = m_dumps[id];
+	DrainGPU();
+	EnsureDumpResources();
+	if (!d.recorded.empty())
+		cerr << "Engine_Vulkan: warning: the GPU added " << d.recorded.size()
+		     << " timestep(s) to a frequency-domain dump that did not process them." << endl;
+	d.recorded.clear();
 
-	if (!m_hostDirty) return;              // nothing new on the GPU side
-	if (!m_hasDumpQueue) return;            // no independent queue -- caller falls back
-	EnsureDumpBuffers();
-	if (!m_dumpBuffersReady) return;
-
-	DrainGPU();  // must see the fully-committed state before snapshotting it
-
-	const int idx = m_dumpNextIdx;
-	m_dumpNextIdx = (m_dumpNextIdx + 1) % DUMP_RING;
-
-	// Slot reuse safety: with the flush-before-new-request rule above, at
-	// most one slot is ever genuinely in flight, but wait defensively in
-	// case a caller ever bypasses BeginAsyncFieldDownload's own pending flush.
-	vkWaitForFences(m_device, 1, &m_dumpSnapshotFence[idx], VK_TRUE, UINT64_MAX);
-	vkWaitForFences(m_device, 1, &m_dumpStagingFence[idx], VK_TRUE, UINT64_MAX);
-	vkResetFences(m_device, 1, &m_dumpSnapshotFence[idx]);
-	vkResetFences(m_device, 1, &m_dumpStagingFence[idx]);
-
-	// --- Stage 1 (compute queue, family == field buffers' family): ---
-	// live volt/curr -> device-local snapshot. Fast, VRAM-bandwidth bound.
-	// Signals m_dumpSnapshotSem[idx] so stage 2 can start without a CPU wait.
-	VkCommandBuffer snapCmd = m_dumpSnapshotCmdBuf[idx];
-	VkCommandBufferBeginInfo bi{};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkResetCommandBuffer(snapCmd, 0);
-	VK_CHECK(vkBeginCommandBuffer(snapCmd, &bi));
-	VkBufferCopy region = {0, 0, m_fieldBufSize};
-	vkCmdCopyBuffer(snapCmd, m_voltBuf, m_dumpSnapVolt[idx].buffer, 1, &region);
-	vkCmdCopyBuffer(snapCmd, m_currBuf, m_dumpSnapCurr[idx].buffer, 1, &region);
-	VK_CHECK(vkEndCommandBuffer(snapCmd));
-
-	VkSubmitInfo snapSubmit{};
-	snapSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	snapSubmit.commandBufferCount = 1;
-	snapSubmit.pCommandBuffers = &snapCmd;
-	snapSubmit.signalSemaphoreCount = 1;
-	snapSubmit.pSignalSemaphores = &m_dumpSnapshotSem[idx];
-	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &snapSubmit, m_dumpSnapshotFence[idx]));
-
-	// --- Stage 2 (independent dump queue): snapshot -> host-visible staging. ---
-	// Slow (PCIe-bound) but runs fully concurrently with whatever the caller
-	// submits to m_computeQueue next, since the source is already frozen.
-	VkCommandBuffer xferCmd = m_dumpStagingCmdBuf[idx];
-	vkResetCommandBuffer(xferCmd, 0);
-	VK_CHECK(vkBeginCommandBuffer(xferCmd, &bi));
-	vkCmdCopyBuffer(xferCmd, m_dumpSnapVolt[idx].buffer, m_dumpStageVolt[idx].buffer, 1, &region);
-	vkCmdCopyBuffer(xferCmd, m_dumpSnapCurr[idx].buffer, m_dumpStageCurr[idx].buffer, 1, &region);
-	VK_CHECK(vkEndCommandBuffer(xferCmd));
-
-	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-	VkSubmitInfo xferSubmit{};
-	xferSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	xferSubmit.waitSemaphoreCount = 1;
-	xferSubmit.pWaitSemaphores = &m_dumpSnapshotSem[idx];
-	xferSubmit.pWaitDstStageMask = &waitStage;
-	xferSubmit.commandBufferCount = 1;
-	xferSubmit.pCommandBuffers = &xferCmd;
-	VK_CHECK(vkQueueSubmit(m_dumpQueue, 1, &xferSubmit, m_dumpStagingFence[idx]));
-
-	m_dumpSlotInFlight[idx] = true;
-	m_dumpAsyncPending = true;
-	m_dumpAsyncIdx = idx;
+	const VkDeviceSize bytes = (VkDeviceSize)d.numFreq * d.count * sizeof(std::complex<float>);
+	GpuBuf stage;
+	const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (!TryCreateBufferWithMemory(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+	                               stage.buffer, stage.memory) &&
+	    !TryCreateBufferWithMemory(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, stage.buffer, stage.memory))
+		return false;
+	RunSingleCommand([&](VkCommandBuffer cmd)
+	{
+		VkMemoryBarrier b{};
+		b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0, 1, &b, 0, nullptr, 0, nullptr);
+		VkBufferCopy region = {0, 0, bytes};
+		vkCmdCopyBuffer(cmd, d.sums.buffer, stage.buffer, 1, &region);
+		b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+		                     0, 1, &b, 0, nullptr, 0, nullptr);
+	});
+	void* mapped = nullptr;
+	VK_CHECK(vkMapMemory(m_device, stage.memory, 0, bytes, 0, &mapped));
+	sums.resize((size_t)d.numFreq * d.count);
+	std::memcpy(sums.data(), mapped, bytes);
+	vkUnmapMemory(m_device, stage.memory);
+	DestroyGpuBuf(stage);
+	samples = d.samples;
+	return true;
 }
 
-void Engine_Vulkan::FinishAsyncFieldDownload()
+void Engine_Vulkan::CleanupDumps()
 {
-	if (!m_dumpAsyncPending)
+	for (DumpSlot& s : m_dumpSlots)
 	{
-		// Nothing was pre-fetched (e.g. HasDumpTransferQueue() was false) --
-		// fall back to the original fully-synchronous path.
-		DrainGPU();
-		if (!m_hostDirty) return;
-		if (m_voltMapped && m_currMapped)
-		{
-			std::memcpy(volt_ptr->data(), m_voltMapped, m_fieldBufSize);
-			std::memcpy(curr_ptr->data(), m_currMapped, m_fieldBufSize);
-		}
-		else
-		{
-			DownloadFromDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-			DownloadFromDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
-		}
-		m_hostDirty = false;
-		return;
+		if (s.mapped)
+			vkUnmapMemory(m_device, s.buf.memory);
+		DestroyGpuBuf(s.buf);
 	}
-
-	const int idx = m_dumpAsyncIdx;
-	vkWaitForFences(m_device, 1, &m_dumpStagingFence[idx], VK_TRUE, UINT64_MAX);
-	m_dumpSlotInFlight[idx] = false;
-	std::memcpy(volt_ptr->data(), m_dumpStageVoltMapped[idx], m_fieldBufSize);
-	std::memcpy(curr_ptr->data(), m_dumpStageCurrMapped[idx], m_fieldBufSize);
-	m_hostDirty = false;
-	m_dumpAsyncPending = false;
-}
-
-void Engine_Vulkan::CleanupDumpAsync()
-{
-	if (m_device == VK_NULL_HANDLE) return;
-	for (int i = 0; i < DUMP_RING; ++i)
-	{
-		if (m_dumpSlotInFlight[i])
-			vkWaitForFences(m_device, 1, &m_dumpStagingFence[i], VK_TRUE, UINT64_MAX);
-		if (m_dumpStageVoltMapped[i]) { vkUnmapMemory(m_device, m_dumpStageVolt[i].memory); m_dumpStageVoltMapped[i] = nullptr; }
-		if (m_dumpStageCurrMapped[i]) { vkUnmapMemory(m_device, m_dumpStageCurr[i].memory); m_dumpStageCurrMapped[i] = nullptr; }
-		DestroyGpuBuf(m_dumpSnapVolt[i]);
-		DestroyGpuBuf(m_dumpSnapCurr[i]);
-		DestroyGpuBuf(m_dumpStageVolt[i]);
-		DestroyGpuBuf(m_dumpStageCurr[i]);
-		if (m_dumpSnapshotSem[i]) { vkDestroySemaphore(m_device, m_dumpSnapshotSem[i], nullptr); m_dumpSnapshotSem[i] = VK_NULL_HANDLE; }
-		if (m_dumpSnapshotFence[i]) { vkDestroyFence(m_device, m_dumpSnapshotFence[i], nullptr); m_dumpSnapshotFence[i] = VK_NULL_HANDLE; }
-		if (m_dumpStagingFence[i]) { vkDestroyFence(m_device, m_dumpStagingFence[i], nullptr); m_dumpStagingFence[i] = VK_NULL_HANDLE; }
-		m_dumpSnapshotCmdBuf[i] = VK_NULL_HANDLE; // freed with their pool below
-		m_dumpStagingCmdBuf[i]  = VK_NULL_HANDLE;
-	}
-	if (m_dumpCmdPool) { vkDestroyCommandPool(m_device, m_dumpCmdPool, nullptr); m_dumpCmdPool = VK_NULL_HANDLE; }
-	if (m_dumpXferCmdPool) { vkDestroyCommandPool(m_device, m_dumpXferCmdPool, nullptr); m_dumpXferCmdPool = VK_NULL_HANDLE; }
-	m_dumpBuffersReady = false;
-	m_dumpAsyncPending = false;
+	m_dumpSlots.clear();
+	for (DumpReg& d : m_dumps)
+		DestroyGpuBuf(d.sums);
+	m_dumps.clear();
+	if (m_dumpWeightMapped)
+		vkUnmapMemory(m_device, m_dumpWeightBuf.memory);
+	m_dumpWeightMapped = nullptr;
+	DestroyGpuBuf(m_dumpWeightBuf);
+	DestroyGpuBuf(m_dumpLinesBuf);
+	if (m_dumpGatherPipeline) vkDestroyPipeline(m_device, m_dumpGatherPipeline, nullptr);
+	if (m_dumpDFTPipeline)    vkDestroyPipeline(m_device, m_dumpDFTPipeline, nullptr);
+	if (m_dumpPipeLayout)     vkDestroyPipelineLayout(m_device, m_dumpPipeLayout, nullptr);
+	if (m_dumpDescLayout)     vkDestroyDescriptorSetLayout(m_device, m_dumpDescLayout, nullptr);
+	if (m_dumpDescPool)       vkDestroyDescriptorPool(m_device, m_dumpDescPool, nullptr);
+	m_dumpGatherPipeline = m_dumpDFTPipeline = VK_NULL_HANDLE;
+	m_dumpPipeLayout = VK_NULL_HANDLE;
+	m_dumpDescLayout = VK_NULL_HANDLE;
+	m_dumpDescPool = VK_NULL_HANDLE;
+	m_dumpReady = false;
+	m_dumpSlotFloats = 0;
+	m_dumpFreqs = 0;
+	m_dumpSumBytes = 0;
 }
 
 void Engine_Vulkan::ValidateGPUFields(unsigned int timestep) const
@@ -5321,6 +5536,12 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 {
 	if (iterTS == 0) return true;
 
+	// The caller may still process the timestep this call starts from (the
+	// pipelined loop does, after submitting), so the dump ring keeps it.
+	struct Depth { int& d; explicit Depth(int& v) : d(v) { ++d; } ~Depth() { --d; } } depth(m_iterateDepth);
+	if (m_iterateDepth == 1)
+		m_dumpKeepFrom = numTS;
+
 	// On some drivers (notably RADV/AMDGPU), very long command buffers can
 	// trigger GPU watchdog resets. Split pure-GPU batches into smaller submits.
 	if (!m_hasCPUExtensions)
@@ -5397,10 +5618,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	{
 		// ========== Pure GPU path: fire-and-forget double-buffered ==========
 		// Record FDTD compute into m_cmdBufs[m_cmdIdx], submit immediately,
-		// flip to the other slot.  GetVolt/GetCurr calls DrainGPU() (usually
-		// a no-op since the ~50 µs compute is already done) then reads
-		// directly from the ReBAR-mapped VRAM pointer — zero copies.
+		// flip to the other slot.  Probes and field dumps are gathered at the
+		// end of the batch; see GetVolt() for the rest.
 		if (m_deviceDirty) SyncFieldsToDevice();
+		EnsureDumpResources();
 
 		bool hasExcVolt = m_hasGPUExcitation && m_excVoltCount > 0;
 		bool hasExcCurr = m_hasGPUExcitation && m_excCurrCount > 0;
@@ -6138,6 +6359,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile + 2);
 		}
 
+		// --- Field dumps due at the batch's last timestep ----------------
+		RecordDumpSamples(cmd, numTS + iterTS);
+
 		if (m_profileEnabled && m_tsQueryPool)
 		{
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -6160,6 +6384,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		}
 		vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
 		VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
+		m_submitSerial[m_cmdIdx] = ++m_submitCount;
 
 		if (useAsyncProbeCopy)
 		{
@@ -6229,7 +6454,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		m_cmdIdx = (m_cmdIdx + 1) % CMD_RING_SIZE;
 
 		numTS += iterTS;
+		m_liveTS = numTS;
 		m_hostDirty = true;
+		m_barReads = 0;
 	}
 	else
 	{
@@ -6320,6 +6547,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		// Final upload so device is consistent
 		if (m_deviceDirty) SyncFieldsToDevice();
 		m_hostDirty = false;
+		m_liveTS = numTS;
 	}
 
 	if (m_validateStages)
@@ -6339,8 +6567,8 @@ void Engine_Vulkan::CleanupVulkan()
 	if (m_device == VK_NULL_HANDLE) return;
 	vkDeviceWaitIdle(m_device);
 
-	// Async field-dump download pipeline (own queue/pools/buffers)
-	CleanupDumpAsync();
+	// Field-dump gather ring, DFT sums and pipelines
+	CleanupDumps();
 
 	// First clean up extension resources
 	CleanupExtensions();

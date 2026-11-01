@@ -1949,37 +1949,32 @@ void openEMS::RunFDTD()
 		}
 
 #ifdef WITH_GPU
-	bool hasFieldDumps = false;
 	if (gpuEng)
 	{
 		// Build the probe gather pipeline from recorded cell accesses
 		gpuEng->SetupProbeCache(PA);
 
-		// Full-field dumps (ProcessFields) bypass the sparse probe cache and
-		// need the entire volt/curr buffers -- detect whether any exist so
-		// the pipelined loop below knows it is worth speculatively kicking
-		// off the (async, double-buffered) dump download pipeline.
-		//
-		// ProcField (added to PA above, purely so the energy estimate gets a
-		// processing cadence) is a ProcessFields too, but it only ever calls
-		// CalcTotalEnergyEstimate() -> CalcFastEnergy(), which the Vulkan
-		// engine answers from a GPU-side reduction without touching the host
-		// field mirror. Counting it made hasFieldDumps unconditionally true on
-		// every GPU run, and the resulting BeginAsyncFieldDownload() call
-		// allocated the async ring -- 2x the field buffer in VRAM plus 2x in
-		// host memory -- for simulations that never dump a field. On a
-		// 224^3 grid that was 803 MB of VRAM instead of 288 MB.
+		// A field dump reads the whole fields when it runs, which then must
+		// still be its timestep: no batch may be computing ahead.  ProcField
+		// (added to PA above, purely so the energy estimate gets a processing
+		// cadence) is a ProcessFields too, but never dumps.
+		bool hostFieldReaders = false;
 		for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 		{
 			Processing* proc = PA->GetProcessing(i);
 			if (proc == ProcField) continue;
-			if (dynamic_cast<ProcessFields*>(proc) != NULL) { hasFieldDumps = true; break; }
+			ProcessFields* pf = dynamic_cast<ProcessFields*>(proc);
+			if (pf && pf->GetEnable()) { hostFieldReaders = true; break; }
 		}
-		gpuEng->SetHasFieldDumps(hasFieldDumps);
+		gpuEng->SetHostFieldReaders(hostFieldReaders);
 	}
 
+	// OPENEMS_GPU_PIPELINE=0 takes the standard loop, for A/B comparisons.
+	const char* envPipeline = std::getenv("OPENEMS_GPU_PIPELINE");
+	const bool gpuPipelineOff = envPipeline && string(envPipeline) == "0";
+
 	// Use pipelined loop if probe gather is set up and no CPU extensions
-	if (gpuEng && gpuEng->HasPipelinedProcessing())
+	if (gpuEng && gpuEng->HasPipelinedProcessing() && !gpuPipelineOff)
 	{
 		int gpuSpecDepth = 1;
 		bool gpuSpecAuto = false;
@@ -2025,13 +2020,6 @@ void openEMS::RunFDTD()
 		FDTD_Eng->IterateTS(step);                   // submit first batch
 		gpuEng->DrainGPU();                           // wait for first batch
 		gpuEng->SnapshotProbeCache();                 // capture probe results
-		// Kick off the dump download for the primed state now, before the loop's
-		// first SubmitSpeculative() below -- see the detailed comment at the
-		// matching call site further down for why this ordering (Begin() BEFORE
-		// the next speculative submit, not after) is what actually produces
-		// overlap rather than just moving where a blocking wait happens.
-		if (hasFieldDumps && gpuEng->HasDumpTransferQueue())
-			gpuEng->BeginAsyncFieldDownload();
 
 		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 		{
@@ -2057,22 +2045,12 @@ void openEMS::RunFDTD()
 			for (int s = 1; s < speculativeNow; ++s)
 				if (PA->IsDueAt((unsigned int)currTS + s)) { speculativeNow = s; break; }
 			if (speculativeNow < 1) break;
-			// This call lands exactly on the next processing horizon iff
-			// speculativeNow == step; remember that now, since `step` is
-			// overwritten by PA->Process() below before we reach the settling
-			// section further down where BeginAsyncFieldDownload() is actually
-			// (re-)issued for the state this iteration is about to commit.
-			bool dumpHorizonThisIter = hasFieldDumps && gpuEng->HasDumpTransferQueue() && (speculativeNow == step);
 			gpuEng->SubmitSpeculative((unsigned int)speculativeNow);
 
 			// Process the state committed by the PREVIOUS iteration (or the
-			// prime step above). Its dump download (if any) was kicked off
-			// back when it was committed -- see the BeginAsyncFieldDownload()
-			// calls below and above -- so this SubmitSpeculative() call just
-			// above has already had a chance to start filling the compute
-			// queue with the NEXT batch concurrently with that download
-			// finishing on the independent dump queue, instead of the two
-			// being forced to serialize.
+			// prime step above), while the GPU runs the batch just submitted.
+			// Probes read the probe cache, field dumps the cells the GPU
+			// gathered at the end of the batch that committed this state.
 			gpuEng->EnablePipelinedReading(true);
 			step = PA->Process();
 			gpuEng->EnablePipelinedReading(false);
@@ -2099,17 +2077,6 @@ void openEMS::RunFDTD()
 					gpuEng->SnapshotProbeCache();
 				}
 			}
-
-			// The state this iteration just committed (above) is now stable.
-			// Kick off its dump download here -- BEFORE the next loop
-			// iteration's SubmitSpeculative() -- so that submission has a real,
-			// already-in-flight transfer to run concurrently against. Doing
-			// this right after SubmitSpeculative() instead (as an earlier
-			// version of this code did) would make BeginAsyncFieldDownload()'s
-			// internal DrainGPU() block on the batch we just submitted,
-			// serializing the two and defeating the whole point.
-			if (dumpHorizonThisIter)
-				gpuEng->BeginAsyncFieldDownload();
 
 			// --- Energy estimation ---
 			if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
@@ -2172,14 +2139,10 @@ void openEMS::RunFDTD()
 #endif
 	{
 	// ====== Standard (non-pipelined) main loop ======
-	// Taken whenever the pipelined loop above isn't usable -- notably including
-	// GPU runs with field dumps but no probes/CPU extensions, since
-	// HasPipelinedProcessing() requires an active probe gather pipeline. Field
-	// dumps still benefit from overlap here: IterateTS() below is a
-	// fire-and-forget GPU submit (see Engine_Vulkan's double-buffered command
-	// ring), so kicking off the async dump download right after it returns lets
-	// the PCIe leg run concurrently with whatever PA->Process() does next,
-	// instead of blocking synchronously the moment a dump needs the data.
+	// Taken whenever the pipelined loop above isn't usable: CPU extensions on
+	// the GPU engine, a field dump the GPU cannot serve, or neither probes nor
+	// dumps.  On the GPU, IterateTS() is a fire-and-forget submit, and field
+	// dumps gather their cells at the end of that batch.
 	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !numericalFailure && !CheckAbortCond())
 	{
 		if (bench)
@@ -2198,10 +2161,6 @@ void openEMS::RunFDTD()
 			step = bench->Clamp(step, currTS);
 		}
 		FDTD_Eng->IterateTS(step);
-#ifdef WITH_GPU
-		if (gpuEng && hasFieldDumps && gpuEng->HasDumpTransferQueue())
-			gpuEng->BeginAsyncFieldDownload();
-#endif
 		step=PA->Process();
 		if (bench)
 			bench->NoteInterval(step);
