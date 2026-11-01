@@ -25,6 +25,7 @@
 
 class VTK_File_Writer;
 class HDF5_File_Writer;
+class Engine_Vulkan;
 
 class ProcessFields : public Processing
 {
@@ -81,6 +82,9 @@ public:
 	void SetNumCalcThreads(unsigned int n) {m_numCalcThreads = n;}
 	unsigned int GetNumCalcThreads() const {return m_numCalcThreads;}
 
+	//! True if the GPU engine gathers the cells this dump reads, so it never needs the whole fields.
+	virtual bool IsServedByGPU() const {return m_gpuGather>=0;}
+
 protected:
 	DumpType m_DumpType;
 	FileType m_fileType;
@@ -102,9 +106,28 @@ protected:
 	unsigned int* posLines[3];	//grid positions to dump
 	double* discLines[3];		//mesh disc lines to dump
 	unsigned int m_numCalcThreads;
+	unsigned int CalcThreads() const;
 
 	//! Calculate the defined field.
 	bool CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field);
+
+	//! GPU engine: the raw cells a dump reads (its footprint), all three
+	//! components of one field on m_gpuLines; m_gpuMap[d][line] is a grid
+	//! line's position in m_gpuLines[d], or -1.
+	bool m_gpuCurr;
+	std::vector<unsigned int> m_gpuLines[3];
+	std::vector<int> m_gpuMap[3];
+	//! The engine's id for the gathered footprint, -1 = none.
+	int m_gpuGather;
+	//! The Vulkan engine behind the interface, or NULL.
+	Engine_Vulkan* GetVulkanEngine() const;
+	//! Set up the footprint for dumping \a type; false if the GPU cannot serve that type.
+	bool SetupGPUFootprint(DumpType type);
+	//! Have the GPU gather the footprint for \a type at every timestep IsDueAt() reports.
+	void RegisterGPUGather(DumpType type);
+	//! CalcField() for \a type from a gathered footprint.  A \a stride of 2
+	//! reads one part of interleaved complex values.
+	bool CalcFieldFromFootprint(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field, DumpType type, const float* data, unsigned int stride);
 };
 
 #endif // PROCESSFIELDS_H

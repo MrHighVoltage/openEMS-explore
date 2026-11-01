@@ -41,6 +41,8 @@ ProcessFields::ProcessFields(Engine_Interface_Base* eng_if) : Processing(eng_if)
 	SetPrecision(6);
 	m_dualTime = false;
 	m_numCalcThreads = 0;
+	m_gpuCurr = false;
+	m_gpuGather = -1;
 
 	// dump box should be always inside the snapped lines
 	m_SnapMethod = 1;
@@ -290,6 +292,150 @@ void ProcessFields::CalcMeshPos()
 	}
 }
 
+unsigned int ProcessFields::CalcThreads() const
+{
+	unsigned int nThreads = m_numCalcThreads;
+	if (nThreads == 0)
+	{
+		nThreads = std::thread::hardware_concurrency();
+		if (nThreads == 0)
+			nThreads = 1;
+	}
+	return nThreads;
+}
+
+static FieldCalc::MaterialContext MaterialContextOf(const Engine_Interface_FDTD* fdtd_if)
+{
+	FieldCalc::MaterialContext mat;
+	mat.kappa = fdtd_if->GetKappaPtr();
+	mat.epsR = fdtd_if->GetEpsRPtr();
+	mat.mueR = fdtd_if->GetMueRPtr();
+	return mat;
+}
+
+Engine_Vulkan* ProcessFields::GetVulkanEngine() const
+{
+#ifdef WITH_GPU
+	const Engine_Interface_FDTD* fdtd_if = dynamic_cast<const Engine_Interface_FDTD*>(m_Eng_Interface);
+	if (fdtd_if)
+		return dynamic_cast<Engine_Vulkan*>(const_cast<Engine*>(fdtd_if->GetFDTDEngine()));
+#endif
+	return NULL;
+}
+
+// The offsets, along every direction, from a dumped line to the raw lines the
+// extraction in processfields_calc.h reads for it: the union over the three
+// components of the interpolation stencil and, for rotH, of the curl.
+static bool GPUStencil(ProcessFields::DumpType type, Engine_Interface_Base::InterpolationType interp,
+                       bool& curr, int& lo, int& hi)
+{
+	switch (type)
+	{
+	case ProcessFields::E_FIELD_DUMP:
+	case ProcessFields::J_FIELD_DUMP:
+	case ProcessFields::D_FIELD_DUMP:
+		curr = false;
+		break;
+	case ProcessFields::ROTH_FIELD_DUMP:
+	case ProcessFields::H_FIELD_DUMP:
+	case ProcessFields::B_FIELD_DUMP:
+		curr = true;
+		break;
+	default:
+		return false;
+	}
+	switch (interp)
+	{
+	case Engine_Interface_Base::NODE_INTERPOLATE:
+		lo = -1; hi = 0;  // E: pos and pos-e_n; H: pos back to pos-e_nP-e_nPP
+		break;
+	case Engine_Interface_Base::CELL_INTERPOLATE:
+		lo = 0; hi = 1;   // E: pos up to pos+e_nP+e_nPP; H: pos and pos+e_n
+		break;
+	default:
+		lo = 0; hi = 0;
+		break;
+	}
+	if (type==ProcessFields::ROTH_FIELD_DUMP)
+		lo = -1;          // the curl reaches back one line along nP and nPP
+	return true;
+}
+
+bool ProcessFields::SetupGPUFootprint(DumpType type)
+{
+	int lo, hi;
+	if (!GPUStencil(type, m_Eng_Interface->GetInterpolationType(), m_gpuCurr, lo, hi))
+		return false;
+	for (int d=0; d<3; ++d)
+	{
+		const long gridLines = (long)Op->GetNumberOfLines(d, true);
+		std::vector<char> used(gridLines, 0);
+		for (unsigned int i=0; i<numLines[d]; ++i)
+			for (int o=lo; o<=hi; ++o)
+			{
+				const long l = (long)posLines[d][i] + o;
+				if ((l>=0) && (l<gridLines))
+					used[l] = 1;
+			}
+		m_gpuLines[d].clear();
+		m_gpuMap[d].assign(gridLines, -1);
+		for (long l=0; l<gridLines; ++l)
+			if (used[l])
+			{
+				m_gpuMap[d][l] = (int)m_gpuLines[d].size();
+				m_gpuLines[d].push_back((unsigned int)l);
+			}
+		if (m_gpuLines[d].empty())
+			return false;
+	}
+	return true;
+}
+
+void ProcessFields::RegisterGPUGather(DumpType type)
+{
+	m_gpuGather = -1;
+#ifdef WITH_GPU
+	Engine_Vulkan* vk = GetVulkanEngine();
+	if ((vk==NULL) || !SetupGPUFootprint(type))
+		return;
+	Engine_Vulkan::DumpFootprint fp;
+	fp.curr = m_gpuCurr;
+	for (int d=0; d<3; ++d)
+		fp.lines[d].assign(m_gpuLines[d].begin(), m_gpuLines[d].end());
+	m_gpuGather = vk->RegisterDumpGather(fp, [this](unsigned int ts) {return IsDueAt(ts);});
+#else
+	(void)type;
+#endif
+}
+
+bool ProcessFields::CalcFieldFromFootprint(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field, DumpType type, const float* data, unsigned int stride)
+{
+	Engine_Interface_FDTD* fdtd_if = dynamic_cast<Engine_Interface_FDTD*>(m_Eng_Interface);
+	if ((fdtd_if==NULL) || (data==NULL))
+		return false;
+	field.Init("Field", numLines);
+	FieldCalc::FootprintView view;
+	view.data = data;
+	view.stride = stride;
+	view.curr = m_gpuCurr;
+	for (int d=0; d<3; ++d)
+		view.map[d] = m_gpuMap[d].data();
+	view.sb = m_gpuLines[2].size();
+	view.sa = m_gpuLines[1].size() * view.sb;
+	view.sn = m_gpuLines[0].size() * view.sa;
+	const FieldCalc::MaterialContext mat = MaterialContextOf(fdtd_if);
+	if (!FieldCalc::CalcFieldForEngine<FieldCalc::FootprintView>(
+			&view, fdtd_if->GetFDTDOperator(), mat, type, m_Eng_Interface->GetInterpolationType(),
+			numLines, posLines, field, CalcThreads()))
+		return false;
+	if (view.missed)
+	{
+		cerr << "ProcessFields::CalcField: " << m_Name << ": the GPU footprint lacks a cell the dump reads" << endl;
+		return false;
+	}
+	return true;
+}
+
 bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 {
 	field.Init("Field", numLines);
@@ -299,18 +445,8 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 	{
 		const Engine* eng = fdtd_if->GetFDTDEngine();
 		const Operator* op = fdtd_if->GetFDTDOperator();
-		FieldCalc::MaterialContext mat;
-		mat.kappa = fdtd_if->GetKappaPtr();
-		mat.epsR = fdtd_if->GetEpsRPtr();
-		mat.mueR = fdtd_if->GetMueRPtr();
-
-		unsigned int nThreads = m_numCalcThreads;
-		if (nThreads == 0)
-		{
-			nThreads = std::thread::hardware_concurrency();
-			if (nThreads == 0)
-				nThreads = 1;
-		}
+		const FieldCalc::MaterialContext mat = MaterialContextOf(fdtd_if);
+		const unsigned int nThreads = CalcThreads();
 
 		bool ok = false;
 		switch (eng->GetType())
@@ -336,15 +472,27 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 			break;
 #ifdef WITH_GPU
 		case Engine::GPU:
+		{
+			Engine_Vulkan* vk = const_cast<Engine_Vulkan*>(static_cast<const Engine_Vulkan*>(eng));
+			const unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+			// The batch that ended at ts gathered the cells this dump reads,
+			// unless the host copy holds ts anyway (timestep 0, the hybrid path).
+			if ((m_gpuGather>=0) && !vk->HostFieldsAt(ts))
+			{
+				if (CalcFieldFromFootprint(field, m_DumpType, vk->AcquireDumpGather(m_gpuGather, ts), 1))
+					return true;
+				field.Init("Field", numLines);
+			}
 			// The templated extractor intentionally uses qualified base-Engine
 			// accessors for thread-safe bulk reads.  Synchronize the Vulkan field
-			// buffers first so those reads do not see the zeroed host shadow.
-			static_cast<const Engine_Vulkan*>(eng)->SyncFieldsToHost();
+			// buffers first so those reads do not see a stale host copy.
+			vk->SyncFieldsToHost();
 			ok = FieldCalc::CalcFieldForEngine<Engine>(
 				eng, op, mat,
 				m_DumpType, m_Eng_Interface->GetInterpolationType(),
 				numLines, posLines, field, nThreads);
 			break;
+		}
 #endif
 		case Engine::BASIC:
 			ok = FieldCalc::CalcFieldForEngine<Engine>(

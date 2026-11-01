@@ -36,6 +36,7 @@
 #include "tools/constants.h"
 #include "tools/arraylib/array_nijk.h"
 
+#include <atomic>
 #include <thread>
 #include <vector>
 #include <functional>
@@ -48,6 +49,44 @@ struct MaterialContext {
 	ArrayLib::ArrayNIJK<float>* kappa;
 	ArrayLib::ArrayNIJK<float>* epsR;
 	ArrayLib::ArrayNIJK<float>* mueR;
+};
+
+//--- A dump's footprint, gathered by the GPU engine ---------------------------
+
+/*
+ * The raw cells of one field that a dump reads, as Engine_Vulkan gathers
+ * them: all three components on the tensor product of three lists of grid
+ * lines, laid out [n][a][b][c], with map[d][line] the position of a grid line
+ * in its list, or -1.  It stands in for the engine in the templates below, so
+ * a dump interpolates exactly as from the whole fields.  A read outside the
+ * footprint returns 0 and sets `missed`.
+ */
+struct FootprintView {
+	const float* data = nullptr;
+	unsigned int stride = 1;   //!< 2 reads one part of interleaved complex values
+	bool curr = false;         //!< the footprint holds curr, else volt
+	const int* map[3] = {nullptr, nullptr, nullptr};
+	size_t sb = 0, sa = 0, sn = 0;  //!< strides of b, a and n
+	mutable std::atomic<bool> missed{false};
+
+	inline FDTD_FLOAT Get(bool c, unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		const int a = map[0][x], b = map[1][y], cc = map[2][z];
+		if ((c != curr) || ((a | b | cc) < 0))
+		{
+			missed.store(true, std::memory_order_relaxed);
+			return 0;
+		}
+		return data[stride * (n * sn + (size_t)a * sa + (size_t)b * sb + (size_t)cc)];
+	}
+	inline FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{ return Get(false, n, x, y, z); }
+	inline FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
+	{ return Get(false, n, pos[0], pos[1], pos[2]); }
+	inline FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{ return Get(true, n, x, y, z); }
+	inline FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
+	{ return Get(true, n, pos[0], pos[1], pos[2]); }
 };
 
 //--- Raw field access (non-virtual, templated on engine type) ----------------

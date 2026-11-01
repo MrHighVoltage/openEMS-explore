@@ -64,6 +64,8 @@ void ProcessFieldsTD::InitProcess()
 		delete m_AsyncWriter;
 		m_AsyncWriter = new AsyncFieldWriter(m_asyncBuffers);
 	}
+
+	RegisterGPUGather(m_DumpType);
 }
 
 void ProcessFieldsTD::FlushData()

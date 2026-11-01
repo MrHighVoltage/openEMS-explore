@@ -17,6 +17,9 @@
 
 #include "processfields_fd.h"
 #include "Common/operator_base.h"
+#ifdef WITH_GPU
+#include "FDTD/engine_vulkan.h"
+#endif
 #include "tools/vtk_file_writer.h"
 #include "tools/hdf5_file_writer.h"
 #include <iomanip>
@@ -27,6 +30,7 @@ using namespace std;
 
 ProcessFieldsFD::ProcessFieldsFD(Engine_Interface_Base* eng_if) : ProcessFields(eng_if)
 {
+	m_gpuDFT = -1;
 }
 
 ProcessFieldsFD::~ProcessFieldsFD()
@@ -67,6 +71,92 @@ void ProcessFieldsFD::InitProcess()
 		ArrayLib::ArrayNIJK<std::complex<float>>* field_fd = new ArrayLib::ArrayNIJK<std::complex<float>>("FD field", numLines);
 		m_FD_Fields.push_back(field_fd);
 	}
+
+	RegisterGPUDump(m_DumpType);
+}
+
+bool ProcessFieldsFD::IsDueAt(unsigned int ts) const
+{
+	return ProcessFields::IsDueAt(ts) && (m_FD_Interval!=0) && (ts%m_FD_Interval==0);
+}
+
+std::complex<float> ProcessFieldsFD::DFTWeight(size_t n, double T) const
+{
+	std::complex<float> exp_jwt_2_dt = std::exp( (std::complex<float>)(-2.0 * I_UNIT * PI * m_FD_Samples.at(n) * T) );
+	exp_jwt_2_dt *= 2; // *2 for single-sided spectrum
+	exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
+	return exp_jwt_2_dt;
+}
+
+void ProcessFieldsFD::RegisterGPUDump(DumpType type)
+{
+	m_gpuDFT = -1;
+#ifdef WITH_GPU
+	Engine_Vulkan* vk = GetVulkanEngine();
+	if ((vk==NULL) || !SetupGPUFootprint(type))
+		return;
+	Engine_Vulkan::DumpFootprint fp;
+	fp.curr = m_gpuCurr;
+	for (int d=0; d<3; ++d)
+		fp.lines[d].assign(m_gpuLines[d].begin(), m_gpuLines[d].end());
+	m_gpuDFT = vk->RegisterDumpDFT(fp, (unsigned int)m_FD_Samples.size(),
+		[this](unsigned int ts) {return IsDueAt(ts);},
+		[this](unsigned int ts, std::complex<float>* w)
+		{
+			// Engine_Interface_FDTD::GetTime() at timestep ts
+			const double T = ((double)ts + (double)m_dualTime*0.5) * Op->GetTimestep();
+			for (size_t n=0; n<m_FD_Samples.size(); ++n)
+				w[n] = DFTWeight(n, T);
+		});
+	if (m_gpuDFT<0)
+		RegisterGPUGather(type);
+#else
+	(void)type;
+#endif
+}
+
+bool ProcessFieldsFD::ReadGPUDFT(std::vector<std::complex<float>>& sums)
+{
+#ifdef WITH_GPU
+	unsigned int samples = 0;
+	Engine_Vulkan* vk = GetVulkanEngine();
+	if ((vk==NULL) || !vk->ReadDumpDFT(m_gpuDFT, sums, samples))
+	{
+		cerr << "ProcessFieldsFD: " << m_Name << ": cannot read the GPU's DFT sums" << endl;
+		return false;
+	}
+	if (samples!=m_FD_SampleCount)
+		cerr << "ProcessFieldsFD: " << m_Name << ": warning: the GPU summed " << samples
+		     << " samples, the dump processed " << m_FD_SampleCount << endl;
+	return true;
+#else
+	(void)sums;
+	return false;
+#endif
+}
+
+bool ProcessFieldsFD::InterpolateGPUDFT(const std::vector<std::complex<float>>& sums, DumpType type,
+                                        std::vector<ArrayLib::ArrayNIJK<std::complex<float>>*>& fields)
+{
+	// Interpolation is linear, so interpolating the sums of the raw values
+	// equals summing the interpolated fields, up to rounding.
+	const size_t count = 3 * m_gpuLines[0].size() * m_gpuLines[1].size() * m_gpuLines[2].size();
+	if (sums.size() < count * fields.size())
+		return false;
+	ArrayLib::ArrayNIJK<FDTD_FLOAT> re, im;
+	for (size_t n = 0; n<fields.size(); ++n)
+	{
+		const float* sum = reinterpret_cast<const float*>(sums.data() + n * count);
+		if (!CalcFieldFromFootprint(re, type, sum, 2) || !CalcFieldFromFootprint(im, type, sum + 1, 2))
+			return false;
+		std::complex<float>* field_fd = fields.at(n)->data();
+		const FDTD_FLOAT* field_re = re.data();
+		const FDTD_FLOAT* field_im = im.data();
+		const size_t N = fields.at(n)->size();
+		for (size_t ijk=0; ijk<N; ++ijk)
+			field_fd[ijk] = std::complex<float>(field_re[ijk], field_im[ijk]);
+	}
+	return true;
 }
 
 int ProcessFieldsFD::Process()
@@ -76,6 +166,16 @@ int ProcessFieldsFD::Process()
 
 	if ((m_FD_Interval==0) || (m_Eng_Interface->GetNumberOfTimesteps()%m_FD_Interval!=0))
 		return GetNextInterval();
+
+#ifdef WITH_GPU
+	if (m_gpuDFT>=0)
+	{
+		// The GPU adds the sample to its sums; DumpFDData() interpolates them.
+		if (GetVulkanEngine()->AddDumpDFTSample(m_gpuDFT, m_Eng_Interface->GetNumberOfTimesteps()))
+			++m_FD_SampleCount;
+		return GetNextInterval();
+	}
+#endif
 
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> tmp_field_td;
 	if (!CalcField(tmp_field_td))
@@ -87,9 +187,7 @@ int ProcessFieldsFD::Process()
 	double T = m_Eng_Interface->GetTime(m_dualTime);
 	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 	{
-		std::complex<float> exp_jwt_2_dt = std::exp( (std::complex<float>)(-2.0 * I_UNIT * PI * m_FD_Samples.at(n) * T) );
-		exp_jwt_2_dt *= 2; // *2 for single-sided spectrum
-		exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
+		std::complex<float> exp_jwt_2_dt = DFTWeight(n, T);
 		unsigned int N = m_FD_Fields.at(n)->size();
 		field_fd = m_FD_Fields.at(n)->data();
 		for (unsigned int ijk=0;ijk<N;++ijk)
@@ -106,6 +204,13 @@ void ProcessFieldsFD::PostProcess()
 
 void ProcessFieldsFD::DumpFDData()
 {
+	if (m_gpuDFT>=0)
+	{
+		std::vector<std::complex<float>> sums;
+		if (!ReadGPUDFT(sums) || !InterpolateGPUDFT(sums, m_DumpType, m_FD_Fields))
+			cerr << "ProcessFieldsFD::DumpFDData: " << m_Name << ": the GPU's DFT sums are lost" << endl;
+	}
+
 	if (m_fileType==VTK_FILETYPE)
 	{
 		ArrayLib::ArrayNIJK<float> tmp_field("field", numLines);

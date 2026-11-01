@@ -1954,17 +1954,19 @@ void openEMS::RunFDTD()
 		// Build the probe gather pipeline from recorded cell accesses
 		gpuEng->SetupProbeCache(PA);
 
-		// A field dump reads the whole fields when it runs, which then must
-		// still be its timestep: no batch may be computing ahead.  ProcField
-		// (added to PA above, purely so the energy estimate gets a processing
-		// cadence) is a ProcessFields too, but never dumps.
+		// Field dumps registered the cells they read in InitProcess(), and the
+		// GPU gathers those at each dump's timestep.  A dump it cannot serve
+		// reads the whole fields when it runs, which then must still be its
+		// timestep: no batch may be computing ahead.  ProcField (added to PA
+		// above, purely so the energy estimate gets a processing cadence) is a
+		// ProcessFields too, but never dumps.
 		bool hostFieldReaders = false;
 		for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 		{
 			Processing* proc = PA->GetProcessing(i);
 			if (proc == ProcField) continue;
 			ProcessFields* pf = dynamic_cast<ProcessFields*>(proc);
-			if (pf && pf->GetEnable()) { hostFieldReaders = true; break; }
+			if (pf && pf->GetEnable() && !pf->IsServedByGPU()) { hostFieldReaders = true; break; }
 		}
 		gpuEng->SetHostFieldReaders(hostFieldReaders);
 	}

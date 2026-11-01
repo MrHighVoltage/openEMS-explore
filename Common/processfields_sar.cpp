@@ -22,6 +22,9 @@
 #include "tools/sar_calculation.h"
 
 #include "CSPropMaterial.h"
+#ifdef WITH_GPU
+#include "FDTD/engine_vulkan.h"
+#endif
 
 using namespace std;
 
@@ -99,6 +102,9 @@ void ProcessFieldsSAR::InitProcess()
 		if (!m_UseCellKappa)
 			m_J_FD_Fields.push_back(new ArrayLib::ArrayNIJK<std::complex<float>>("J_FD", numLines));
 	}
+
+	// E and J read the same voltages, so one footprint serves both.
+	RegisterGPUDump(E_FIELD_DUMP);
 }
 
 int ProcessFieldsSAR::Process()
@@ -108,6 +114,16 @@ int ProcessFieldsSAR::Process()
 
 	if ((m_FD_Interval==0) || (m_Eng_Interface->GetNumberOfTimesteps()%m_FD_Interval!=0))
 		return GetNextInterval();
+
+#ifdef WITH_GPU
+	if (m_gpuDFT>=0)
+	{
+		// The GPU adds the sample to its sums; DumpFDData() interpolates them.
+		if (GetVulkanEngine()->AddDumpDFTSample(m_gpuDFT, m_Eng_Interface->GetNumberOfTimesteps()))
+			++m_FD_SampleCount;
+		return GetNextInterval();
+	}
+#endif
 
 	std::complex<float>* field_fd = NULL;
 	double T;
@@ -126,9 +142,7 @@ int ProcessFieldsSAR::Process()
 	unsigned int N;
 	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 	{
-		std::complex<float> exp_jwt_2_dt = std::exp( (std::complex<float>)(-2.0 * I_UNIT * PI * m_FD_Samples.at(n) * T) );
-		exp_jwt_2_dt *= 2; // *2 for single-sided spectrum
-		exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
+		std::complex<float> exp_jwt_2_dt = DFTWeight(n, T);
 		N = m_E_FD_Fields.at(n)->size();
 		field_fd = m_E_FD_Fields.at(n)->data();
 		for (unsigned int ijk=0;ijk<N;++ijk)
@@ -146,9 +160,7 @@ int ProcessFieldsSAR::Process()
 		T = m_Eng_Interface->GetTime(m_dualTime);
 		for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 		{
-			std::complex<float> exp_jwt_2_dt = std::exp( (std::complex<float>)(-2.0 * I_UNIT * PI * m_FD_Samples.at(n) * T) );
-			exp_jwt_2_dt *= 2; // *2 for single-sided spectrum
-			exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
+			std::complex<float> exp_jwt_2_dt = DFTWeight(n, T);
 			N = m_J_FD_Fields.at(n)->size();
 			field_fd = m_J_FD_Fields.at(n)->data();
 			for (unsigned int ijk=0;ijk<N;++ijk)
@@ -167,6 +179,13 @@ int ProcessFieldsSAR::Process()
 void ProcessFieldsSAR::DumpFDData()
 {
 	if (Enabled==false) return;
+	if (m_gpuDFT>=0)
+	{
+		std::vector<std::complex<float>> sums;
+		if (!ReadGPUDFT(sums) || !InterpolateGPUDFT(sums, E_FIELD_DUMP, m_E_FD_Fields) ||
+		    (!m_UseCellKappa && !InterpolateGPUDFT(sums, J_FIELD_DUMP, m_J_FD_Fields)))
+			cerr << "ProcessFieldsSAR::DumpFDData: " << m_Name << ": the GPU's DFT sums are lost" << endl;
+	}
 	unsigned int pos[3];
 	unsigned int orig_pos[3];
 	ArrayLib::ArrayIJK<float> SAR("SAR", numLines);
