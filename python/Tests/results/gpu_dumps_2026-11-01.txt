@@ -1,0 +1,82 @@
+# GPU field dumps: gathered and Fourier-summed on the GPU (2026-11-01)
+# Host: cytex = i9-13900K with RX 6800 (0000:03:00.0, legacy 256 MB BAR); a desktop, not quiesced.
+# Builds: old = 7cd7231 (tests/gpuprof/bin-tb7; its GPU code is ddc69ca's), new = d38071b's sources.
+# One simulation at a time.  Dumps written to tmpfs, so a write costs a memcpy, not storage.
+
+## 1. The cause, measured on the old build (64^3 PEC, 200 timesteps, full-volume E dump, HDF5)
+#    With ReBAR mapping (the default whenever both fields fit the BAR) SyncFieldsToHost()
+#    memcpy'd both fields out of mapped VRAM: ~250 ms per dump of 2 x 3.1 MB, about 25 MB/s.
+dumps   run                                   wall
+200     CPU --engine=sse                      0.56 s
+200     GPU default (ReBAR)                  50.6 s
+200     GPU --gpu-no-rebar-fields             0.59 s
+5       GPU default (ReBAR)                   1.24 s
+5       GPU --gpu-no-rebar-fields             0.24 s
+#    Every GPU dump after the first held a later timestep than its label: H+1 at depth 1
+#    (ReBAR or not), H+interval with OPENEMS_GPU_SPEC_DEPTH=auto.  The new build: 200 dumps 0.42 s,
+#    all at the labelled timestep (2.5e-7..7.8e-7 relative to the CPU).
+
+## 2. Paired old/new, 160^3 PEC (4.1 M cells, 49 MB per field, so ReBAR on this card), 4000 TS,
+#    a voltage probe, OverSampling 2 (TD dumps every 65 TS: 63 dumps); "run" is openEMS's own
+#    timing of the stepping loop.  nf2ff = E and H frequency-domain dumps on the six faces of a
+#    box 10 cells inside the boundary, 3 frequencies.
+none       old          wall    3.56 s  run 1.31521 s  speed 12457.3 MC/s  (0 dump datasets)
+none       new          wall    3.49 s  run 1.32166 s  speed 12396.5 MC/s  (0 dump datasets)
+none       old-norebar  wall    3.46 s  run 1.30703 s  speed 12535.3 MC/s  (0 dump datasets)
+none       new-norebar  wall    3.53 s  run 1.36995 s  speed 11959.6 MC/s  (0 dump datasets)
+none       cpu-avx2mt   wall   20.49 s  run 19.07 s  speed 859.33 MC/s  (0 dump datasets)
+et_plane   old          wall  299.98 s  run 297.76 s  speed 55.02 MC/s  (63 dump datasets)
+et_plane   new          wall    3.52 s  run 1.34498 s  speed 12181.6 MC/s  (63 dump datasets)
+et_plane   old-norebar  wall    4.51 s  run 2.28153 s  speed 7181.16 MC/s  (63 dump datasets)
+et_plane   new-norebar  wall    3.52 s  run 1.38662 s  speed 11815.8 MC/s  (63 dump datasets)
+et_plane   cpu-avx2mt   wall   20.69 s  run 19.27 s  speed 850.21 MC/s  (63 dump datasets)
+nf2ff      old          wall  151.88 s  run 149.62 s  speed 109.50 MC/s  (12 dump datasets)
+nf2ff      new          wall    3.60 s  run 1.30377 s  speed 12566.7 MC/s  (12 dump datasets)
+nf2ff      old-norebar  wall    4.14 s  run 1.96676 s  speed 8330.46 MC/s  (12 dump datasets)
+nf2ff      new-norebar  wall    3.63 s  run 1.32909 s  speed 12327.2 MC/s  (12 dump datasets)
+nf2ff      cpu-avx2mt   wall   21.56 s  run 20.13 s  speed 814.00 MC/s  (12 dump datasets)
+et_volume  old          wall  300.83 s  run 298.59 s  speed 54.87 MC/s  (63 dump datasets)
+et_volume  new          wall    5.28 s  run 3.07742 s  speed 5323.94 MC/s  (63 dump datasets)
+et_volume  old-norebar  wall    5.50 s  run 3.28976 s  speed 4980.3 MC/s  (63 dump datasets)
+et_volume  new-norebar  wall    5.25 s  run 3.09763 s  speed 5289.2 MC/s  (63 dump datasets)
+et_volume  cpu-avx2mt   wall   22.40 s  run 20.97 s  speed 781.25 MC/s  (63 dump datasets)
+
+## 3. python/Tests/gpu_dump_check.py --bin new --gpu 0000:03:00.0 --ref old (1500 TS)
+  cpu dumps            reference, 34 of 34 HDF5 files non-zero
+  cpu noprobe          reference, 34 of 34 HDF5 files non-zero
+  cpu sheet            reference, 34 of 34 HDF5 files non-zero
+  default              OK    208 files, worst 2.3e-05
+  device-local         OK    208 files, worst 2.3e-05
+  spec auto            OK    208 files, worst 2.3e-05
+  spec 4               OK    208 files, worst 2.3e-05
+  standard loop        OK    208 files, worst 2.3e-05
+  host DFT             OK    208 files, worst 2.3e-05
+  whole fields         OK    208 files, worst 2.3e-05
+  tblock 3:8 chunk 7   OK    208 files, worst 2.3e-05
+  no probe             OK    208 files, worst 2.3e-05
+  sheet                OK    208 files, worst 4.0e-05
+  sheet hybrid         OK    208 files, worst 3.3e-05
+  ref build            differs (not counted): FAIL  208 files, worst inf
+      Bt_sub_cell.h5: 3.4e-02 a dataset differs by 3.3e-01 of its own maximum
+      Bt_vol_none_ss.h5: 4.8e-02 a dataset differs by 4.8e-01 of its own maximum
+      Dt_sub_node.h5: 3.1e-02 a dataset differs by 1.6e-01 of its own maximum
+      Dt_xplane_none.h5: 3.6e-02 a dataset differs by 9.2e-02 of its own maximum
+      Ef_zplane_node.h5: 2.0e-02 a dataset differs by 5.4e-02 of its own maximum
+      Et_sub_cell.h5: 3.0e-02 a dataset differs by 1.6e-01 of its own maximum
+all variants match the CPU
+#    For scale: --engine=basic against --engine=sse, same model, worst 3.0e-05.
+#    Between GPU variants, TD dumps are bit-identical (including OPENEMS_GPU_DUMP_GATHER=0,
+#    the whole-field path); FD dumps summed on the GPU differ from host-summed ones by <= 6e-7.
+
+## 4. python/Tests/gpu_tblock_identity.py --bin new --gpu 0000:03:00.0 (all built-in cases)
+all identical (mur_rlc, tfsf, pml_mur, pml_mur_unfused, local_abc, local_abc_sa; flat, flat again,
+flat Mur unfused, tblock 4:12 8:20 16:40 24:48, default)
+
+## 5. The hybrid loop under foreign GPU load (not a result of the dump change)
+#    From 14:51 another process ran a GPU parameter sweep on the same card.  Under that load the
+#    hybrid variant (OPENEMS_GPU_CPU_LOCAL_ABC=1, which puts Mur, PML and the sheet on the CPU)
+#    diverged, the field energy reaching inf between timesteps 1300 and 1450, in every run:
+#    ddc69ca, the intermediate 76fa8f6, d38071b, and d38071b with --gpu-no-rebar-fields.  The same
+#    model without Mur stayed stable; without PML it diverged.  Runs on the idle card (sections 3
+#    and 4, before 14:51) matched the CPU.  The diverging runs were slow from the start (4 MC/s
+#    against 27), so the loop depends on timing somewhere; not investigated further.

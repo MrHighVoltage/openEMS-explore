@@ -193,9 +193,11 @@ working set fits the 128 MB Infinity Cache, so it gains more in ratio, while
 the larger grid gains more in absolute time.
 
 `ea82f59` (async field-dump download, ~18× on a dump-heavy GPU run) belongs to
-this group chronologically but is already in the GPU table below, and its full
-write-up — including the `HOST_CACHED` staging-memory bug that turned out to
-be the whole story — is in
+this group chronologically but is already in the GPU table below.  It only
+ever helped with `--gpu-no-rebar-fields`; the default ReBAR path kept reading
+mapped VRAM at about 25 MB/s, and every GPU dump held a later timestep than
+its label.  The GPU-side gather that replaced it (`76fa8f6`, `d38071b`), and
+the measurements, are in
 [FDTD/GPU_PIPELINE_OPTIMIZATION.md](FDTD/GPU_PIPELINE_OPTIMIZATION.md) §4.
 The fusion and pipelining design is in
 [FDTD/GPU_FUSION_AND_PIPELINING.md](FDTD/GPU_FUSION_AND_PIPELINING.md).
@@ -237,7 +239,8 @@ crossover against upstream's best CPU configuration at ~55 timesteps.
 | Commit | Change | Measured |
 |---|---|---|
 | `fbd95a6` | Don't place field buffers in an undersized BAR aperture | **6.4–6.5×** on grids exceeding the 256 MB aperture (803 → 5115 MC/s at 256×224×224) |
-| `ea82f59` | Async field-dump download; request `HOST_CACHED` staging | **~18×** wall clock on a dump-heavy 291³ run (74 s → 16 s) |
+| `ea82f59` | Async field-dump download; request `HOST_CACHED` staging | **~18×** wall clock on a dump-heavy 291³ run (74 s → 16 s), with `--gpu-no-rebar-fields` only; replaced by the row below |
+| `76fa8f6`, `d38071b` | Gather each dump's cells on the GPU at its timestep; keep FD/NF2FF/SAR DFT sums on the GPU; no CPU reads of mapped VRAM | **221× / 115× / 97×** on 160³ with ReBAR (plane / NF2FF / whole-volume dumps: 298 → 1.34 s, 150 → 1.30 s, 299 → 3.08 s); plane and NF2FF dumps now free. Fixes dumps holding a later timestep than their label |
 | `2ed6523` | Reuse shared curl taps in the update shaders | Neutral on RADV (its NIR already CSE'd them); kernels shrink 11–14%. Portability insurance |
 | `49c7efc` | Narrow the compressed-operator index to 8/16/32 bits | **+3.5% to +6.2%**; Coax index buffer 2793 → 698 KB |
 | `fabcaa3` | Single Vulkan 1.3 baseline, negotiate device features | Enablement, not throughput |

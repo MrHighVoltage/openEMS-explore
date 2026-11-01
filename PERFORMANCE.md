@@ -591,10 +591,15 @@ The changes that produced those numbers, in order of what they were worth:
   when 493,040 unique coefficient sets in a 23 MB table turned six per-cell
   gathers into six scattered cache lines. What matters is table size *relative
   to cache*, not the compression ratio.
-- **Async field-dump download** (`ea82f59`) — **~18× wall clock** on a
-  dump-heavy run (74 s → 16 s). Not visible in this document's benchmarks,
-  which deliberately dump nothing, but it is the difference that matters most
-  in practice on dump-heavy models.
+- **Field dumps gathered on the GPU** (`76fa8f6`, `d38071b`; replacing the
+  async download of `ea82f59`, which helped only without ReBAR) — each dump's cells are
+  gathered at its timestep in the batch that ends there, and FD/NF2FF/SAR
+  dumps keep their DFT sums on the GPU. On 160³ with ReBAR: plane dumps
+  **221×** (298 → 1.34 s), an NF2FF box **115×**, whole-volume dumps **97×**;
+  plane and NF2FF dumps now cost nothing measurable, where the old default ran
+  below the CPU engine. Not visible in this document's benchmarks, which
+  deliberately dump nothing, but it is the difference that matters most in
+  practice on dump-heavy models (FDTD/GPU_PIPELINE_OPTIMIZATION.md §4).
 - **Narrowed the compressed-operator index to 8/16/32 bits** (`49c7efc`) —
   +3.5–6.2%.
 - **Deduplicated UPML coefficients into shared tables** (`00ba1c6`) —
