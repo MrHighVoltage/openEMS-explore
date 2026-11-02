@@ -421,9 +421,6 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_device         = VK_NULL_HANDLE;
 	m_computeQueue   = VK_NULL_HANDLE;
 	m_computeQueueFamily = 0;
-	m_transferQueue  = VK_NULL_HANDLE;
-	m_transferQueueFamily = 0;
-	m_hasDedicatedTransferQueue = false;
 
 	m_voltBuf = m_currBuf = VK_NULL_HANDLE;
 	m_voltMem = m_currMem = VK_NULL_HANDLE;
@@ -474,15 +471,6 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_tbQuiet = false;
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		m_gpuInFlight[i] = false;
-
-	m_transferCmdPool = VK_NULL_HANDLE;
-	for (int i = 0; i < CMD_RING_SIZE; ++i)
-	{
-		m_transferCmdBufs[i] = VK_NULL_HANDLE;
-		m_transferFences[i] = VK_NULL_HANDLE;
-		m_probeCopySem[i] = VK_NULL_HANDLE;
-		m_probeTransferInFlight[i] = false;
-	}
 
 	m_hostDirty   = false;
 	m_hasGPUExcitation  = false;
@@ -839,12 +827,6 @@ void Engine_Vulkan::InitVulkan()
 	if (m_physDevice == VK_NULL_HANDLE)
 		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
 
-	// Probe and energy outputs are tiny coherent host-visible buffers. Keeping
-	// their work on the compute queue avoids cross-family ownership transfers
-	// and semaphore submissions, which cost more than these readbacks.
-	m_transferQueueFamily = m_computeQueueFamily;
-	m_hasDedicatedTransferQueue = false;
-
 	// --- Logical device ---
 	float priority = 1.0f;
 	std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -854,15 +836,6 @@ void Engine_Vulkan::InitVulkan()
 	computeQueueInfo.queueCount = 1;
 	computeQueueInfo.pQueuePriorities = &priority;
 	queueInfos.push_back(computeQueueInfo);
-	if (m_hasDedicatedTransferQueue)
-	{
-		VkDeviceQueueCreateInfo transferQueueInfo{};
-		transferQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-		transferQueueInfo.queueFamilyIndex = m_transferQueueFamily;
-		transferQueueInfo.queueCount = 1;
-		transferQueueInfo.pQueuePriorities = &priority;
-		queueInfos.push_back(transferQueueInfo);
-	}
 
 	// --- Negotiate optional features ---------------------------------------
 	// Query what the device supports, then enable exactly the subset the engine
@@ -931,7 +904,6 @@ void Engine_Vulkan::InitVulkan()
 	VK_CHECK(vkCreateDevice(m_physDevice, &devInfo, nullptr, &m_device));
 
 	vkGetDeviceQueue(m_device, m_computeQueueFamily, 0, &m_computeQueue);
-	vkGetDeviceQueue(m_device, m_transferQueueFamily, 0, &m_transferQueue);
 
 	// --- Command pool + buffer ---
 	VkCommandPoolCreateInfo poolInfo{};
@@ -939,14 +911,6 @@ void Engine_Vulkan::InitVulkan()
 	poolInfo.queueFamilyIndex = m_computeQueueFamily;
 	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 	VK_CHECK(vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_cmdPool));
-	if (m_hasDedicatedTransferQueue)
-	{
-		VkCommandPoolCreateInfo transferPoolInfo{};
-		transferPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-		transferPoolInfo.queueFamilyIndex = m_transferQueueFamily;
-		transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-		VK_CHECK(vkCreateCommandPool(m_device, &transferPoolInfo, nullptr, &m_transferCmdPool));
-	}
 
 	VkCommandBufferAllocateInfo allocInfo{};
 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -956,16 +920,6 @@ void Engine_Vulkan::InitVulkan()
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_cmdBufs[i]));
 	VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_utilCmdBuf));
-	if (m_hasDedicatedTransferQueue)
-	{
-		VkCommandBufferAllocateInfo transferAllocInfo{};
-		transferAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		transferAllocInfo.commandPool = m_transferCmdPool;
-		transferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		transferAllocInfo.commandBufferCount = 1;
-		for (int i = 0; i < CMD_RING_SIZE; ++i)
-			VK_CHECK(vkAllocateCommandBuffers(m_device, &transferAllocInfo, &m_transferCmdBufs[i]));
-	}
 
 	// --- Fences ---
 	VkFenceCreateInfo fenceInfo{};
@@ -973,20 +927,8 @@ void Engine_Vulkan::InitVulkan()
 	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;   // start signaled so first wait is a no-op
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_fences[i]));
-	if (m_hasDedicatedTransferQueue)
-	{
-		for (int i = 0; i < CMD_RING_SIZE; ++i)
-			VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_transferFences[i]));
-	}
 	fenceInfo.flags = 0;   // utility fence starts unsignaled
 	VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_utilFence));
-	if (m_hasDedicatedTransferQueue)
-	{
-		VkSemaphoreCreateInfo semInfo{};
-		semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		for (int i = 0; i < CMD_RING_SIZE; ++i)
-			VK_CHECK(vkCreateSemaphore(m_device, &semInfo, nullptr, &m_probeCopySem[i]));
-	}
 
 	// --- Pipeline cache (speeds up subsequent runs) ---
 	VkPipelineCacheCreateInfo cacheInfo{};
@@ -3466,12 +3408,6 @@ void Engine_Vulkan::UpdateSteadyStateResult()
 	m_steadyLastCompletedPeriods = completedPeriods;
 }
 
-void Engine_Vulkan::SetupGPU_Probes()
-{
-	// Placeholder — actual probe setup happens in SetupProbeCache()
-	// after the initial PA->Process() recording run.
-}
-
 void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 {
 	// Finalize probe recording: stop recording mode and build GPU resources
@@ -3615,40 +3551,7 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 void Engine_Vulkan::SnapshotProbeCache()
 {
 	if (!m_hasGPU_Probes || m_probeCacheCount == 0) return;
-	if (m_hasDedicatedTransferQueue && m_probeTransferInFlight[m_lastProbeSubmitSlot])
-	{
-		vkWaitForFences(m_device, 1, &m_transferFences[m_lastProbeSubmitSlot], VK_TRUE, UINT64_MAX);
-		m_probeTransferInFlight[m_lastProbeSubmitSlot] = false;
-	}
-
-	if (m_probeOutMapped)
-	{
-		// ReBAR: direct copy from mapped VRAM
-		memcpy(m_probeCacheCPU.data(), m_probeOutMapped,
-		       m_probeCacheCount * sizeof(float));
-	}
-	else if (m_probeReadbackMapped[m_lastProbeSubmitSlot])
-	{
-		// Readback ring: data was copied in the main command buffer for this slot.
-		memcpy(m_probeCacheCPU.data(), m_probeReadbackMapped[m_lastProbeSubmitSlot],
-		       m_probeCacheCount * sizeof(float));
-	}
-	else
-	{
-		// No ReBAR: copy via staging buffer with a transfer command
-		VkDeviceSize sz = m_probeCacheCount * sizeof(float);
-		RunSingleCommand([&](VkCommandBuffer cmd)
-		{
-			VkBufferCopy region = {0, 0, sz};
-			vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
-			                m_probeStagingBuf.buffer, 1, &region);
-		});
-
-		void* mapped;
-		VK_CHECK(vkMapMemory(m_device, m_probeStagingBuf.memory, 0, sz, 0, &mapped));
-		memcpy(m_probeCacheCPU.data(), mapped, sz);
-		vkUnmapMemory(m_device, m_probeStagingBuf.memory);
-	}
+	memcpy(m_probeCacheCPU.data(), m_probeOutMapped, m_probeCacheCount * sizeof(float));
 }
 
 void Engine_Vulkan::SubmitSpeculative(unsigned int nTS)
@@ -3802,11 +3705,6 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	}
 }
 
-void Engine_Vulkan::FlushGPU() const
-{
-	DrainGPU();
-}
-
 void Engine_Vulkan::DrainGPU() const
 {
 	if (m_gpuDrained) return;  // Already drained — skip redundant fence syscalls
@@ -3823,11 +3721,6 @@ void Engine_Vulkan::DrainGPU() const
 				CollectProfileForSlot(i);
 			}
 			m_gpuInFlight[i] = false;
-		}
-		if (m_probeTransferInFlight[i])
-		{
-			vkWaitForFences(m_device, 1, &m_transferFences[i], VK_TRUE, UINT64_MAX);
-			m_probeTransferInFlight[i] = false;
 		}
 	}
 	m_gpuDrained = true;
@@ -5460,9 +5353,6 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	const bool murSeparate = m_hasGPU_Mur && !m_murFused;
 	bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
 	bool hasCurrLateWrites = hasExcCurr || m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE;
-	bool useAsyncProbeCopy = m_hasDedicatedTransferQueue && m_hasGPU_Probes &&
-	                         (m_probeCacheCount > 0) && !m_probeOutMapped &&
-	                         (m_probeReadbackMapped[m_cmdIdx] != nullptr);
 
 	// Cache TF/SF signal info (invariant across iterations)
 	Excitation* tfsfExc = nullptr;
@@ -5492,11 +5382,6 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		}
 		m_gpuInFlight[m_cmdIdx] = false;
 	}
-	if (m_probeTransferInFlight[m_cmdIdx])
-	{
-		vkWaitForFences(m_device, 1, &m_transferFences[m_cmdIdx], VK_TRUE, UINT64_MAX);
-		m_probeTransferInFlight[m_cmdIdx] = false;
-	}
 
 	// Begin recording
 	VkCommandBuffer cmd = m_cmdBufs[m_cmdIdx];
@@ -5506,24 +5391,6 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	vkResetCommandBuffer(cmd, 0);
 	VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 	uint32_t qBaseProfile = 0;
-
-	if (useAsyncProbeCopy)
-	{
-		// Acquire probe output buffer ownership from transfer queue before compute writes.
-		VkBufferMemoryBarrier ownAcquire{};
-		ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		ownAcquire.srcAccessMask = 0;
-		ownAcquire.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		ownAcquire.srcQueueFamilyIndex = m_transferQueueFamily;
-		ownAcquire.dstQueueFamilyIndex = m_computeQueueFamily;
-		ownAcquire.buffer = m_probeOutBuf.buffer;
-		ownAcquire.offset = 0;
-		ownAcquire.size = VK_WHOLE_SIZE;
-		vkCmdPipelineBarrier(cmd,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
-	}
 
 	if (m_profileEnabled && m_tsQueryPool)
 	{
@@ -6123,50 +5990,14 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		                   0, sizeof(uint32_t), &m_probeCacheCount);
 		vkCmdDispatch(cmd, probeGroups, 1, 1);
 
-		if (m_probeOutMapped)
-		{
-			VkMemoryBarrier hostBarrier{};
-			hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-			hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-				0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
-		}
-
-		// If probe output is not directly mapped, enqueue a device->host
-		// copy into the readback ring for this submission slot.
-		if (useAsyncProbeCopy)
-		{
-			VkBufferMemoryBarrier ownRelease{};
-			ownRelease.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			ownRelease.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			ownRelease.dstAccessMask = 0;
-			ownRelease.srcQueueFamilyIndex = m_computeQueueFamily;
-			ownRelease.dstQueueFamilyIndex = m_transferQueueFamily;
-			ownRelease.buffer = m_probeOutBuf.buffer;
-			ownRelease.offset = 0;
-			ownRelease.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-				0, 0, nullptr, 1, &ownRelease, 0, nullptr);
-		}
-		else if (!m_probeOutMapped && m_probeReadbackMapped[m_cmdIdx])
-		{
-			VkMemoryBarrier xferBarrier{};
-			xferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-			xferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			xferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
-				0, 1, &xferBarrier, 0, nullptr, 0, nullptr);
-
-			VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
-			vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
-			                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
-		}
+		// The host reads m_probeOutMapped once this batch's fence signals.
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+			0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 	}
 
 	if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
@@ -6191,74 +6022,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers    = &cmd;
-	VkSemaphore signalSem = VK_NULL_HANDLE;
-	if (useAsyncProbeCopy)
-	{
-		signalSem = m_probeCopySem[m_cmdIdx];
-		si.signalSemaphoreCount = 1;
-		si.pSignalSemaphores = &signalSem;
-	}
 	vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
 	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
 	m_submitSerial[m_cmdIdx] = ++m_submitCount;
 
-	if (useAsyncProbeCopy)
-	{
-		VkCommandBuffer tcmd = m_transferCmdBufs[m_cmdIdx];
-		vkResetCommandBuffer(tcmd, 0);
-		VkCommandBufferBeginInfo tbi{};
-		tbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		tbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		VK_CHECK(vkBeginCommandBuffer(tcmd, &tbi));
-
-		VkBufferMemoryBarrier ownAcquire{};
-		ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		ownAcquire.srcAccessMask = 0;
-		ownAcquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		ownAcquire.srcQueueFamilyIndex = m_computeQueueFamily;
-		ownAcquire.dstQueueFamilyIndex = m_transferQueueFamily;
-		ownAcquire.buffer = m_probeOutBuf.buffer;
-		ownAcquire.offset = 0;
-		ownAcquire.size = VK_WHOLE_SIZE;
-		vkCmdPipelineBarrier(tcmd,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
-
-		VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
-		vkCmdCopyBuffer(tcmd, m_probeOutBuf.buffer,
-		                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
-
-		VkBufferMemoryBarrier ownRelease{};
-		ownRelease.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		ownRelease.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		ownRelease.dstAccessMask = 0;
-		ownRelease.srcQueueFamilyIndex = m_transferQueueFamily;
-		ownRelease.dstQueueFamilyIndex = m_computeQueueFamily;
-		ownRelease.buffer = m_probeOutBuf.buffer;
-		ownRelease.offset = 0;
-		ownRelease.size = VK_WHOLE_SIZE;
-		vkCmdPipelineBarrier(tcmd,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-			0, 0, nullptr, 1, &ownRelease, 0, nullptr);
-
-		VK_CHECK(vkEndCommandBuffer(tcmd));
-
-		VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-		VkSubmitInfo tsi{};
-		tsi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		tsi.waitSemaphoreCount = 1;
-		tsi.pWaitSemaphores = &signalSem;
-		tsi.pWaitDstStageMask = &waitStage;
-		tsi.commandBufferCount = 1;
-		tsi.pCommandBuffers = &tcmd;
-		vkResetFences(m_device, 1, &m_transferFences[m_cmdIdx]);
-		VK_CHECK(vkQueueSubmit(m_transferQueue, 1, &tsi, m_transferFences[m_cmdIdx]));
-		m_probeTransferInFlight[m_cmdIdx] = true;
-	}
 	m_gpuInFlight[m_cmdIdx] = true;
-	m_lastProbeSubmitSlot = m_cmdIdx;
 	if (m_profileEnabled)
 	{
 		m_profilePending[m_cmdIdx] = true;
@@ -6335,13 +6103,7 @@ void Engine_Vulkan::CleanupVulkan()
 	// Command / sync
 	for (int i = 0; i < CMD_RING_SIZE; ++i)
 		if (m_fences[i]) vkDestroyFence(m_device, m_fences[i], nullptr);
-	for (int i = 0; i < CMD_RING_SIZE; ++i)
-	{
-		if (m_transferFences[i]) vkDestroyFence(m_device, m_transferFences[i], nullptr);
-		if (m_probeCopySem[i]) vkDestroySemaphore(m_device, m_probeCopySem[i], nullptr);
-	}
 	if (m_utilFence) vkDestroyFence(m_device, m_utilFence, nullptr);
-	if (m_transferCmdPool) vkDestroyCommandPool(m_device, m_transferCmdPool, nullptr);
 	if (m_cmdPool) vkDestroyCommandPool(m_device, m_cmdPool, nullptr);
 
 	// Optional raw-field validation
@@ -6542,12 +6304,6 @@ void Engine_Vulkan::CleanupExtensions()
 	DestroyGpuBuf(m_gpuRLC.ib0);  DestroyGpuBuf(m_gpuRLC.b1); DestroyGpuBuf(m_gpuRLC.b2);
 	m_gpuRLC = GpuRLCData{};
 
-	// --- Destroy probe GPU data ---
-	DestroyGpuBuf(m_gpuProbes.probeIdx);
-	DestroyGpuBuf(m_gpuProbes.fieldSel);
-	DestroyGpuBuf(m_gpuProbes.output);
-	m_gpuProbes = GpuProbeData{};
-
 	// --- Destroy probe cache GPU data (pipelined processing) ---
 	if (m_probeOutMapped)
 	{
@@ -6557,16 +6313,6 @@ void Engine_Vulkan::CleanupExtensions()
 	DestroyGpuBuf(m_probeIdxBuf);
 	DestroyGpuBuf(m_probeSelBuf);
 	DestroyGpuBuf(m_probeOutBuf);
-	for (int i = 0; i < CMD_RING_SIZE; ++i)
-	{
-		if (m_probeReadbackMapped[i])
-		{
-			vkUnmapMemory(m_device, m_probeReadbackBuf[i].memory);
-			m_probeReadbackMapped[i] = nullptr;
-		}
-		DestroyGpuBuf(m_probeReadbackBuf[i]);
-	}
-	DestroyGpuBuf(m_probeStagingBuf);
 	if (m_probeDescPool) { vkDestroyDescriptorPool(m_device, m_probeDescPool, nullptr); m_probeDescPool = VK_NULL_HANDLE; }
 	m_probeGatherDescSet = VK_NULL_HANDLE; // freed with pool
 	m_probeCacheKeys.clear();

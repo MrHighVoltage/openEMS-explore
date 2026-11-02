@@ -225,9 +225,6 @@ private:
 	VkDevice         m_device;
 	VkQueue          m_computeQueue;
 	uint32_t         m_computeQueueFamily;
-	VkQueue          m_transferQueue;
-	uint32_t         m_transferQueueFamily;
-	bool             m_hasDedicatedTransferQueue;
 	DeviceCaps       m_caps;
 
 	// ---- GPU buffers --------------------------------------------------
@@ -288,13 +285,6 @@ private:
 	uint64_t        m_submitSerial[CMD_RING_SIZE] = {}; //!< m_submitCount at m_cmdBufs[i]'s last submit
 	uint64_t        m_submitCount = 0;
 	int             m_iterateDepth = 0; //!< IterateTS() nesting (it splits long batches)
-
-	// Optional transfer-queue path for probe output copies
-	VkCommandPool   m_transferCmdPool;
-	VkCommandBuffer m_transferCmdBufs[CMD_RING_SIZE];
-	VkFence         m_transferFences[CMD_RING_SIZE];
-	VkSemaphore     m_probeCopySem[CMD_RING_SIZE];
-	mutable bool    m_probeTransferInFlight[CMD_RING_SIZE];
 
 	// ---- State --------------------------------------------------------
 	//! The host copy differs from the device fields.
@@ -416,10 +406,6 @@ private:
 	//! The compute -> compute dependency between two stages of a timestep;
 	//! counted, or skipped, by the profiling switches above.
 	void CmdComputeBarrier(VkCommandBuffer cmd, const VkMemoryBarrier& barrier) const;
-
-	//! Submit any pending batched GPU command buffer and wait for completion.
-	//! Used only by hybrid path and non-ReBAR fallback.
-	void FlushGPU() const;
 
 	//! Upload CPU data to a device-local buffer via the staging buffer.
 	void UploadToDeviceBuffer(VkBuffer dst, const void* data, VkDeviceSize size);
@@ -609,14 +595,6 @@ private:
 		uint32_t count = 0;
 	};
 
-	//! Probe gather GPU state.
-	struct GpuProbeData {
-		GpuBuf probeIdx, fieldSel, output;
-		float* outputMapped = nullptr;                    // ReBAR-mapped for readback
-		VkDescriptorSet desc = VK_NULL_HANDLE;
-		uint32_t count = 0;
-	};
-
 	// ---- Fused Yee+UPML pipeline (concatenated PML buffers) ----------
 	bool m_hasFusedUPML = false;
 	GpuBuf m_fusedVoltFlux;     //!< Concatenated volt flux (all PML regions)
@@ -665,7 +643,6 @@ private:
 	VkPipeline            m_murFusedPipeline   = VK_NULL_HANDLE;
 	void SetupMurFusion();
 	GpuRLCData                m_gpuRLC;
-	GpuProbeData              m_gpuProbes;
 
 	// ---- GPU steady-state observer -----------------------------------
 	Engine_Ext_SteadyState* m_gpuSteadyStateExt = nullptr; // owned by Engine::m_Eng_exts
@@ -759,11 +736,7 @@ private:
 	GpuBuf m_probeIdxBuf;              //!< GPU probe index buffer
 	GpuBuf m_probeSelBuf;              //!< GPU field selector (0=volt, 1=curr)
 	GpuBuf m_probeOutBuf;              //!< Coherent host-visible GPU probe output
-	GpuBuf m_probeReadbackBuf[CMD_RING_SIZE];      //!< Per-submit-slot host-visible probe readback ring
-	GpuBuf m_probeStagingBuf;          //!< Staging buffer for non-ReBAR probe download
 	float* m_probeOutMapped = nullptr;  //!< Persistently mapped probe output
-	float* m_probeReadbackMapped[CMD_RING_SIZE] = {}; //!< Persistently mapped readback ring
-	int m_lastProbeSubmitSlot = 0;      //!< Last submitted cmd slot carrying probe results
 	VkDescriptorSet  m_probeGatherDescSet = VK_NULL_HANDLE;
 	VkDescriptorPool m_probeDescPool     = VK_NULL_HANDLE;
 	unsigned int m_speculativeTS = 0;   //!< Timesteps in speculative batch
@@ -804,7 +777,6 @@ private:
 	void SetupGPU_TFSF();          //!< Flatten and upload TF/SF injection points
 	void SetupGPU_Mur();           //!< Upload Mur ABC data
 	void SetupGPU_RLC();           //!< Upload lumped RLC data
-	void SetupGPU_Probes();        //!< Build probe gather descriptor
 	void CreateExtensionDescriptorLayouts();   //!< Create all extension descriptor set layouts
 	void CreateExtensionPipelines();           //!< Create all extension compute pipelines
 	void CleanupExtensions();      //!< Destroy all extension GPU resources
