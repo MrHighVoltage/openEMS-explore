@@ -269,7 +269,6 @@ nf2ff_box = FDTD.CreateNF2FFBox(opt_resolution = [max_cellsize]*3, frequency = [
 simulation_engine = os.environ.get("OPENEMS_ENGINE", "avx2_multithreaded")
 run_options = {}
 if simulation_engine == "gpu":
-    run_options["gpu_no_rebar_fields"] = os.environ.get("OPENEMS_GPU_DEVICE_LOCAL", "1") != "0"
     run_options["gpu_profile"] = os.environ.get("OPENEMS_GPU_PROFILE", "1") != "0"
 sub1_data_path = simulation_setup.runSimulation(
     excite_ports,

@@ -52,7 +52,6 @@ def parse_args():
     parser.add_argument("--material", choices=("none", "conducting-sheet"), default="none")
     parser.add_argument("--source-z", type=int, default=-1,
                         help="place the benchmark excitation on one z plane")
-    parser.add_argument("--field-memory", choices=("auto", "device-local"), default="auto")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--probe-x", type=int, default=-1)
@@ -141,7 +140,6 @@ def main():
         f" excitation={args.excitation}"
         f" local_abc={args.local_abc}"
         f" material={args.material}"
-        f" field_memory={args.field_memory}"
         f" profile={int(args.profile)}"
         f" probe={int(args.probe)}",
         flush=True,
@@ -150,7 +148,6 @@ def main():
     run_options = {"cleanup": True, "engine": args.engine}
     if args.engine == "gpu":
         run_options.update(
-            gpu_no_rebar_fields=(args.field_memory == "device-local"),
             gpu_profile=args.profile,
         )
     fdtd.Run(sim_path, **run_options)

@@ -156,12 +156,11 @@ if os.environ.get("OPENEMS_SHOW_CSXCAD", "0") == "1":
 
 if not post_proc_only:
     gpu_profile = os.environ.get("OPENEMS_GPU_PROFILE", "0") == "1"
-    print(f"GPU config: no-ReBAR fields=True, profiling={gpu_profile}")
+    print(f"GPU config: profiling={gpu_profile}")
     FDTD.Run(
         Sim_Path,
         cleanup=True,
         engine="gpu",
-        gpu_no_rebar_fields=True,
         gpu_profile=gpu_profile,
     )
 

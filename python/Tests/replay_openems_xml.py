@@ -35,7 +35,6 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--engine", choices=("basic", "multithreaded", "avx2", "avx2-multithreaded", "gpu"), default="gpu")
     parser.add_argument("--gpu-index", type=int, default=0)
-    parser.add_argument("--gpu-no-rebar-fields", action="store_true")
     parser.add_argument("--threads", type=int, default=0)
     args = parser.parse_args()
 
@@ -56,8 +55,6 @@ def main():
     }
     if args.threads > 0:
         options["numThreads"] = args.threads
-    if args.engine == "gpu":
-        options["gpu_no_rebar_fields"] = args.gpu_no_rebar_fields
 
     fdtd.Run(args.output, **options)
 

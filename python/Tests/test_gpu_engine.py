@@ -138,8 +138,6 @@ def _run_and_read_probe(engine, sim_tag, build_fn, probe_name, extra_opts=None):
     sim_path = os.path.join(tempfile.gettempdir(), "gpu_regress_{}_{}".format(sim_tag, engine))
     FDTD, CSX, mesh = build_fn()
     run_opts = {"cleanup": True, "engine": engine}
-    if engine == "gpu":
-        run_opts["gpu_no_rebar_fields"] = False
     if extra_opts:
         run_opts.update(extra_opts)
     FDTD.Run(sim_path, **run_opts)
