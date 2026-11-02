@@ -1985,26 +1985,28 @@ void openEMS::RunFDTD()
 	// Use pipelined loop if probe gather is set up and no CPU extensions
 	if (gpuEng && gpuEng->HasPipelinedProcessing() && !gpuPipelineOff)
 	{
+		// How far the GPU computes ahead while the host processes: by default
+		// (auto) up to the next timestep a processing is due at, at most
+		// gpuSpecMaxDepth; OPENEMS_GPU_SPEC_DEPTH=<n> fixes it at n timesteps.
+		// Auto hides the host's work on a dump behind the GPU's: 160^3 with 63
+		// whole-volume dumps runs 1.44 s instead of 3.0 s at depth 1.
 		int gpuSpecDepth = 1;
-		bool gpuSpecAuto = false;
+		bool gpuSpecAuto = true;
 		int gpuSpecMaxDepth = 64;
 		if (const char* envSpecDepth = std::getenv("OPENEMS_GPU_SPEC_DEPTH"))
 		{
 			string specStr(envSpecDepth);
-			if (specStr == "auto" || specStr == "AUTO" || specStr == "Auto")
-			{
-				gpuSpecAuto = true;
-			}
-			else
+			if (specStr != "auto" && specStr != "AUTO" && specStr != "Auto")
 			{
 				int parsedDepth = atoi(envSpecDepth);
 				if (parsedDepth > 0)
+				{
+					gpuSpecAuto = false;
 					gpuSpecDepth = parsedDepth;
-				else if (parsedDepth == 0)
-					gpuSpecAuto = true;  // allow "0" as shorthand for auto
-				else
+				}
+				else if (parsedDepth < 0)  // "0" stays a shorthand for auto
 					cerr << "RunFDTD: Warning: invalid OPENEMS_GPU_SPEC_DEPTH='" << envSpecDepth
-					     << "' (use >=1, 0, or auto). Using default depth=1." << endl;
+					     << "' (use >=1, 0, or auto). Using auto." << endl;
 			}
 		}
 		if (const char* envSpecMaxDepth = std::getenv("OPENEMS_GPU_SPEC_MAX_DEPTH"))
@@ -2017,9 +2019,7 @@ void openEMS::RunFDTD()
 				     << "' (must be >=1). Using default max depth=64." << endl;
 		}
 
-		if (gpuSpecAuto)
-			cout << "RunFDTD: GPU speculative depth set to AUTO (max " << gpuSpecMaxDepth << ")" << endl;
-		else if (gpuSpecDepth > 1)
+		if (!gpuSpecAuto)
 			cout << "RunFDTD: GPU speculative depth set to " << gpuSpecDepth << endl;
 
 		// ====== Pipelined GPU main loop ======
