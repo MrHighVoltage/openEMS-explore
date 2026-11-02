@@ -6,7 +6,8 @@
 
 One model, run one simulation at a time: a graded mesh with a lossy, dense
 dielectric block (J, D and SAR), a magnetic block (B), a Mur and a PML face,
-an E-field source and a voltage probe.  It dumps every time-domain type
+an E-field source, a voltage probe, and a voltage and a current probe that
+start late.  It dumps every time-domain type
 (E, H, J, rotH, D, B) in every interpolation (none, node, cell) on volumes,
 planes and sub-boxes, sub-sampled, inside a start/stop window and as VTK;
 frequency-domain E, H, J and rotH on planes and boxes; an NF2FF-style box of
@@ -20,7 +21,9 @@ within --tol (default 1e-4) of the largest magnitude in each dataset's group
 (a time series, a set of frequencies).  Every dataset holding at least 1 % of
 that maximum must also be within 10*tol of its own maximum, so that a dump of
 the wrong timestep (1e-2 and more here) cannot hide behind a large
-neighbour.  For scale: --engine=basic differs from sse by about 3e-5.
+neighbour.  The probes' time series must be within --tol of their largest
+magnitude, and no probe read may miss the GPU's probe cache.  For scale:
+--engine=basic differs from sse by about 3e-5.
 
 The variants cover the GPU paths a dump can take: the default (ReBAR on a
 small grid), device-local fields, speculative depths auto and 4, the standard
@@ -135,6 +138,11 @@ def model(nts, probe=True, sheet=False):
 	if probe:
 		props.append('<ProbeBox ID="4" Name="ut1" Number="0" Type="0" Weight="1" NormDir="-1"><Primitives>' +
 		             box((30, 25, 12), (30, 25, 22)) + '</Primitives></ProbeBox>')
+		# not due at timestep 0, so the recording there does not see them
+		props.append('<ProbeBox ID="6" Name="ut_late" Number="0" Type="0" Weight="1" NormDir="-1" StartTime="3e-10">'
+		             '<Primitives>' + box((24, 30, 14), (24, 30, 26)) + '</Primitives></ProbeBox>')
+		props.append('<ProbeBox ID="7" Name="it_late" Number="0" Type="1" Weight="1" NormDir="2" StartTime="3e-10">'
+		             '<Primitives>' + box((X[4], Y[14], Z[14]), (X[10], Y[20], Z[14])) + '</Primitives></ProbeBox>')
 	if sheet:
 		props.append('<AbsorbingBC ID="5" Name="abs" NormalSignPositive="1" AbsorbingBoundaryType="0" PhaseVelocity="299792458">'
 		             '<Primitives>' + box((X[2], Y[30], Z[2]), (X[37], Y[30], Z[27]), 30) + '</Primitives></AbsorbingBC>')
@@ -243,18 +251,38 @@ def compare_file(ref, run, tol):
 	return worst, ""
 
 
+def compare_probe(ref, run, tol):
+	"""The worst error of a probe's time series, relative to its largest magnitude."""
+	a = np.loadtxt(str(ref), comments="%", ndmin=2)
+	b = np.loadtxt(str(run), comments="%", ndmin=2)
+	if a.shape != b.shape:
+		return math.inf, "%d samples, not %d" % (len(b), len(a))
+	if not np.allclose(a[:, 0], b[:, 0], rtol=1e-6, atol=0):
+		return math.inf, "sampled at other times"
+	norm = float(np.abs(a[:, 1:]).max())
+	if norm == 0:
+		return math.inf, "the reference is zero"
+	return float(np.abs(a[:, 1:] - b[:, 1:]).max()) / norm, ""
+
+
+PROBES = ("ut1", "ut_late", "it_late")
+
+
 def compare_runs(ref_dir, run_dir, tol):
 	"""(files, worst error, failures)"""
-	names = sorted(p.name for p in ref_dir.iterdir() if p.suffix in (".h5", ".vtr"))
-	got = sorted(p.name for p in run_dir.iterdir() if p.suffix in (".h5", ".vtr"))
+	names = sorted(p.name for p in ref_dir.iterdir() if p.suffix in (".h5", ".vtr") or p.name in PROBES)
+	got = sorted(p.name for p in run_dir.iterdir() if p.suffix in (".h5", ".vtr") or p.name in PROBES)
 	fails = ["extra files %s" % sorted(set(got) - set(names))[:3]] if set(got) - set(names) else []
 	worst = 0.0
 	for name in names:
 		if not (run_dir / name).exists():
 			fails.append("%s missing" % name)
 			continue
-		load = h5_datasets if name.endswith(".h5") else vtr_datasets
-		w, why = compare_file(load(ref_dir / name), load(run_dir / name), tol)
+		if name in PROBES:
+			w, why = compare_probe(ref_dir / name, run_dir / name, tol)
+		else:
+			load = h5_datasets if name.endswith(".h5") else vtr_datasets
+			w, why = compare_file(load(ref_dir / name), load(run_dir / name), tol)
 		worst = max(worst, w)
 		if w > tol:
 			fails.append("%s: %.1e %s" % (name, w, why))
@@ -325,6 +353,10 @@ def main():
 			verdict = "%s  %d files, worst %.1e" % ("OK  " if not fails else "FAIL", n, worst)
 		if "OPENEMS_GPU_CPU_LOCAL_ABC" in env and "hybrid mode" not in log:
 			verdict, fails = "FAIL (the hybrid loop did not run)", []
+		# a miss reads the live fields, which the pipelined loop has moved on
+		misses = re.search(r"probe cache stats: hits=\d+, misses=(\d+)", log)
+		if misses and int(misses.group(1)):
+			verdict, fails = "FAIL (%s probe reads missed the probe cache)" % misses.group(1), []
 		if name.startswith("tblock") and "temporal blocking active" not in log:
 			verdict, fails = "FAIL (temporal blocking did not engage)", []
 		if name == "ref build" and verdict.startswith("FAIL"):

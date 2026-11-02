@@ -1951,6 +1951,17 @@ void openEMS::RunFDTD()
 #ifdef WITH_GPU
 	if (gpuEng)
 	{
+		// The recording above saw only the probes due at this timestep.  One
+		// with a start time reads its cells now, or once due it would miss the
+		// probe cache and read the live fields, which the pipelined loop has
+		// computed ahead by then.
+		for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
+		{
+			ProcessIntegral* pi = dynamic_cast<ProcessIntegral*>(PA->GetProcessing(i));
+			if (pi && pi->GetEnable())
+				pi->CalcMultipleIntegrals();
+		}
+
 		// Build the probe gather pipeline from recorded cell accesses
 		gpuEng->SetupProbeCache(PA);
 
