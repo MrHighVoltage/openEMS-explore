@@ -485,8 +485,6 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	}
 
 	m_hostDirty   = false;
-	m_deviceDirty = false;
-	m_hasCPUExtensions  = false;
 	m_hasGPUExcitation  = false;
 	m_validateFields    = false;
 	m_validateStages    = false;
@@ -638,7 +636,6 @@ void Engine_Vulkan::Init()
 	});
 
 	m_hostDirty  = false;
-	m_deviceDirty = false;
 	m_liveTS = numTS;
 
 	// Print GPU info
@@ -672,10 +669,6 @@ void Engine_Vulkan::Init()
 			cout << "  Uncompressed operator: one coeff set per cell, no index"
 			     << " (tables: " << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
 	}
-	if (m_hasCPUExtensions)
-		cout << "  WARNING: CPU extensions present — hybrid mode (slower)" << endl;
-	else
-		cout << "  Pure GPU mode — double-buffered fire-and-forget submission" << endl;
 	if (m_profileEnabled)
 		cout << "  GPU profiling enabled (timestamp queries + fence wait accounting"
 		     << (m_profileStages ? ", stage timestamps" : "") << ")" << endl;
@@ -1641,13 +1634,11 @@ void Engine_Vulkan::SetupGPUExcitation()
 		++it;
 	}
 
-	bool forceCpuLocalABC = false;
-	if (const char* env = std::getenv("OPENEMS_GPU_CPU_LOCAL_ABC"))
-		forceCpuLocalABC = std::strcmp(env, "0") != 0;
-	auto isGpuNative = [forceCpuLocalABC](Engine_Extension* ext)
+	// Every extension runs on the GPU, inside the batched update.  One without
+	// a GPU implementation needs a CPU engine: applying it on the host would
+	// copy both fields there and back twice per timestep, slower than the CPU.
+	auto isGpuNative = [](Engine_Extension* ext)
 	{
-		if (forceCpuLocalABC && dynamic_cast<Engine_Ext_Absorbing_BC*>(ext))
-			return false;
 		return dynamic_cast<Engine_Ext_UPML*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_LorentzMaterial*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_TFSF*>(ext) != nullptr ||
@@ -1656,31 +1647,22 @@ void Engine_Vulkan::SetupGPUExcitation()
 		       dynamic_cast<Engine_Ext_SteadyState*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_Absorbing_BC*>(ext) != nullptr;
 	};
+	for (Engine_Extension* ext : m_Eng_exts)
+		if (!isGpuNative(ext))
+			throw std::runtime_error("Engine_Vulkan: the extension \"" + ext->GetExtensionName() +
+			                         "\" has no GPU implementation; use a CPU engine");
 
-	// The hybrid loop executes extensions on the CPU. Keep every extension
-	// CPU-owned when even one extension lacks a GPU implementation, otherwise
-	// mixed configurations would silently omit the GPU-native phases.
-	m_hasCPUExtensions = std::any_of(m_Eng_exts.begin(), m_Eng_exts.end(),
-		[&](Engine_Extension* ext) { return !isGpuNative(ext); });
-	if (!m_hasCPUExtensions)
+	for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
 	{
-		for (auto it = m_Eng_exts.begin(); it != m_Eng_exts.end(); )
+		// openEMS keeps a non-owning pointer to this observer. Leave it in
+		// the engine-owned list; the engine never runs the list.
+		if (dynamic_cast<Engine_Ext_SteadyState*>(*it))
 		{
-			// openEMS keeps a non-owning pointer to this observer. Leave it in
-			// the engine-owned list, but do not execute it on the pure GPU path.
-			if (dynamic_cast<Engine_Ext_SteadyState*>(*it))
-			{
-				++it;
-				continue;
-			}
-			if (!isGpuNative(*it))
-			{
-				++it;
-				continue;
-			}
-			delete *it;
-			it = m_Eng_exts.erase(it);
+			++it;
+			continue;
 		}
+		delete *it;
+		it = m_Eng_exts.erase(it);
 	}
 
 	if (!opExc || !exc)
@@ -1847,11 +1829,6 @@ void Engine_Vulkan::SetupGPUExcitation()
 
 void Engine_Vulkan::SetupGPUExtensions()
 {
-	// Hybrid execution retains all extensions on the CPU so their priority and
-	// phase ordering remain identical to the reference engine.
-	if (m_hasCPUExtensions)
-		return;
-
 	bool startupTrace = (g_settings.GetVerboseLevel() > 0);
 	if (const char* env = std::getenv("OPENEMS_GPU_STARTUP_TRACE"))
 	{
@@ -3877,15 +3854,6 @@ void Engine_Vulkan::SyncFieldsToHost() const
 	m_hostDirty = false;
 }
 
-void Engine_Vulkan::SyncFieldsToDevice()
-{
-	DrainGPU();  // must complete any pending GPU work before overwriting
-	if (!m_deviceDirty) return;
-	UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-	UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
-	m_deviceDirty = false;
-}
-
 // ===========================================================================
 // Field dumps: the footprint gathered, or Fourier-summed, on the GPU
 // ===========================================================================
@@ -4270,8 +4238,8 @@ const float* Engine_Vulkan::AcquireDumpGather(int id, unsigned int ts)
 			return s.mapped + d.slotOff;
 		}
 
-	// No batch ended at ts with this dump due (timestep 0, the hybrid path):
-	// gather now, if the GPU still holds ts.
+	// No batch ended at ts with this dump due (timestep 0): gather now, if
+	// the GPU still holds ts.
 	DrainGPU();
 	if (m_liveTS != ts)
 	{
@@ -4279,8 +4247,6 @@ const float* Engine_Vulkan::AcquireDumpGather(int id, unsigned int ts)
 		     << m_liveTS << " already." << endl;
 		return nullptr;
 	}
-	if (m_deviceDirty)
-		SyncFieldsToDevice();
 	EnsureDumpResources();
 	DumpSlot* slot = TakeDumpSlot(ts, ts);
 	if (!slot)
@@ -4317,8 +4283,8 @@ bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)
 		return true;
 	}
 
-	// Not added by a batch (timestep 0, the hybrid path): add it now, if the
-	// GPU still holds ts.
+	// Not added by a batch (timestep 0): add it now, if the GPU still holds
+	// ts.
 	DrainGPU();
 	if (m_liveTS != ts)
 	{
@@ -4326,8 +4292,6 @@ bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)
 		     << m_liveTS << " already." << endl;
 		return false;
 	}
-	if (m_deviceDirty)
-		SyncFieldsToDevice();
 	EnsureDumpResources();
 	RunSingleCommand([&](VkCommandBuffer cmd)
 	{
@@ -4644,11 +4608,6 @@ TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingR
 	//
 	// GPU probes need nothing: the gather is recorded once at the end of each
 	// batch, after the last trapezoid, when the whole grid is at one timestep.
-	if (m_hasCPUExtensions)
-	{
-		plan.why = "extensions are running on the CPU";
-		return plan;
-	}
 	if (m_steadyPipeline != VK_NULL_HANDLE)
 	{
 		plan.why = "steady-state detection integrates energy over the whole grid, "
@@ -5406,53 +5365,50 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		m_dumpKeepFrom = numTS;
 
 	// On some drivers (notably RADV/AMDGPU), very long command buffers can
-	// trigger GPU watchdog resets. Split pure-GPU batches into smaller submits.
-	if (!m_hasCPUExtensions)
+	// trigger GPU watchdog resets. Split batches into smaller submits.
+	if (iterTS > m_maxTSPerSubmit)
 	{
-		if (iterTS > m_maxTSPerSubmit)
+		if (g_settings.GetVerboseLevel() > 1)
+			cout << "Engine_Vulkan: splitting " << iterTS
+			     << " timesteps into chunks of " << m_maxTSPerSubmit
+			     << " (progress every ~" << m_chunkProgressIntervalSec << " s)"
+			     << endl;
+
+		unsigned int submitted = 0;
+		unsigned int remaining = iterTS;
+		while (remaining > 0)
 		{
-			if (g_settings.GetVerboseLevel() > 1)
-				cout << "Engine_Vulkan: splitting " << iterTS
-				     << " timesteps into chunks of " << m_maxTSPerSubmit
-				     << " (progress every ~" << m_chunkProgressIntervalSec << " s)"
-				     << endl;
+			unsigned int chunk = std::min(remaining, m_maxTSPerSubmit);
+			if (!IterateTS(chunk))
+				return false;
+			remaining -= chunk;
+			submitted += chunk;
 
-			unsigned int submitted = 0;
-			unsigned int remaining = iterTS;
-			while (remaining > 0)
+			if (g_settings.GetVerboseLevel() > 0)
 			{
-				unsigned int chunk = std::min(remaining, m_maxTSPerSubmit);
-				if (!IterateTS(chunk))
-					return false;
-				remaining -= chunk;
-				submitted += chunk;
-
-				if (g_settings.GetVerboseLevel() > 0)
+				auto now = std::chrono::steady_clock::now();
+				bool printNow = !m_chunkProgressHasLastPrint;
+				if (!printNow)
 				{
-					auto now = std::chrono::steady_clock::now();
-					bool printNow = !m_chunkProgressHasLastPrint;
-					if (!printNow)
-					{
-						double dt = std::chrono::duration<double>(now - m_chunkProgressLastPrint).count();
-						printNow = (dt >= m_chunkProgressIntervalSec);
-					}
-					if (printNow)
-					{
-						unsigned int pct = (iterTS > 0)
-						                 ? (unsigned int)((100ULL * submitted + (iterTS / 2)) / iterTS)
-						                 : 100U;
-						cout << "Engine_Vulkan: chunk progress " << submitted << "/" << iterTS
-						     << " TS (" << pct << "%)";
-						if (m_speculativeTS > 0)
-							cout << " [speculative]";
-						cout << endl;
-						m_chunkProgressLastPrint = now;
-						m_chunkProgressHasLastPrint = true;
-					}
+					double dt = std::chrono::duration<double>(now - m_chunkProgressLastPrint).count();
+					printNow = (dt >= m_chunkProgressIntervalSec);
+				}
+				if (printNow)
+				{
+					unsigned int pct = (iterTS > 0)
+					                 ? (unsigned int)((100ULL * submitted + (iterTS / 2)) / iterTS)
+					                 : 100U;
+					cout << "Engine_Vulkan: chunk progress " << submitted << "/" << iterTS
+					     << " TS (" << pct << "%)";
+					if (m_speculativeTS > 0)
+						cout << " [speculative]";
+					cout << endl;
+					m_chunkProgressLastPrint = now;
+					m_chunkProgressHasLastPrint = true;
 				}
 			}
-			return true;
 		}
+		return true;
 	}
 
 	uint32_t N  = numLines[0] * numLines[1] * numLines[2];
@@ -5477,489 +5433,248 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
-	if (!m_hasCPUExtensions)
+	// Fire-and-forget, double-buffered: record the batch into
+	// m_cmdBufs[m_cmdIdx], submit it, flip to the other slot.  Probes and
+	// field dumps are gathered at the end of the batch; see GetVolt() for the
+	// rest.
+	EnsureDumpResources();
+
+	bool hasExcVolt = m_hasGPUExcitation && m_excVoltCount > 0;
+	bool hasExcCurr = m_hasGPUExcitation && m_excCurrCount > 0;
+	bool hasDispVoltADE = false;
+	bool hasDispCurrADE = false;
+	for (const auto& d : m_gpuDisp)
 	{
-		// ========== Pure GPU path: fire-and-forget double-buffered ==========
-		// Record FDTD compute into m_cmdBufs[m_cmdIdx], submit immediately,
-		// flip to the other slot.  Probes and field dumps are gathered at the
-		// end of the batch; see GetVolt() for the rest.
-		if (m_deviceDirty) SyncFieldsToDevice();
-		EnsureDumpResources();
+		hasDispVoltADE = hasDispVoltADE || d.voltADEOn;
+		hasDispCurrADE = hasDispCurrADE || d.currADEOn;
+		if (hasDispVoltADE && hasDispCurrADE) break;
+	}
+	bool needPostVoltBarrierFused = (m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC);
+	bool needPostCurrBarrierFused = (m_hasGPU_TFSF || hasDispCurrADE);
+	bool needPostVoltBarrier = (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC);
+	bool needPostCurrBarrier = (m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE);
+	bool hasVoltLateWritesFused = hasExcVolt || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
+	bool hasCurrLateWritesFused = hasExcCurr || m_hasGPU_TFSF || hasDispCurrADE;
+	// With m_murFused the Mur post and apply happen inside the voltage
+	// update (SetupMurFusion()); only the separate phases need the rest.
+	const bool murSeparate = m_hasGPU_Mur && !m_murFused;
+	bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
+	bool hasCurrLateWrites = hasExcCurr || m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE;
+	bool useAsyncProbeCopy = m_hasDedicatedTransferQueue && m_hasGPU_Probes &&
+	                         (m_probeCacheCount > 0) && !m_probeOutMapped &&
+	                         (m_probeReadbackMapped[m_cmdIdx] != nullptr);
 
-		bool hasExcVolt = m_hasGPUExcitation && m_excVoltCount > 0;
-		bool hasExcCurr = m_hasGPUExcitation && m_excCurrCount > 0;
-		bool hasDispVoltADE = false;
-		bool hasDispCurrADE = false;
-		for (const auto& d : m_gpuDisp)
+	// Cache TF/SF signal info (invariant across iterations)
+	Excitation* tfsfExc = nullptr;
+	int         tfsfSigPeriod = 0;
+	uint32_t    tfsfSigLen = 0;
+	if (m_hasGPU_TFSF)
+	{
+		tfsfExc = const_cast<Operator*>(Op)->GetExcitationSignal();
+		if (tfsfExc)
 		{
-			hasDispVoltADE = hasDispVoltADE || d.voltADEOn;
-			hasDispCurrADE = hasDispCurrADE || d.currADEOn;
-			if (hasDispVoltADE && hasDispCurrADE) break;
+			tfsfSigLen = (uint32_t)tfsfExc->GetLength();
+			tfsfSigPeriod = (tfsfExc->GetSignalPeriod() > 0)
+			              ? (int)(tfsfExc->GetSignalPeriod() / tfsfExc->GetTimestep()) : 0;
 		}
-		bool needPostVoltBarrierFused = (m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC);
-		bool needPostCurrBarrierFused = (m_hasGPU_TFSF || hasDispCurrADE);
-		bool needPostVoltBarrier = (m_hasGPU_UPML || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC);
-		bool needPostCurrBarrier = (m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE);
-		bool hasVoltLateWritesFused = hasExcVolt || m_hasGPU_Mur || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
-		bool hasCurrLateWritesFused = hasExcCurr || m_hasGPU_TFSF || hasDispCurrADE;
-		// With m_murFused the Mur post and apply happen inside the voltage
-		// update (SetupMurFusion()); only the separate phases need the rest.
-		const bool murSeparate = m_hasGPU_Mur && !m_murFused;
-		bool hasVoltLateWrites = hasExcVolt || m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF || hasDispVoltADE || m_hasGPU_RLC;
-		bool hasCurrLateWrites = hasExcCurr || m_hasGPU_UPML || m_hasGPU_TFSF || hasDispCurrADE;
-		bool useAsyncProbeCopy = m_hasDedicatedTransferQueue && m_hasGPU_Probes &&
-		                         (m_probeCacheCount > 0) && !m_probeOutMapped &&
-		                         (m_probeReadbackMapped[m_cmdIdx] != nullptr);
+	}
 
-		// Cache TF/SF signal info (invariant across iterations)
-		Excitation* tfsfExc = nullptr;
-		int         tfsfSigPeriod = 0;
-		uint32_t    tfsfSigLen = 0;
-		if (m_hasGPU_TFSF)
+	// Wait for this slot if it is still in-flight from a previous round
+	if (m_gpuInFlight[m_cmdIdx])
+	{
+		auto t0 = std::chrono::steady_clock::now();
+		vkWaitForFences(m_device, 1, &m_fences[m_cmdIdx], VK_TRUE, UINT64_MAX);
+		auto t1 = std::chrono::steady_clock::now();
+		if (m_profileEnabled)
 		{
-			tfsfExc = const_cast<Operator*>(Op)->GetExcitationSignal();
-			if (tfsfExc)
-			{
-				tfsfSigLen = (uint32_t)tfsfExc->GetLength();
-				tfsfSigPeriod = (tfsfExc->GetSignalPeriod() > 0)
-				              ? (int)(tfsfExc->GetSignalPeriod() / tfsfExc->GetTimestep()) : 0;
-			}
+			m_profileWaitMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+			CollectProfileForSlot(m_cmdIdx);
 		}
+		m_gpuInFlight[m_cmdIdx] = false;
+	}
+	if (m_probeTransferInFlight[m_cmdIdx])
+	{
+		vkWaitForFences(m_device, 1, &m_transferFences[m_cmdIdx], VK_TRUE, UINT64_MAX);
+		m_probeTransferInFlight[m_cmdIdx] = false;
+	}
 
-		// Wait for this slot if it is still in-flight from a previous round
-		if (m_gpuInFlight[m_cmdIdx])
-		{
-			auto t0 = std::chrono::steady_clock::now();
-			vkWaitForFences(m_device, 1, &m_fences[m_cmdIdx], VK_TRUE, UINT64_MAX);
-			auto t1 = std::chrono::steady_clock::now();
-			if (m_profileEnabled)
-			{
-				m_profileWaitMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
-				CollectProfileForSlot(m_cmdIdx);
-			}
-			m_gpuInFlight[m_cmdIdx] = false;
-		}
-		if (m_probeTransferInFlight[m_cmdIdx])
-		{
-			vkWaitForFences(m_device, 1, &m_transferFences[m_cmdIdx], VK_TRUE, UINT64_MAX);
-			m_probeTransferInFlight[m_cmdIdx] = false;
-		}
+	// Begin recording
+	VkCommandBuffer cmd = m_cmdBufs[m_cmdIdx];
+	VkCommandBufferBeginInfo bi{};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkResetCommandBuffer(cmd, 0);
+	VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+	uint32_t qBaseProfile = 0;
 
-		// Begin recording
-		VkCommandBuffer cmd = m_cmdBufs[m_cmdIdx];
-		VkCommandBufferBeginInfo bi{};
-		bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		vkResetCommandBuffer(cmd, 0);
-		VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-		uint32_t qBaseProfile = 0;
+	if (useAsyncProbeCopy)
+	{
+		// Acquire probe output buffer ownership from transfer queue before compute writes.
+		VkBufferMemoryBarrier ownAcquire{};
+		ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		ownAcquire.srcAccessMask = 0;
+		ownAcquire.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		ownAcquire.srcQueueFamilyIndex = m_transferQueueFamily;
+		ownAcquire.dstQueueFamilyIndex = m_computeQueueFamily;
+		ownAcquire.buffer = m_probeOutBuf.buffer;
+		ownAcquire.offset = 0;
+		ownAcquire.size = VK_WHOLE_SIZE;
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
+	}
 
-		if (useAsyncProbeCopy)
-		{
-			// Acquire probe output buffer ownership from transfer queue before compute writes.
-			VkBufferMemoryBarrier ownAcquire{};
-			ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			ownAcquire.srcAccessMask = 0;
-			ownAcquire.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			ownAcquire.srcQueueFamilyIndex = m_transferQueueFamily;
-			ownAcquire.dstQueueFamilyIndex = m_computeQueueFamily;
-			ownAcquire.buffer = m_probeOutBuf.buffer;
-			ownAcquire.offset = 0;
-			ownAcquire.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
-		}
+	if (m_profileEnabled && m_tsQueryPool)
+	{
+		qBaseProfile = (uint32_t)(m_cmdIdx * m_profileQueriesPerSlot);
+		vkCmdResetQueryPool(cmd, m_tsQueryPool, qBaseProfile, m_profileQueriesPerSlot);
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile);
+	}
 
-		if (m_profileEnabled && m_tsQueryPool)
-		{
-			qBaseProfile = (uint32_t)(m_cmdIdx * m_profileQueriesPerSlot);
-			vkCmdResetQueryPool(cmd, m_tsQueryPool, qBaseProfile, m_profileQueriesPerSlot);
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile);
-		}
-
-		// OPENEMS_GPU_PROFILE_STAGES: a timestamp after each stage of every
-		// flat-schedule timestep (s_profileStageNames).  A bottom-of-pipe
-		// timestamp is written once all earlier work has finished, so two
-		// consecutive marks bracket one stage, its barrier included.
-		uint32_t qStage = (uint32_t)(m_cmdIdx * m_stageQueriesPerSlot);
-		const auto stageMark = [&]()
-		{
-			if (m_stageQueryPool)
-				vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_stageQueryPool, qStage++);
-		};
+	// OPENEMS_GPU_PROFILE_STAGES: a timestamp after each stage of every
+	// flat-schedule timestep (s_profileStageNames).  A bottom-of-pipe
+	// timestamp is written once all earlier work has finished, so two
+	// consecutive marks bracket one stage, its barrier included.
+	uint32_t qStage = (uint32_t)(m_cmdIdx * m_stageQueriesPerSlot);
+	const auto stageMark = [&]()
+	{
 		if (m_stageQueryPool)
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_stageQueryPool, qStage++);
+	};
+	if (m_stageQueryPool)
+	{
+		vkCmdResetQueryPool(cmd, m_stageQueryPool, qStage, m_stageQueriesPerSlot);
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_stageQueryPool, qStage++);
+	}
+
+	// Append all FDTD timesteps
+	// ================= Trapezoidal temporal blocking ==================
+	// See ConfigureTemporalBlocking() for the schedule and its guards.  A
+	// block of kk timesteps is covered by one narrowing trapezoid per tile
+	// followed by one widening wedge per interior tile boundary; together
+	// they partition the domain, so every cell is updated exactly once per
+	// timestep and the result is bit-identical to the flat sweep.
+	if (!m_tbAnnounced)
+		const_cast<Engine_Vulkan*>(this)->ConfigureTemporalBlocking();
+	if (m_tbActive)
+	{
+		// k is clamped to the call's timestep count, so a short IterateTS
+		// (openems.cpp passes the number of steps until the next probe or
+		// dump) stays correct with no work on the caller's side: the grid
+		// is globally coherent at the end of every call.
+		const unsigned int k = std::min<unsigned int>(m_tbK, iterTS);
+		for (unsigned int base = 0; base < iterTS; base += k)
 		{
-			vkCmdResetQueryPool(cmd, m_stageQueryPool, qStage, m_stageQueriesPerSlot);
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_stageQueryPool, qStage++);
+			const int kk = (int)std::min<unsigned int>(k, iterTS - base);
+			const uint32_t t0 = numTS + base;
+			for (size_t i = 0; i + 1 < m_tbEdges.size(); ++i)
+				RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i + 1], kk, +1, t0,
+				                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
+			for (size_t i = 1; i + 1 < m_tbEdges.size(); ++i)
+				RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i], kk, -1, t0,
+				                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
 		}
+	}
+	else
+	for (unsigned int iter = 0; iter < iterTS; ++iter)
+	{
+		uint32_t ts = numTS + iter;
 
-		// Append all FDTD timesteps
-		// ================= Trapezoidal temporal blocking ==================
-		// See ConfigureTemporalBlocking() for the schedule and its guards.  A
-		// block of kk timesteps is covered by one narrowing trapezoid per tile
-		// followed by one widening wedge per interior tile boundary; together
-		// they partition the domain, so every cell is updated exactly once per
-		// timestep and the result is bit-identical to the flat sweep.
-		if (!m_tbAnnounced)
-			const_cast<Engine_Vulkan*>(this)->ConfigureTemporalBlocking();
-		if (m_tbActive)
+		if (m_hasFusedUPML)
 		{
-			// k is clamped to the call's timestep count, so a short IterateTS
-			// (openems.cpp passes the number of steps until the next probe or
-			// dump) stays correct with no work on the caller's side: the grid
-			// is globally coherent at the end of every call.
-			const unsigned int k = std::min<unsigned int>(m_tbK, iterTS);
-			for (unsigned int base = 0; base < iterTS; base += k)
+			// ============= FUSED Yee+UPML path =============
+			// Single dispatch replaces: UPML pre-volt + Yee volt + UPML post-volt
+			// Mur/RLC/Dispersive pre-voltage still dispatch separately before fused
+			if (m_hasGPU_Mur || m_hasGPU_RLC || m_hasGPU_Dispersive)
 			{
-				const int kk = (int)std::min<unsigned int>(k, iterTS - base);
-				const uint32_t t0 = numTS + base;
-				for (size_t i = 0; i + 1 < m_tbEdges.size(); ++i)
-					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i + 1], kk, +1, t0,
-					                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
-				for (size_t i = 1; i + 1 < m_tbEdges.size(); ++i)
-					RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i], kk, -1, t0,
-					                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
-			}
-		}
-		else
-		for (unsigned int iter = 0; iter < iterTS; ++iter)
-		{
-			uint32_t ts = numTS + iter;
-
-			if (m_hasFusedUPML)
-			{
-				// ============= FUSED Yee+UPML path =============
-				// Single dispatch replaces: UPML pre-volt + Yee volt + UPML post-volt
-				// Mur/RLC/Dispersive pre-voltage still dispatch separately before fused
-				if (m_hasGPU_Mur || m_hasGPU_RLC || m_hasGPU_Dispersive)
-				{
-					// Record non-UPML pre-voltage extensions
-					// Mur pre-voltage
-					if (!m_gpuMur.empty())
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPreVoltPipeline);
-					for (const auto& m : m_gpuMur)
-					{
-						if (ts < m.startTS) continue;
-						uint32_t groups = (m.totalCells + 255) / 256;
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_murUpdatePipeLayout, 0, 1, &m.preDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					// RLC pre-voltage
-					if (m_hasGPU_RLC)
-					{
-						RlcPC pc = {m_gpuRLC.count};
-						uint32_t groups = (m_gpuRLC.count + 255) / 256;
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcPreVoltPipeline);
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_rlcPrePipeLayout, 0, 1, &m_gpuRLC.preDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_rlcPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					// Dispersive pre-voltage
-					if (!m_gpuDisp.empty())
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
-					for (const auto& d : m_gpuDisp)
-					{
-						if (!d.voltADEOn) continue;
-						uint32_t groups = (d.count + 255) / 256;
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					CmdComputeBarrier(cmd, barrier);
-				}
-				RecordLocalABCPhase(cmd, 0);
-				stageMark();
-
-				// --- Fused voltage update (Yee + UPML pre + UPML post in one dispatch) ---
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_fusedPipeLayout, 0, 1, &m_fusedVoltDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(FusedPC), &fusedPC);
-				vkCmdDispatch(cmd, voltGroups, 1, 1);
-
-				CmdComputeBarrier(cmd, barrier);
-				stageMark();
-				if (m_validateStages)
-					RecordGPUFieldValidation(cmd, 16);
-
-				// --- Post-voltage: non-UPML only (Mur, TF/SF) ---
-				// (UPML post-voltage is fused into the main dispatch above)
-				if (m_hasGPU_Mur || m_hasGPU_TFSF)
-				{
-					// Mur post-voltage
-					if (!m_gpuMur.empty())
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
-					for (const auto& m : m_gpuMur)
-					{
-						if (ts < m.startTS) continue;
-						uint32_t groups = (m.totalCells + 255) / 256;
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					// TF/SF voltage injection
-					if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
-					{
-						TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
-						uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-						                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					CmdComputeBarrier(cmd, barrier);
-				}
-				RecordLocalABCPhase(cmd, 1);
-				stageMark();
-
-				// --- Apply2Voltages (dispersive, Mur, RLC — same as non-fused path) ---
-				if (!m_gpuDisp.empty())
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
-				for (const auto &d : m_gpuDisp)
-				{
-					if (!d.voltADEOn)
-						continue;
-					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
-					uint32_t groups = (d.count + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
-											&d.applyVoltDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
-									   &dpc);
-					vkCmdDispatch(cmd, groups, 1, 1);
-					CmdComputeBarrier(cmd, barrier);
-				}
+				// Record non-UPML pre-voltage extensions
+				// Mur pre-voltage
 				if (!m_gpuMur.empty())
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
-				for (const auto &m : m_gpuMur)
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPreVoltPipeline);
+				for (const auto& m : m_gpuMur)
 				{
-					if (ts < m.startTS)
-						continue;
+					if (ts < m.startTS) continue;
 					uint32_t groups = (m.totalCells + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1,
-											&m.applyDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_murUpdatePipeLayout, 0, 1, &m.preDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
-				// Mur and RLC can share cells; the CPU applies them in this order.
-				if (m_hasGPU_Mur && m_hasGPU_RLC)
-					CmdComputeBarrier(cmd, barrier);
+				// RLC pre-voltage
 				if (m_hasGPU_RLC)
 				{
 					RlcPC pc = {m_gpuRLC.count};
 					uint32_t groups = (m_gpuRLC.count + 255) / 256;
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyPipeLayout, 0, 1,
-											&m_gpuRLC.applyDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
-					vkCmdDispatch(cmd, groups, 1, 1);
-				}
-				// A lumped port puts its resistor and its excitation on the same
-				// edges.  Without this barrier the excitation's += and the RLC's
-				// write are unordered.
-				if ((m_hasGPU_Mur || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
-					CmdComputeBarrier(cmd, barrier);
-				RecordLocalABCPhase(cmd, 2);
-
-				// --- Voltage excitation ---
-				// Match Engine::Apply2Voltages(): dispersive and RLC corrections
-				// precede the low-priority excitation extension.
-				if (hasExcVolt)
-				{
-					ExcPC epc = {m_excVoltCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod};
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcPreVoltPipeline);
 					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
-					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-					                   0, sizeof(ExcPC), &epc);
-					vkCmdDispatch(cmd, excVoltGroups, 1, 1);
-				}
-
-				// Late voltage writes must be visible to pre-current extensions
-				// and to the fused Yee current update.
-				if (hasVoltLateWritesFused)
-				{
-					CmdComputeBarrier(cmd, barrier);
-				}
-				if (m_validateStages)
-					RecordGPUFieldValidation(cmd, 32);
-				RecordSteadyStateSample(cmd, ts);
-				stageMark();
-
-				// --- Fused current update (Yee + UPML pre + UPML post) ---
-				// Pre-current non-UPML extensions (dispersive)
-				if (m_hasGPU_Dispersive)
-				{
-					if (!m_gpuDisp.empty())
-						vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreCurrPipeline);
-					for (const auto &d : m_gpuDisp)
-					{
-						if (!d.currADEOn)
-							continue;
-						uint32_t groups = (d.count + 255) / 256;
-						vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPrePipeLayout, 0, 1,
-												&d.preCurrDesc, 0, nullptr);
-						vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
-										   &d.currPC);
-						vkCmdDispatch(cmd, groups, 1, 1);
-					}
-					CmdComputeBarrier(cmd, barrier);
-				}
-				RecordLocalABCPhase(cmd, 3);
-				stageMark();
-
-				// Fused current dispatch (Yee + UPML pre/post)
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedPipeLayout, 0, 1,
-										&m_fusedCurrDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FusedPC), &fusedPC);
-				vkCmdDispatch(cmd, voltGroups, 1, 1); // dispatch N threads (same as voltage)
-
-				CmdComputeBarrier(cmd, barrier);
-				stageMark();
-				if (m_validateStages)
-					RecordGPUFieldValidation(cmd, 64);
-
-				// --- Post-current: TF/SF only (UPML is fused) ---
-				if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
-				{
-					TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
-					uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfPipeLayout, 0, 1,
-											&m_gpuTFSF.currDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+					                        m_rlcPrePipeLayout, 0, 1, &m_gpuRLC.preDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_rlcPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
-				if (m_hasGPU_TFSF && hasDispCurrADE)
-				{
-					CmdComputeBarrier(cmd, barrier);
-				}
-				RecordLocalABCPhase(cmd, 4);
-				// Dispersive apply current
+				// Dispersive pre-voltage
 				if (!m_gpuDisp.empty())
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
-				for (const auto &d : m_gpuDisp)
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
+				for (const auto& d : m_gpuDisp)
 				{
-					if (!d.currADEOn)
-						continue;
-					DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+					if (!d.voltADEOn) continue;
 					uint32_t groups = (d.count + 255) / 256;
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
-											&d.applyCurrDesc, 0, nullptr);
-					vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
-									   &dpc);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
 					vkCmdDispatch(cmd, groups, 1, 1);
-					CmdComputeBarrier(cmd, barrier);
 				}
-				RecordLocalABCPhase(cmd, 5);
-
-				// --- Current excitation ---
-				// Match Engine::Apply2Current(): dispersive corrections precede
-				// the low-priority excitation extension.
-				if (hasExcCurr)
-				{
-					ExcPC epc = {m_excCurrCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod};
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeLayout, 0, 1,
-											&m_excCurrDescSet, 0, nullptr);
-					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC), &epc);
-					vkCmdDispatch(cmd, excCurrGroups, 1, 1);
-				}
-				if (hasCurrLateWritesFused)
-				{
-					CmdComputeBarrier(cmd, barrier);
-				}
-				if (m_validateStages)
-					RecordGPUFieldValidation(cmd, 80);
+				CmdComputeBarrier(cmd, barrier);
 			}
-			else
-			{
-			// ============= Original separate-dispatch path =============
-			// === Pre-voltage extensions (GPU) ===
-			RecordVoltageExtensions(cmd, ts);
-			if (m_validateStages)
-				RecordGPUFieldValidation(cmd, 0);
+			RecordLocalABCPhase(cmd, 0);
 			stageMark();
 
-			// --- Voltage update (with Mur post and apply, when fused) ---
-			{
-				const VkPipelineLayout vLayout = m_murFused ? m_murFusedPipeLayout : m_fdtdPipeLayout;
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                  m_murFused ? m_murFusedPipeline : m_updateVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vLayout, 0, 1,
-				                        m_murFused ? &m_murFusedDescSet : &m_updateVoltDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, vLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(GridPC), &gridPC);
-				vkCmdDispatch(cmd, voltGroups, 1, 1);
-			}
+			// --- Fused voltage update (Yee + UPML pre + UPML post in one dispatch) ---
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_fusedPipeLayout, 0, 1, &m_fusedVoltDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(FusedPC), &fusedPC);
+			vkCmdDispatch(cmd, voltGroups, 1, 1);
 
 			CmdComputeBarrier(cmd, barrier);
 			stageMark();
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 16);
 
-			// === Post-voltage extensions (GPU) ===
-			// UPML post-voltage
-			if (!m_gpuUPML.empty())
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostVoltPipeline);
-			for (const auto& u : m_gpuUPML)
+			// --- Post-voltage: non-UPML only (Mur, TF/SF) ---
+			// (UPML post-voltage is fused into the main dispatch above)
+			if (m_hasGPU_Mur || m_hasGPU_TFSF)
 			{
-				uint32_t groups = (u.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_upmlPostPipeLayout, 0, 1, &u.postVoltDesc, 0, nullptr);
-			vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
-				vkCmdDispatch(cmd, groups, 1, 1);
-			}
-			// UPML post-voltage turns the flux back into the field; Mur and
-			// TF/SF come after it on the CPU and may read the same cells.
-			if (!m_gpuUPML.empty() && (m_hasGPU_Mur || m_hasGPU_TFSF))
-				CmdComputeBarrier(cmd, barrier);
-
-			// Mur post-voltage (accumulates shifted field)
-			if (murSeparate)
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
-			for (const auto& m : m_gpuMur)
-			{
-				if (!murSeparate) break;
-				if (ts < m.startTS) continue;
-				uint32_t groups = (m.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
-			vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
-				vkCmdDispatch(cmd, groups, 1, 1);
-			}
-
-			// TF/SF voltage injection
-			if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
-			{
-				TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
-				uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
-				vkCmdDispatch(cmd, groups, 1, 1);
-			}
-
-			// Barrier for post-voltage writes
-			if (m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF)
-			{
+				// Mur post-voltage
+				if (!m_gpuMur.empty())
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
+				for (const auto& m : m_gpuMur)
+				{
+					if (ts < m.startTS) continue;
+					uint32_t groups = (m.totalCells + 255) / 256;
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+				vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				// TF/SF voltage injection
+				if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
+				{
+					TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
+					uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+					                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
 				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 1);
 			stageMark();
 
-			// === Apply2Voltages extensions (GPU) ===
-			// Dispersive apply
+			// --- Apply2Voltages (dispersive, Mur, RLC — same as non-fused path) ---
 			if (!m_gpuDisp.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
 			for (const auto &d : m_gpuDisp)
@@ -5970,31 +5685,26 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				uint32_t groups = (d.count + 255) / 256;
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
 										&d.applyVoltDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+								   &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 				CmdComputeBarrier(cmd, barrier);
 			}
-
-			// Mur apply (overwrites boundary voltages)
-			if (murSeparate)
+			if (!m_gpuMur.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
 			for (const auto &m : m_gpuMur)
 			{
-				if (!murSeparate)
-					break;
 				if (ts < m.startTS)
 					continue;
 				uint32_t groups = (m.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1, &m.applyDesc,
-										0, nullptr);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1,
+										&m.applyDesc, 0, nullptr);
 				vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
 			// Mur and RLC can share cells; the CPU applies them in this order.
-			if (murSeparate && m_hasGPU_RLC)
+			if (m_hasGPU_Mur && m_hasGPU_RLC)
 				CmdComputeBarrier(cmd, barrier);
-
-			// RLC apply
 			if (m_hasGPU_RLC)
 			{
 				RlcPC pc = {m_gpuRLC.count};
@@ -6008,7 +5718,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			// A lumped port puts its resistor and its excitation on the same
 			// edges.  Without this barrier the excitation's += and the RLC's
 			// write are unordered.
-			if ((murSeparate || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
+			if ((m_hasGPU_Mur || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
 				CmdComputeBarrier(cmd, barrier);
 			RecordLocalABCPhase(cmd, 2);
 
@@ -6026,7 +5736,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdDispatch(cmd, excVoltGroups, 1, 1);
 			}
 
-			if (hasVoltLateWrites)
+			// Late voltage writes must be visible to pre-current extensions
+			// and to the fused Yee current update.
+			if (hasVoltLateWritesFused)
 			{
 				CmdComputeBarrier(cmd, barrier);
 			}
@@ -6035,40 +5747,41 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			RecordSteadyStateSample(cmd, ts);
 			stageMark();
 
-			// === Pre-current extensions (GPU) ===
-			RecordCurrentExtensions(cmd, ts);
-			if (m_validateStages)
-				RecordGPUFieldValidation(cmd, 48);
+			// --- Fused current update (Yee + UPML pre + UPML post) ---
+			// Pre-current non-UPML extensions (dispersive)
+			if (m_hasGPU_Dispersive)
+			{
+				if (!m_gpuDisp.empty())
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreCurrPipeline);
+				for (const auto &d : m_gpuDisp)
+				{
+					if (!d.currADEOn)
+						continue;
+					uint32_t groups = (d.count + 255) / 256;
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPrePipeLayout, 0, 1,
+											&d.preCurrDesc, 0, nullptr);
+					vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+									   &d.currPC);
+					vkCmdDispatch(cmd, groups, 1, 1);
+				}
+				CmdComputeBarrier(cmd, barrier);
+			}
+			RecordLocalABCPhase(cmd, 3);
 			stageMark();
 
-			// --- Current update ---
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet,
-									0, nullptr);
-			vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPCc);
-			vkCmdDispatch(cmd, currGroups, 1, 1);
+			// Fused current dispatch (Yee + UPML pre/post)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedCurrPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedPipeLayout, 0, 1,
+									&m_fusedCurrDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_fusedPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FusedPC), &fusedPC);
+			vkCmdDispatch(cmd, voltGroups, 1, 1); // dispatch N threads (same as voltage)
 
 			CmdComputeBarrier(cmd, barrier);
 			stageMark();
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 64);
 
-			// === Post-current extensions (GPU) ===
-			// UPML post-current
-			if (!m_gpuUPML.empty())
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostCurrPipeline);
-			for (const auto &u : m_gpuUPML)
-			{
-				uint32_t groups = (u.totalCells + 255) / 256;
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostPipeLayout, 0, 1,
-										&u.postCurrDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
-				vkCmdDispatch(cmd, groups, 1, 1);
-			}
-			if (!m_gpuUPML.empty() && m_hasGPU_TFSF && m_gpuTFSF.currCount > 0)
-				CmdComputeBarrier(cmd, barrier);
-
-			// TF/SF current injection
+			// --- Post-current: TF/SF only (UPML is fused) ---
 			if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
 			{
 				TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
@@ -6079,13 +5792,11 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 			}
-
-			if ((m_hasGPU_UPML || m_hasGPU_TFSF) && hasDispCurrADE)
+			if (m_hasGPU_TFSF && hasDispCurrADE)
 			{
 				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 4);
-
 			// Dispersive apply current
 			if (!m_gpuDisp.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
@@ -6097,7 +5808,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				uint32_t groups = (d.count + 255) / 256;
 				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
 										&d.applyCurrDesc, 0, nullptr);
-				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+				vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC),
+								   &dpc);
 				vkCmdDispatch(cmd, groups, 1, 1);
 				CmdComputeBarrier(cmd, barrier);
 			}
@@ -6115,302 +5827,451 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC), &epc);
 				vkCmdDispatch(cmd, excCurrGroups, 1, 1);
 			}
-
-			if (hasCurrLateWrites)
+			if (hasCurrLateWritesFused)
 			{
 				CmdComputeBarrier(cmd, barrier);
 			}
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 80);
-			} // end else (original separate-dispatch path)
-			stageMark();
 		}
-
+		else
+		{
+		// ============= Original separate-dispatch path =============
+		// === Pre-voltage extensions (GPU) ===
+		RecordVoltageExtensions(cmd, ts);
 		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 0);
+		stageMark();
+
+		// --- Voltage update (with Mur post and apply, when fused) ---
 		{
-			VkMemoryBarrier hostBarrier{};
-			hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-			hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_HOST_BIT, 0,
-			                     1, &hostBarrier, 0, nullptr, 0, nullptr);
+			const VkPipelineLayout vLayout = m_murFused ? m_murFusedPipeLayout : m_fdtdPipeLayout;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                  m_murFused ? m_murFusedPipeline : m_updateVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vLayout, 0, 1,
+			                        m_murFused ? &m_murFusedDescSet : &m_updateVoltDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, vLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(GridPC), &gridPC);
+			vkCmdDispatch(cmd, voltGroups, 1, 1);
 		}
 
-		if (m_steadyPipeline)
-		{
-			VkMemoryBarrier hostBarrier{};
-			hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-			hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_HOST_BIT, 0,
-			                     1, &hostBarrier, 0, nullptr, 0, nullptr);
-		}
+		CmdComputeBarrier(cmd, barrier);
+		stageMark();
+		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 16);
 
-		if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
+		// === Post-voltage extensions (GPU) ===
+		// UPML post-voltage
+		if (!m_gpuUPML.empty())
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostVoltPipeline);
+		for (const auto& u : m_gpuUPML)
 		{
-			// End of compute/update section (before probe gather/copy section)
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile + 1);
-		}
-
-		// --- Probe gather: append at end of batch ----------------------
-		if (m_hasGPU_Probes && m_probeCacheCount > 0)
-		{
-			// Final barrier: ensure all Yee/extension writes are visible
-			vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-			uint32_t probeGroups = (m_probeCacheCount + 255) / 256;
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_probePipeline);
+			uint32_t groups = (u.totalCells + 255) / 256;
 			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_probePipeLayout, 0, 1, &m_probeGatherDescSet, 0, nullptr);
-			vkCmdPushConstants(cmd, m_probePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(uint32_t), &m_probeCacheCount);
-			vkCmdDispatch(cmd, probeGroups, 1, 1);
-
-			if (m_probeOutMapped)
-			{
-				VkMemoryBarrier hostBarrier{};
-				hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-				hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-				hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-					0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
-			}
-
-			// If probe output is not directly mapped, enqueue a device->host
-			// copy into the readback ring for this submission slot.
-			if (useAsyncProbeCopy)
-			{
-				VkBufferMemoryBarrier ownRelease{};
-				ownRelease.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				ownRelease.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-				ownRelease.dstAccessMask = 0;
-				ownRelease.srcQueueFamilyIndex = m_computeQueueFamily;
-				ownRelease.dstQueueFamilyIndex = m_transferQueueFamily;
-				ownRelease.buffer = m_probeOutBuf.buffer;
-				ownRelease.offset = 0;
-				ownRelease.size = VK_WHOLE_SIZE;
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-					0, 0, nullptr, 1, &ownRelease, 0, nullptr);
-			}
-			else if (!m_probeOutMapped && m_probeReadbackMapped[m_cmdIdx])
-			{
-				VkMemoryBarrier xferBarrier{};
-				xferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-				xferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-				xferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					VK_PIPELINE_STAGE_TRANSFER_BIT,
-					0, 1, &xferBarrier, 0, nullptr, 0, nullptr);
-
-				VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
-				vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
-				                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
-			}
+			                        m_upmlPostPipeLayout, 0, 1, &u.postVoltDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
 		}
+		// UPML post-voltage turns the flux back into the field; Mur and
+		// TF/SF come after it on the CPU and may read the same cells.
+		if (!m_gpuUPML.empty() && (m_hasGPU_Mur || m_hasGPU_TFSF))
+			CmdComputeBarrier(cmd, barrier);
 
-		if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
+		// Mur post-voltage (accumulates shifted field)
+		if (murSeparate)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murPostVoltPipeline);
+		for (const auto& m : m_gpuMur)
 		{
-			// End of probe section (or immediately after compute when no probes)
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile + 2);
+			if (!murSeparate) break;
+			if (ts < m.startTS) continue;
+			uint32_t groups = (m.totalCells + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_murUpdatePipeLayout, 0, 1, &m.postDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_murUpdatePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
 		}
 
-		// --- Field dumps due at the batch's last timestep ----------------
-		RecordDumpSamples(cmd, numTS + iterTS);
-
-		if (m_profileEnabled && m_tsQueryPool)
+		// TF/SF voltage injection
+		if (m_hasGPU_TFSF && m_gpuTFSF.voltCount > 0 && tfsfExc)
 		{
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-			                   m_tsQueryPool, qBaseProfile + (m_profileQueriesPerSlot - 1));
+			TfsfPC tpc = {m_gpuTFSF.voltCount, (int32_t)(ts+1), tfsfSigLen, tfsfSigPeriod};
+			uint32_t groups = (m_gpuTFSF.voltCount + 255) / 256;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_tfsfPipeLayout, 0, 1, &m_gpuTFSF.voltDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+			vkCmdDispatch(cmd, groups, 1, 1);
 		}
 
-		// --- End + submit (fire-and-forget) ---
-		VK_CHECK(vkEndCommandBuffer(cmd));
+		// Barrier for post-voltage writes
+		if (m_hasGPU_UPML || murSeparate || m_hasGPU_TFSF)
+		{
+			CmdComputeBarrier(cmd, barrier);
+		}
+		RecordLocalABCPhase(cmd, 1);
+		stageMark();
 
-		VkSubmitInfo si{};
-		si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		si.commandBufferCount = 1;
-		si.pCommandBuffers    = &cmd;
-		VkSemaphore signalSem = VK_NULL_HANDLE;
+		// === Apply2Voltages extensions (GPU) ===
+		// Dispersive apply
+		if (!m_gpuDisp.empty())
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
+		for (const auto &d : m_gpuDisp)
+		{
+			if (!d.voltADEOn)
+				continue;
+			DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+			uint32_t groups = (d.count + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+									&d.applyVoltDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+			CmdComputeBarrier(cmd, barrier);
+		}
+
+		// Mur apply (overwrites boundary voltages)
+		if (murSeparate)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
+		for (const auto &m : m_gpuMur)
+		{
+			if (!murSeparate)
+				break;
+			if (ts < m.startTS)
+				continue;
+			uint32_t groups = (m.totalCells + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyPipeLayout, 0, 1, &m.applyDesc,
+									0, nullptr);
+			vkCmdPushConstants(cmd, m_murApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MurPC), &m.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+		}
+		// Mur and RLC can share cells; the CPU applies them in this order.
+		if (murSeparate && m_hasGPU_RLC)
+			CmdComputeBarrier(cmd, barrier);
+
+		// RLC apply
+		if (m_hasGPU_RLC)
+		{
+			RlcPC pc = {m_gpuRLC.count};
+			uint32_t groups = (m_gpuRLC.count + 255) / 256;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyVoltPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rlcApplyPipeLayout, 0, 1,
+									&m_gpuRLC.applyDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_rlcApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RlcPC), &pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+		}
+		// A lumped port puts its resistor and its excitation on the same
+		// edges.  Without this barrier the excitation's += and the RLC's
+		// write are unordered.
+		if ((murSeparate || m_hasGPU_RLC) && (hasExcVolt || !m_gpuLocalABC.empty()))
+			CmdComputeBarrier(cmd, barrier);
+		RecordLocalABCPhase(cmd, 2);
+
+		// --- Voltage excitation ---
+		// Match Engine::Apply2Voltages(): dispersive and RLC corrections
+		// precede the low-priority excitation extension.
+		if (hasExcVolt)
+		{
+			ExcPC epc = {m_excVoltCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod};
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(ExcPC), &epc);
+			vkCmdDispatch(cmd, excVoltGroups, 1, 1);
+		}
+
+		if (hasVoltLateWrites)
+		{
+			CmdComputeBarrier(cmd, barrier);
+		}
+		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 32);
+		RecordSteadyStateSample(cmd, ts);
+		stageMark();
+
+		// === Pre-current extensions (GPU) ===
+		RecordCurrentExtensions(cmd, ts);
+		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 48);
+		stageMark();
+
+		// --- Current update ---
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet,
+								0, nullptr);
+		vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GridPC), &gridPCc);
+		vkCmdDispatch(cmd, currGroups, 1, 1);
+
+		CmdComputeBarrier(cmd, barrier);
+		stageMark();
+		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 64);
+
+		// === Post-current extensions (GPU) ===
+		// UPML post-current
+		if (!m_gpuUPML.empty())
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostCurrPipeline);
+		for (const auto &u : m_gpuUPML)
+		{
+			uint32_t groups = (u.totalCells + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPostPipeLayout, 0, 1,
+									&u.postCurrDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_upmlPostPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+		}
+		if (!m_gpuUPML.empty() && m_hasGPU_TFSF && m_gpuTFSF.currCount > 0)
+			CmdComputeBarrier(cmd, barrier);
+
+		// TF/SF current injection
+		if (m_hasGPU_TFSF && m_gpuTFSF.currCount > 0 && tfsfExc)
+		{
+			TfsfPC tpc = {m_gpuTFSF.currCount, (int32_t)(ts), tfsfSigLen, tfsfSigPeriod};
+			uint32_t groups = (m_gpuTFSF.currCount + 255) / 256;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfCurrPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tfsfPipeLayout, 0, 1,
+									&m_gpuTFSF.currDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_tfsfPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TfsfPC), &tpc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+		}
+
+		if ((m_hasGPU_UPML || m_hasGPU_TFSF) && hasDispCurrADE)
+		{
+			CmdComputeBarrier(cmd, barrier);
+		}
+		RecordLocalABCPhase(cmd, 4);
+
+		// Dispersive apply current
+		if (!m_gpuDisp.empty())
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyCurrPipeline);
+		for (const auto &d : m_gpuDisp)
+		{
+			if (!d.currADEOn)
+				continue;
+			DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
+			uint32_t groups = (d.count + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyPipeLayout, 0, 1,
+									&d.applyCurrDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_dispApplyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &dpc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+			CmdComputeBarrier(cmd, barrier);
+		}
+		RecordLocalABCPhase(cmd, 5);
+
+		// --- Current excitation ---
+		// Match Engine::Apply2Current(): dispersive corrections precede
+		// the low-priority excitation extension.
+		if (hasExcCurr)
+		{
+			ExcPC epc = {m_excCurrCount, (int32_t)ts, m_excSignalLen, m_excSignalPeriod};
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeLayout, 0, 1,
+									&m_excCurrDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExcPC), &epc);
+			vkCmdDispatch(cmd, excCurrGroups, 1, 1);
+		}
+
+		if (hasCurrLateWrites)
+		{
+			CmdComputeBarrier(cmd, barrier);
+		}
+		if (m_validateStages)
+			RecordGPUFieldValidation(cmd, 80);
+		} // end else (original separate-dispatch path)
+		stageMark();
+	}
+
+	if (m_validateStages)
+	{
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_HOST_BIT, 0,
+		                     1, &hostBarrier, 0, nullptr, 0, nullptr);
+	}
+
+	if (m_steadyPipeline)
+	{
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_HOST_BIT, 0,
+		                     1, &hostBarrier, 0, nullptr, 0, nullptr);
+	}
+
+	if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
+	{
+		// End of compute/update section (before probe gather/copy section)
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile + 1);
+	}
+
+	// --- Probe gather: append at end of batch ----------------------
+	if (m_hasGPU_Probes && m_probeCacheCount > 0)
+	{
+		// Final barrier: ensure all Yee/extension writes are visible
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+		uint32_t probeGroups = (m_probeCacheCount + 255) / 256;
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_probePipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+		                        m_probePipeLayout, 0, 1, &m_probeGatherDescSet, 0, nullptr);
+		vkCmdPushConstants(cmd, m_probePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(uint32_t), &m_probeCacheCount);
+		vkCmdDispatch(cmd, probeGroups, 1, 1);
+
+		if (m_probeOutMapped)
+		{
+			VkMemoryBarrier hostBarrier{};
+			hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+				0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
+		}
+
+		// If probe output is not directly mapped, enqueue a device->host
+		// copy into the readback ring for this submission slot.
 		if (useAsyncProbeCopy)
 		{
-			signalSem = m_probeCopySem[m_cmdIdx];
-			si.signalSemaphoreCount = 1;
-			si.pSignalSemaphores = &signalSem;
-		}
-		vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
-		VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
-		m_submitSerial[m_cmdIdx] = ++m_submitCount;
-
-		if (useAsyncProbeCopy)
-		{
-			VkCommandBuffer tcmd = m_transferCmdBufs[m_cmdIdx];
-			vkResetCommandBuffer(tcmd, 0);
-			VkCommandBufferBeginInfo tbi{};
-			tbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-			tbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-			VK_CHECK(vkBeginCommandBuffer(tcmd, &tbi));
-
-			VkBufferMemoryBarrier ownAcquire{};
-			ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			ownAcquire.srcAccessMask = 0;
-			ownAcquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			ownAcquire.srcQueueFamilyIndex = m_computeQueueFamily;
-			ownAcquire.dstQueueFamilyIndex = m_transferQueueFamily;
-			ownAcquire.buffer = m_probeOutBuf.buffer;
-			ownAcquire.offset = 0;
-			ownAcquire.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(tcmd,
-				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
-				0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
-
-			VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
-			vkCmdCopyBuffer(tcmd, m_probeOutBuf.buffer,
-			                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
-
 			VkBufferMemoryBarrier ownRelease{};
 			ownRelease.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			ownRelease.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			ownRelease.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 			ownRelease.dstAccessMask = 0;
-			ownRelease.srcQueueFamilyIndex = m_transferQueueFamily;
-			ownRelease.dstQueueFamilyIndex = m_computeQueueFamily;
+			ownRelease.srcQueueFamilyIndex = m_computeQueueFamily;
+			ownRelease.dstQueueFamilyIndex = m_transferQueueFamily;
 			ownRelease.buffer = m_probeOutBuf.buffer;
 			ownRelease.offset = 0;
 			ownRelease.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(tcmd,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 				0, 0, nullptr, 1, &ownRelease, 0, nullptr);
-
-			VK_CHECK(vkEndCommandBuffer(tcmd));
-
-			VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-			VkSubmitInfo tsi{};
-			tsi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-			tsi.waitSemaphoreCount = 1;
-			tsi.pWaitSemaphores = &signalSem;
-			tsi.pWaitDstStageMask = &waitStage;
-			tsi.commandBufferCount = 1;
-			tsi.pCommandBuffers = &tcmd;
-			vkResetFences(m_device, 1, &m_transferFences[m_cmdIdx]);
-			VK_CHECK(vkQueueSubmit(m_transferQueue, 1, &tsi, m_transferFences[m_cmdIdx]));
-			m_probeTransferInFlight[m_cmdIdx] = true;
 		}
-		m_gpuInFlight[m_cmdIdx] = true;
-		m_lastProbeSubmitSlot = m_cmdIdx;
-		if (m_profileEnabled)
+		else if (!m_probeOutMapped && m_probeReadbackMapped[m_cmdIdx])
 		{
-			m_profilePending[m_cmdIdx] = true;
-			m_profileSubmittedTS[m_cmdIdx] = iterTS;
-			m_profileRecordedTS += iterTS;
-			m_stageSlotTS[m_cmdIdx] = (m_stageQueryPool && !m_tbActive) ? iterTS : 0;
-		}
-		m_gpuDrained = false;  // new submission in flight
-		m_cmdIdx = (m_cmdIdx + 1) % CMD_RING_SIZE;
+			VkMemoryBarrier xferBarrier{};
+			xferBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			xferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			xferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 1, &xferBarrier, 0, nullptr, 0, nullptr);
 
-		numTS += iterTS;
-		m_liveTS = numTS;
-		m_hostDirty = true;
+			VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
+			vkCmdCopyBuffer(cmd, m_probeOutBuf.buffer,
+			                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
+		}
 	}
-	else
+
+	if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
 	{
-		// ========== Hybrid path: per-timestep with CPU extension sync =====
-		// Each cycle: GPU update → 1 download → CPU extensions → 1 upload
-		// Per timestep: 2 downloads + 2 uploads (minimum possible)
-		for (unsigned int iter = 0; iter < iterTS; ++iter)
-		{
-			// --- Pre-voltage extensions (CPU) ---
-			// Host is current from previous iteration's final upload,
-			// or from Init() on the first iteration.
-			DoPreVoltageUpdates();
-			m_deviceDirty = true;
-			SyncFieldsToDevice();
-
-			// --- GPU: voltage update + excitation ---
-			RunSingleCommand([&](VkCommandBuffer cmd)
-			{
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateVoltPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_fdtdPipeLayout, 0, 1, &m_updateVoltDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(GridPC), &gridPC);
-				vkCmdDispatch(cmd, voltGroups, 1, 1);
-
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-				if (m_hasGPUExcitation && m_excVoltCount > 0)
-				{
-					ExcPC epc = {m_excVoltCount, (int32_t)numTS, m_excSignalLen, m_excSignalPeriod};
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_excPipeLayout, 0, 1, &m_excVoltDescSet, 0, nullptr);
-					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-					                   0, sizeof(ExcPC), &epc);
-					vkCmdDispatch(cmd, excVoltGroups, 1, 1);
-				}
-			});
-
-			// --- Post-voltage + apply + pre-current extensions (CPU) ---
-			// Single download, batch all CPU voltage+current-prep work, single upload
-			m_hostDirty = true;
-			SyncFieldsToHost();
-			DoPostVoltageUpdates();
-			Apply2Voltages();
-			DoPreCurrentUpdates();
-			m_deviceDirty = true;
-			SyncFieldsToDevice();
-
-			// --- GPU: current update + excitation ---
-			RunSingleCommand([&](VkCommandBuffer cmd)
-			{
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateCurrPipeline);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-				                        m_fdtdPipeLayout, 0, 1, &m_updateCurrDescSet, 0, nullptr);
-				vkCmdPushConstants(cmd, m_fdtdPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-				                   0, sizeof(GridPC), &gridPCc);
-				vkCmdDispatch(cmd, currGroups, 1, 1);
-
-				vkCmdPipelineBarrier(cmd,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-				if (m_hasGPUExcitation && m_excCurrCount > 0)
-				{
-					ExcPC epc = {m_excCurrCount, (int32_t)numTS, m_excSignalLen, m_excSignalPeriod};
-					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_excPipeline);
-					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-					                        m_excPipeLayout, 0, 1, &m_excCurrDescSet, 0, nullptr);
-					vkCmdPushConstants(cmd, m_excPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-					                   0, sizeof(ExcPC), &epc);
-					vkCmdDispatch(cmd, excCurrGroups, 1, 1);
-				}
-			});
-
-			// --- Post-current + apply extensions (CPU) ---
-			m_hostDirty = true;
-			SyncFieldsToHost();
-			DoPostCurrentUpdates();
-			Apply2Current();
-			// Host is now current; device upload deferred to next iteration
-			m_deviceDirty = true;
-
-			++numTS;
-		}
-		// Final upload so device is consistent
-		if (m_deviceDirty) SyncFieldsToDevice();
-		m_hostDirty = false;
-		m_liveTS = numTS;
+		// End of probe section (or immediately after compute when no probes)
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_tsQueryPool, qBaseProfile + 2);
 	}
+
+	// --- Field dumps due at the batch's last timestep ----------------
+	RecordDumpSamples(cmd, numTS + iterTS);
+
+	if (m_profileEnabled && m_tsQueryPool)
+	{
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                   m_tsQueryPool, qBaseProfile + (m_profileQueriesPerSlot - 1));
+	}
+
+	// --- End + submit (fire-and-forget) ---
+	VK_CHECK(vkEndCommandBuffer(cmd));
+
+	VkSubmitInfo si{};
+	si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers    = &cmd;
+	VkSemaphore signalSem = VK_NULL_HANDLE;
+	if (useAsyncProbeCopy)
+	{
+		signalSem = m_probeCopySem[m_cmdIdx];
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = &signalSem;
+	}
+	vkResetFences(m_device, 1, &m_fences[m_cmdIdx]);
+	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[m_cmdIdx]));
+	m_submitSerial[m_cmdIdx] = ++m_submitCount;
+
+	if (useAsyncProbeCopy)
+	{
+		VkCommandBuffer tcmd = m_transferCmdBufs[m_cmdIdx];
+		vkResetCommandBuffer(tcmd, 0);
+		VkCommandBufferBeginInfo tbi{};
+		tbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		tbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		VK_CHECK(vkBeginCommandBuffer(tcmd, &tbi));
+
+		VkBufferMemoryBarrier ownAcquire{};
+		ownAcquire.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		ownAcquire.srcAccessMask = 0;
+		ownAcquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		ownAcquire.srcQueueFamilyIndex = m_computeQueueFamily;
+		ownAcquire.dstQueueFamilyIndex = m_transferQueueFamily;
+		ownAcquire.buffer = m_probeOutBuf.buffer;
+		ownAcquire.offset = 0;
+		ownAcquire.size = VK_WHOLE_SIZE;
+		vkCmdPipelineBarrier(tcmd,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 1, &ownAcquire, 0, nullptr);
+
+		VkBufferCopy copyRegion = {0, 0, m_probeCacheCount * sizeof(float)};
+		vkCmdCopyBuffer(tcmd, m_probeOutBuf.buffer,
+		                m_probeReadbackBuf[m_cmdIdx].buffer, 1, &copyRegion);
+
+		VkBufferMemoryBarrier ownRelease{};
+		ownRelease.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		ownRelease.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		ownRelease.dstAccessMask = 0;
+		ownRelease.srcQueueFamilyIndex = m_transferQueueFamily;
+		ownRelease.dstQueueFamilyIndex = m_computeQueueFamily;
+		ownRelease.buffer = m_probeOutBuf.buffer;
+		ownRelease.offset = 0;
+		ownRelease.size = VK_WHOLE_SIZE;
+		vkCmdPipelineBarrier(tcmd,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			0, 0, nullptr, 1, &ownRelease, 0, nullptr);
+
+		VK_CHECK(vkEndCommandBuffer(tcmd));
+
+		VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		VkSubmitInfo tsi{};
+		tsi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		tsi.waitSemaphoreCount = 1;
+		tsi.pWaitSemaphores = &signalSem;
+		tsi.pWaitDstStageMask = &waitStage;
+		tsi.commandBufferCount = 1;
+		tsi.pCommandBuffers = &tcmd;
+		vkResetFences(m_device, 1, &m_transferFences[m_cmdIdx]);
+		VK_CHECK(vkQueueSubmit(m_transferQueue, 1, &tsi, m_transferFences[m_cmdIdx]));
+		m_probeTransferInFlight[m_cmdIdx] = true;
+	}
+	m_gpuInFlight[m_cmdIdx] = true;
+	m_lastProbeSubmitSlot = m_cmdIdx;
+	if (m_profileEnabled)
+	{
+		m_profilePending[m_cmdIdx] = true;
+		m_profileSubmittedTS[m_cmdIdx] = iterTS;
+		m_profileRecordedTS += iterTS;
+		m_stageSlotTS[m_cmdIdx] = (m_stageQueryPool && !m_tbActive) ? iterTS : 0;
+	}
+	m_gpuDrained = false;  // new submission in flight
+	m_cmdIdx = (m_cmdIdx + 1) % CMD_RING_SIZE;
+
+	numTS += iterTS;
+	m_liveTS = numTS;
+	m_hostDirty = true;
 
 	if (m_validateStages)
 		ReportGPUFieldValidation(numTS);

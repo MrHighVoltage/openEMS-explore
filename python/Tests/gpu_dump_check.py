@@ -7,13 +7,11 @@
 One model, run one simulation at a time: a graded mesh with a lossy, dense
 dielectric block (J, D and SAR), a magnetic block (B), a Mur and a PML face,
 an E-field source, a voltage probe, and a voltage and a current probe that
-start late.  It dumps every time-domain type
-(E, H, J, rotH, D, B) in every interpolation (none, node, cell) on volumes,
-planes and sub-boxes, sub-sampled, inside a start/stop window and as VTK;
-frequency-domain E, H, J and rotH on planes and boxes; an NF2FF-style box of
-six E and six H faces; local and raw SAR.  A second model adds a local
-absorbing sheet, for the GPU-native sheet and for the hybrid loop it forces
-with OPENEMS_GPU_CPU_LOCAL_ABC=1.
+start late.  It dumps every time-domain type (E, H, J, rotH, D, B) in every
+interpolation (none, node, cell) on volumes, planes and sub-boxes,
+sub-sampled, inside a start/stop window and as VTK; frequency-domain E, H, J
+and rotH on planes and boxes; an NF2FF-style box of six E and six H faces;
+local and raw SAR.  A second model adds a local absorbing sheet.
 
 --engine=sse is the reference.  Every GPU variant must produce the same files,
 the same datasets (timesteps, frequencies, mesh) and attributes, and values
@@ -29,13 +27,11 @@ The variants cover the GPU paths a dump can take: the default, speculative
 depths auto and 4, the standard loop (OPENEMS_GPU_PIPELINE=0),
 frequency-domain dumps summed on the host (OPENEMS_GPU_DUMP_DFT=0),
 whole-field dumps (OPENEMS_GPU_DUMP_GATHER=0), forced temporal blocking with
-short submits, a model without probes, and the hybrid loop.
+short submits, the model without probes, and the one with the sheet.
 
 --ref adds the default GPU run of another build, reported but not counted.
 
-Run it on an otherwise idle machine. The hybrid variant has gone unstable
-(field energy to infinity) whenever another process was using the GPU, with
-builds from before the dump gather as well; on an idle machine it matches.
+Run it on an otherwise idle machine.
 """
 import argparse
 import base64
@@ -306,7 +302,6 @@ VARIANTS = [
 	("tblock 3:8 chunk 7", "dumps", {"OPENEMS_GPU_MAX_TS_PER_SUBMIT": "7"}, ["--gpu-temporal-block=3:8"]),
 	("no probe", "noprobe", {}, []),
 	("sheet", "sheet", {}, []),
-	("sheet hybrid", "sheet", {"OPENEMS_GPU_CPU_LOCAL_ABC": "1"}, []),
 ]
 
 
@@ -349,8 +344,6 @@ def main():
 		else:
 			n, worst, fails = compare_runs(refs[m], d, args.tol)
 			verdict = "%s  %d files, worst %.1e" % ("OK  " if not fails else "FAIL", n, worst)
-		if "OPENEMS_GPU_CPU_LOCAL_ABC" in env and "hybrid mode" not in log:
-			verdict, fails = "FAIL (the hybrid loop did not run)", []
 		# a miss reads the live fields, which the pipelined loop has moved on
 		misses = re.search(r"probe cache stats: hits=\d+, misses=(\d+)", log)
 		if misses and int(misses.group(1)):

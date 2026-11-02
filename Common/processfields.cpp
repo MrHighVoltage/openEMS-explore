@@ -476,7 +476,7 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 			Engine_Vulkan* vk = const_cast<Engine_Vulkan*>(static_cast<const Engine_Vulkan*>(eng));
 			const unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
 			// The batch that ended at ts gathered the cells this dump reads,
-			// unless the host copy holds ts anyway (timestep 0, the hybrid path).
+			// unless the host copy holds ts anyway, as at timestep 0.
 			if ((m_gpuGather>=0) && !vk->HostFieldsAt(ts))
 			{
 				if (CalcFieldFromFootprint(field, m_DumpType, vk->AcquireDumpGather(m_gpuGather, ts), 1))

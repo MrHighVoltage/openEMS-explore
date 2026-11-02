@@ -39,14 +39,9 @@ class Operator_Ext_LumpedRLC;
  * shadow copy that is lazily synchronised on the first GetVolt / GetCurr
  * call after a GPU update.
  *
- * Two iteration modes:
- *  - **Pure GPU** (no non-excitation extensions): all timesteps are batched
- *    in a single Vulkan command buffer with zero CPU involvement.
- *  - **Hybrid** (non-excitation extensions present): per-timestep with
- *    GPU↔CPU sync around extension hooks.
- *
- * The excitation is always applied on the GPU through a dedicated compute
- * shader to avoid CPU round-trips.
+ * Timesteps are batched into Vulkan command buffers with no CPU work in
+ * between.  The excitation and every extension run on the GPU; a model with
+ * an extension that has no GPU implementation needs a CPU engine.
  */
 class Engine_Vulkan : public Engine
 {
@@ -120,7 +115,7 @@ public:
 	//! meanwhile.  A dump the GPU cannot serve reads the whole fields, which
 	//! only holds that timestep until the next batch is submitted.
 	bool HasPipelinedProcessing() const
-	{ return (m_hasGPU_Probes || !m_dumps.empty()) && !m_hasCPUExtensions && !m_hostFieldReaders; }
+	{ return (m_hasGPU_Probes || !m_dumps.empty()) && !m_hostFieldReaders; }
 	//! Submit a speculative batch that does NOT advance the public numTS.
 	void SubmitSpeculative(unsigned int nTS);
 	//! Drain the speculative batch and advance numTS.
@@ -177,19 +172,8 @@ public:
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
 	{ return GetCurr(n, pos[0], pos[1], pos[2]); }
 
-	inline virtual void SetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT v)
-	{ if (m_hostDirty) SyncFieldsToHost(); Engine::SetVolt(n,x,y,z,v); m_deviceDirty = true; }
-	inline virtual void SetVolt(unsigned int n, const unsigned int pos[3], FDTD_FLOAT v)
-	{ if (m_hostDirty) SyncFieldsToHost(); Engine::SetVolt(n,pos,v); m_deviceDirty = true; }
-	inline virtual void SetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT v)
-	{ if (m_hostDirty) SyncFieldsToHost(); Engine::SetCurr(n,x,y,z,v); m_deviceDirty = true; }
-	inline virtual void SetCurr(unsigned int n, const unsigned int pos[3], FDTD_FLOAT v)
-	{ if (m_hostDirty) SyncFieldsToHost(); Engine::SetCurr(n,pos,v); m_deviceDirty = true; }
-
 	//! Copy GPU field data → CPU shadow.  Logically const (mutable internals).
 	void SyncFieldsToHost() const;
-	//! Copy CPU shadow → GPU buffers (after CPU-side extension modifications).
-	void SyncFieldsToDevice();
 
 	// --- Field dumps ------------------------------------------------------
 	//! The raw cells a field dump reads: all three components of one field
@@ -296,7 +280,7 @@ private:
 	// The next call uses the other slot.
 	VkCommandPool   m_cmdPool;
 	VkCommandBuffer m_cmdBufs[CMD_RING_SIZE];   //!< Ring-buffered FDTD + copy command buffers
-	VkCommandBuffer m_utilCmdBuf;   //!< Utility cmd buf (uploads, hybrid path)
+	VkCommandBuffer m_utilCmdBuf;   //!< Utility cmd buf (uploads, downloads, one-off commands)
 	VkFence         m_fences[CMD_RING_SIZE];    //!< One per m_cmdBufs slot
 	VkFence         m_utilFence;    //!< Fence for utility (upload/download) work
 	int             m_cmdIdx;       //!< Index into m_cmdBufs/m_fences ring
@@ -318,8 +302,6 @@ private:
 	//! The timestep the device fields hold once the submitted batches are
 	//! done; ahead of numTS while a speculative batch is uncommitted.
 	unsigned int m_liveTS = 0;
-	bool         m_deviceDirty;
-	bool         m_hasCPUExtensions;
 	bool         m_hasGPUExcitation;
 	bool         m_validateFields;
 	bool         m_validateStages;
