@@ -115,3 +115,14 @@ new spec-auto ut1 5.7e-07, ut_late 6.4e-07, it_late 4.4e-07
 #    unfused and every blocked schedule bit-identical to the first flat run -> "all identical".
 
 ### --gpu-no-rebar-fields: accepted ("No effect: the GPU field buffers are always device-local"), rc=0.
+
+## 6. Speculative depth 1 against auto (the default since c66193d), RX 6800, idle machine
+#    Measured 2026-11-01 with the 66473d0 build, OPENEMS_GPU_SPEC_DEPTH=1 and =auto, the four
+#    160^3 cases of section 4, two rounds; stepping-loop seconds, all dumps written in every run:
+#      case        depth 1           auto
+#      none        1.281  1.375      1.313  1.385
+#      et_plane    1.329  1.329      1.304  1.383
+#      nf2ff       1.374  1.362      1.387  1.355
+#      et_volume   2.968  3.003      1.444  1.435
+#    The c66193d build passes gpu_dump_check.py on the UHD 770 (default = auto, "spec 1",
+#    "spec 4" and the rest all OK, worst 2.3e-05 / sheet 4.0e-05, no probe-cache misses).

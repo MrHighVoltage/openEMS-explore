@@ -138,8 +138,15 @@ speculative batch from the interval that led to the current timestep, before
 `PA->Process()` reported the next one: with `OPENEMS_GPU_SPEC_DEPTH=4` a
 batch ran from 129 to 133 past dumps due at 130, with `auto` from 120 to 130
 past an FD sample due at 129.  The loop now stops the batch at the next
-timestep `PA->IsDueAt()` reports (`c3bba67`).  Depth 1, the default, could
-not overshoot.
+timestep `PA->IsDueAt()` reports (`c3bba67`).  Depth 1, then the default,
+could not overshoot.
+
+Since `c66193d` auto is the default.  At depth 1 the speculative batch was a
+single timestep, so the GPU idled while the host extracted and wrote a dump,
+and the rest of the interval ran only after the drain.  Auto runs up to the
+next due timestep (at most 64) and hides the host's work behind it: 160³ with
+63 whole-volume E dumps 1.44 s instead of 2.97–3.00 s, the other cases
+unchanged.  `OPENEMS_GPU_SPEC_DEPTH=1` restores the old behaviour.
 
 **Measured** (RX 6800, 160³ PEC, 4000 timesteps, 63 TD dumps or an NF2FF
 box of 6+6 faces at 3 frequencies; stepping-loop seconds, raw data in
@@ -172,7 +179,8 @@ whole-field path.  The previous build fails it in every TD file.
 Since `6900f90` the check also compares the probes' time series, among them a
 voltage and a current probe that start late, and fails on any probe-cache
 miss; the device-local and hybrid variants went with the BAR mapping and the
-hybrid loop (`0d92e77`, `3a7633a`).
+hybrid loop (`0d92e77`, `3a7633a`), and the auto variant became a depth-1
+variant when auto became the default (`c66193d`).
 
 ## Files Modified
 
