@@ -3,15 +3,16 @@
 ## 1. Overview
 
 `Engine_Vulkan` is a Vulkan compute-based FDTD engine that replaces the CPU
-field-update loop with GPU dispatches.  It operates in two modes:
+field-update loop with GPU dispatches.  Timesteps are batched into command
+buffers with no CPU work in between.  The excitation and every extension
+(PML, Mur, local absorbing sheets, dispersive materials, TF/SF, lumped RLC,
+steady-state detection) run on the GPU.  A model with an extension that has no
+GPU implementation stops with an error naming it; it needs a CPU engine.
 
-| Mode | Condition | Sync cost |
-|------|-----------|-----------|
-| **Pure GPU** | No non-excitation CPU extensions | 1 fence wait per `PA->Process()` call |
-| **Hybrid** | CPU extensions present (PML, etc.) | 2 full GPU↔CPU round-trips per timestep |
-
-Excitation is always applied on the GPU (dedicated compute shader) to avoid a
-CPU round-trip.
+Until 2026-11 such a model ran a hybrid loop instead, copying both fields to
+the host and back twice per timestep (0.34 MC/s on 64³, against 7165 MC/s on
+the GPU), and the field buffers could live in the PCI BAR.  Both are gone; see
+`OPTIMIZATIONS.md` §1.2.
 
 ---
 
@@ -26,35 +27,40 @@ CPU round-trip.
 │  │ 176 MB   │ │ 176 MB   │   │coef││coef││coef││coef│     │
 │  │ RW+Xfer  │ │ RW+Xfer  │   │ RO │ │ RO ││ RO ││ RO │    │
 │  └─┬────────┘ └─┬────────┘   └────┘└────┘└────┘└────┘     │
-│    │ReBAR map   │ReBAR map                                  │
-│    │            │           ┌────────────┐                  │
-│    ▼            ▼           │ staging_buf│ (host-visible)   │
-│  m_voltMapped  m_currMapped │  176 MB    │                  │
-│  (CPU pointer) (CPU pointer)└────────────┘                  │
+│    │ DMA        │ DMA       ┌────────────┐                  │
+│    ▼            ▼           │ staging_buf│ (host-visible,   │
+│  (copied on demand)         │  176 MB    │  host-cached)    │
+│                             └────────────┘                  │
 │                                                             │
 │  ┌──────────────────────────────────────────────┐           │
 │  │ Excitation buffers (idx, amp, delay, signal) │           │
 │  │ Per volt + per curr                          │           │
 │  └──────────────────────────────────────────────┘           │
 └─────────────────────────────────────────────────────────────┘
-         │ PCIe BAR (ReBAR)
+         │ PCIe (DMA through the staging buffer)
          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                        CPU  RAM                             │
 │                                                             │
 │  volt_ptr (Engine base)    curr_ptr (Engine base)           │
-│  Shadow copy — used only   Shadow copy — used only          │
-│  by hybrid path & no-ReBAR by hybrid path & no-ReBAR        │
-│  fallback                  fallback                         │
+│  Shadow copy, filled by    Shadow copy, filled by           │
+│  SyncFieldsToHost() when   SyncFieldsToHost() when          │
+│  something reads it        something reads it               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### ReBAR (Resizable BAR)
+### Field memory
 
-The volt/curr buffers are allocated as `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`.
-The CPU can read directly from the GPU's VRAM through the PCIe BAR — no staging
-buffer copy needed.  Each scalar read takes ~300 ns over PCIe.  Without ReBAR,
-a full 176 MB download through the staging buffer is required.
+The volt/curr buffers are plain `DEVICE_LOCAL`.  The host never reads them in
+place: probes read the cells the GPU gathers at the end of each batch, field
+dumps the cells it gathers at their timestep, and anything else copies both
+fields by DMA through the staging buffer (`SyncFieldsToHost()`).
+
+They used to be `DEVICE_LOCAL | HOST_VISIBLE` (the PCI BAR) whenever both fit.
+A CPU read through that mapping is an uncached PCIe read, about 25 MB/s on an
+RX 6800, and with a legacy 256 MB BAR the driver silently places what does not
+fit in system RAM, where the update kernels then read it over PCIe — 10× slower
+for three runs sharing one card.
 
 ---
 
@@ -84,7 +90,7 @@ Double-buffered command buffers with a utility buffer for one-shot operations:
 │  ┌───────────┐  ┌───────────┐     │    ┌───────────┐
 │  │ FDTD work │  │ FDTD work │     │    │ Uploads,  │
 │  │ slot 0    │  │ slot 1    │     │    │ downloads,│
-│  └─────┬─────┘  └─────┬─────┘     │    │ hybrid    │
+│  └─────┬─────┘  └─────┬─────┘     │    │ one-offs  │
 │        │              │           │    └─────┬─────┘
 │  m_fences[0]    m_fences[1]       │    m_utilFence
 │  (start signaled) (start signaled)│    (start unsignaled)
@@ -94,7 +100,7 @@ Double-buffered command buffers with a utility buffer for one-shot operations:
 ```
 
 - `m_cmdBufs[m_cmdIdx]` — used by `IterateTS()` for FDTD compute
-- `m_utilCmdBuf` — used by `RunSingleCommand()` for uploads, downloads, hybrid path
+- `m_utilCmdBuf` — used by `RunSingleCommand()` for uploads, downloads, one-off commands
 - Fences start **signaled** so the first `WaitForFences` is a no-op
 
 ---
@@ -117,12 +123,12 @@ while (running) {
  ──────   ─────────────────────────────────       ──────────────────────
    1      record cmdBufs[0], submit+fence[0]      DrainGPU: wait fence[0]
           flip → cmdIdx=1                         then fence[1] (no-op)
-          [GPU starts FDTD batch 1]               read m_voltMapped[]
+          [GPU starts FDTD batch 1]               read the probe cache
                                                   (probes, HDF5, etc.)
 
    2      wait fence[1] (no-op, signaled)         DrainGPU: wait fence[1]
           record cmdBufs[1], submit+fence[1]      then fence[0] (no-op)
-          flip → cmdIdx=0                         read m_voltMapped[]
+          flip → cmdIdx=0                         read the probe cache
           [GPU starts FDTD batch 2]
 
    3      wait fence[0] (blocks if batch 1        ...
@@ -146,7 +152,7 @@ CPU:     ┌record┐              ┌record┐              ┌record┐
          └──┬───┘              └──┬───┘              └──┬───┘
             │  ┌──PA->Process──┐  │  ┌──PA->Process──┐  │
             │  │ DrainGPU:wait │  │  │ DrainGPU:wait │  │
-            │  │ GetVolt (bar) │  │  │ GetVolt (bar) │  │
+            │  │ GetVolt       │  │  │ GetVolt       │  │
             │  │ HDF5 writes   │  │  │ HDF5 writes   │  │
             │  └───────────────┘  │  └───────────────┘  │
             ▼                     ▼                     ▼
@@ -179,13 +185,13 @@ bottleneck → `DrainGPU()` always stalls.
 
 ---
 
-## 6. DrainGPU / FlushGPU — Synchronization
+## 6. DrainGPU — Synchronization
 
 ```
-DrainGPU()                          FlushGPU()
-┌─────────────────────────┐         ┌────────────────────┐
-│ for i in {0, 1}:        │         │ calls DrainGPU()   │
-│   if gpuInFlight[i]:    │         └────────────────────┘
+DrainGPU()
+┌─────────────────────────┐
+│ for i in {0, 1}:        │
+│   if gpuInFlight[i]:    │
 │     vkWaitForFences(    │
 │       fences[i])        │
 │     gpuInFlight[i]=false│
@@ -193,9 +199,8 @@ DrainGPU()                          FlushGPU()
 ```
 
 `DrainGPU()` is called from:
-- **`GetVolt()` / `GetCurr()`** — every probe read
-- **`SyncFieldsToHost()`** — full field download (no-ReBAR fallback)
-- **`SyncFieldsToDevice()`** — before CPU→GPU upload
+- **`GetVolt()` / `GetCurr()`** — a probe read that misses the probe cache
+- **`SyncFieldsToHost()`** — full field download
 
 Since probes call `GetVolt`/`GetCurr` hundreds of times per `PA->Process()`,
 `DrainGPU()` is called hundreds of times — but only the first call actually
@@ -210,80 +215,36 @@ waits (subsequent calls see `gpuInFlight[i] == false`).
 ```
 GetVolt(n, x, y, z)
         │
-        ▼
-   DrainGPU()  ◄─── wait for both fences (usually already done)
+        ├── recording (initial PA->Process())?  ── note the cell, read on
         │
-        ├── m_voltMapped != null (ReBAR)?
+        ├── pipelined loop and cell in the probe cache?
         │         │
         │    YES  ▼
-        │   return m_voltMapped[linear index]  ◄── PCIe BAR read (~300 ns)
+        │   return the value the GPU gathered at the end of the batch
         │
-        └── NO
-             │
-             ▼
-        m_hostDirty?
-             │
-        YES  ▼
-        SyncFieldsToHost()  ◄── staging buffer: 2 × 176 MB DMA download
-             │
-             ▼
-        return Engine::GetVolt()  ◄── read from CPU shadow array
+        ▼
+   DrainGPU()  ◄─── wait for both fences
+        │
+   m_hostDirty? ──YES──► SyncFieldsToHost()  ◄── 2 × 176 MB DMA download
+        │
+        ▼
+   return Engine::GetVolt()  ◄── read from CPU shadow array
 ```
 
-### SetVolt / SetCurr (Write)
-
-```
-SetVolt(n, x, y, z, v)
-        │
-        ▼
-   m_hostDirty? ──YES──► SyncFieldsToHost()
-        │
-        ▼
-   Engine::SetVolt()  ◄── write to CPU shadow array
-        │
-        ▼
-   m_deviceDirty = true  ◄── next IterateTS will upload
-```
+Nothing writes the shadow copy back: no CPU code changes the fields.
 
 ---
 
-## 8. Hybrid Path (with CPU Extensions)
+## 8. Extensions
 
-When non-excitation CPU extensions exist (PML, lumped elements, etc.), the
-engine must sync after every voltage update and every current update:
+Every extension the operator creates must have a GPU implementation.
+`SetupGPUExcitation()` replaces the CPU excitation; the others are checked
+against the GPU-native list (UPML, Lorentz/Drude and conducting sheets, TF/SF,
+Mur, local absorbing sheets, lumped RLC, steady-state detection), and anything
+else throws `"the extension … has no GPU implementation; use a CPU engine"`.
+Cylindrical meshes never reach the GPU engine.
 
-```
- Per timestep (1 of iterTS):
-
- CPU                          GPU                          Transfers
- ───                          ───                          ─────────
- DoPreVoltageUpdates()
- SyncFieldsToDevice()                                     ◄── upload if dirty
-                              ┌─────────────────┐
-                              │ Voltage update   │
-                              │ + V excitation   │
-                              └────────┬────────┘
-                                       │
- SyncFieldsToHost()                    ▼          ◄── 176 MB download × 2
- DoPostVoltageUpdates()
- Apply2Voltages()
- DoPreCurrentUpdates()
- SyncFieldsToDevice()                                     ◄── upload if dirty
-                              ┌─────────────────┐
-                              │ Current update   │
-                              │ + I excitation   │
-                              └────────┬────────┘
-                                       │
- SyncFieldsToHost()                    ▼          ◄── 176 MB download × 2
- DoPostCurrentUpdates()
- Apply2Current()
- m_deviceDirty = true
- ─── next timestep ───
-```
-
-This path has **4 GPU↔CPU synchronization points** per timestep.
-Each sync involves `RunSingleCommand` (submit + fence wait) plus potentially
-a staging-buffer transfer.  This is inherently slow.
+---
 
 ---
 
@@ -302,15 +263,15 @@ Engine_Vulkan::New(op)
     ├── Engine::Init()         ◄── allocate CPU shadow arrays, create extensions
     ├── InitVulkan()           ◄── VkInstance → PhysDevice → Device → Queue
     │                               CmdPool → 3 CmdBufs → 3 Fences
-    ├── CreateBuffers()        ◄── volt/curr (ReBAR probe → fallback device-local)
-    │                               vv/vi/ii/iv (device-local), staging (host-visible)
+    ├── CreateBuffers()        ◄── volt/curr, vv/vi/ii/iv (device-local),
+    │                               staging (host-visible, host-cached)
     ├── CreateDescriptors()    ◄── descriptor sets for FDTD + excitation
     ├── CreatePipelines()      ◄── compile SPIR-V → 3 compute pipelines
     ├── UploadCoefficients()   ◄── CPU vv/vi/ii/iv → staging → GPU
     ├── SetupGPUExcitation()   ◄── convert CPU excitation → GPU buffers
-    │                               remove CPU excitation extension
-    │                               detect hasCPUExtensions
-    ├── Upload initial fields  ◄── via ReBAR memcpy or staging buffer
+    │                               remove CPU excitation extension,
+    │                               reject extensions without a GPU path
+    ├── Upload initial fields  ◄── via the staging buffer
     └── Print GPU info
 ```
 
@@ -344,12 +305,10 @@ then `PA->Process()` immediately calls `GetVolt` → `DrainGPU()` → fence wait
 In practice, the GPU hasn't finished the just-submitted work yet, so the CPU
 blocks for the full ~50 µs compute time.
 
-### Issue 3: PCIe BAR Read Latency
+### ~~Issue 3: PCIe BAR Read Latency~~
 
-Each `GetVolt`/`GetCurr` call reads 4 bytes over PCIe (~300 ns per read).
-A voltage probe at 1 point = 3 reads.  A mode-match probe integrating over
-a cross-section might do 50,000+ reads = ~15 ms, which actually exceeds the
-GPU compute time significantly.
+Resolved: probes read the probe cache, and the fields are no longer mapped
+through the BAR at all (§2).
 
 ### Possible Future Improvements
 

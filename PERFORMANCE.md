@@ -600,6 +600,11 @@ The changes that produced those numbers, in order of what they were worth:
   below the CPU engine. Not visible in this document's benchmarks, which
   deliberately dump nothing, but it is the difference that matters most in
   practice on dump-heavy models (FDTD/GPU_PIPELINE_OPTIMIZATION.md §4).
+- **Field buffers always device-local** (`0d92e77`) — nothing reads them through
+  the BAR any more, and on a card with a legacy 256 MB BAR, runs sharing the
+  GPU no longer spill each other's fields into system RAM: **~9×** per run for
+  three runs on the RX 6800 (175–210 → 1680–1740 MC/s). Single runs are
+  unchanged.
 - **Narrowed the compressed-operator index to 8/16/32 bits** (`49c7efc`) —
   +3.5–6.2%.
 - **Deduplicated UPML coefficients into shared tables** (`00ba1c6`) —

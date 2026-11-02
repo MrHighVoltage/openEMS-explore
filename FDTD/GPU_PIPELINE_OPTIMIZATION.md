@@ -38,8 +38,8 @@ The CPU sums 256 partial sums (trivially fast), applies `ε₀` and `μ₀` cons
 ```
 GPU field buffers (650 MB, already resident)
     ↓ reduce_energy.comp dispatch (256 workgroups)
-GPU partial sums buffer (2 KB)
-    ↓ ReBAR direct read or staging download
+GPU partial sums buffer (2 KB, host-visible)
+    ↓ memcpy from the mapping
 CPU: sum 256 + 256 floats → return ε₀·E + μ₀·H
 ```
 
@@ -58,6 +58,11 @@ For voltage probes (line integrals), we bypass the generic `GetVolt()` virtual d
 
 The key improvement is avoiding the per-cell virtual dispatch overhead and ensuring
 the integration uses the optimal path for the memory configuration.
+
+**Removed** (`0d92e77`): without the BAR mapping both methods came down to the
+generic loop over `GetVolt()`, which reads the probe cache in the pipelined
+loop, so `Engine_Interface_FDTD::CalcVoltageIntegral()` no longer special-cases
+the GPU.  `CalcCurrentIntegralGPU()` had no caller.
 
 ### 3. Async Processing Thread (removed)
 
@@ -109,8 +114,8 @@ interpolates from the slot with the unchanged templated extractor
 (`FieldCalc::FootprintView` stands in for the engine), so its output is
 bit-identical to extracting from the whole fields.  A slot is reused once its
 timestep is older than the one the outermost `IterateTS()` started from.
-Timestep 0 and the hybrid loop, where no batch ends on the dump, gather on
-the spot (`AcquireDumpGather()`) when the GPU still holds the timestep.
+At timestep 0, where no batch ends on the dump, it gathers on the spot
+(`AcquireDumpGather()`) while the GPU still holds the timestep.
 
 Frequency-domain dumps (FD, NF2FF boxes, SAR) go further: `dump_dft.comp`
 adds the footprint times the sample's DFT weight (computed on the host by
@@ -122,9 +127,8 @@ sums may take a quarter of the device-local heap; beyond that, or with
 `OPENEMS_GPU_DUMP_DFT=0`, a dump gathers every sample and sums on the host.
 
 Whole-field reads remain for what the GPU cannot serve, and are now always
-by DMA into the `HOST_CACHED` staging buffer.  `GetVolt()`/`GetCurr()` read the
-host copy once it is current and serve at most `BarReadLimit()` scattered
-values from the mapping before syncing by DMA.  A dump that cannot register
+by DMA into the `HOST_CACHED` staging buffer; since `0d92e77` that is the only
+way the host reads the fields.  A dump that cannot register
 (or `OPENEMS_GPU_DUMP_GATHER=0`) makes `HasPipelinedProcessing()` false, so
 it runs in the standard loop, where the live buffers are the timestep being
 processed.  The second queue and the snapshot ring are gone.
@@ -153,7 +157,7 @@ against 12.4 without dumps); before, the default path ran at 55 and 110
 MC/s, below the CPU engine.  A whole-volume dump still moves one field and
 is interpolated and written on the host, about 28 ms per 49 MB dump here.
 New results do not depend on the field-buffer placement (`new-norebar`:
-1.39, 1.33, 3.10 s).
+1.39, 1.33, 3.10 s), so `0d92e77` keeps the fields device-local always.
 
 **Correctness.**  `python/Tests/gpu_dump_check.py` runs one model with every
 TD dump type in every interpolation (volumes, planes, sub-boxes, sub-sampled,
@@ -165,6 +169,10 @@ absorbing sheet, and the hybrid loop.  All match to ≤ 4e-5 of the dataset
 group's maximum, the same as `--engine=basic` against `--engine=sse` (3e-5).
 TD dumps are bit-identical across all GPU variants, including the
 whole-field path.  The previous build fails it in every TD file.
+Since `6900f90` the check also compares the probes' time series, among them a
+voltage and a current probe that start late, and fails on any probe-cache
+miss; the device-local and hybrid variants went with the BAR mapping and the
+hybrid loop (`0d92e77`, `3a7633a`).
 
 ## Files Modified
 
@@ -195,8 +203,8 @@ the dump queue and the snapshot ring).
 ```
 Init()
   └─ SetupGPU_EnergyReduction()
-       ├─ CreateGpuBuf(m_energyPartialBuf, 2KB, ReBAR or device-local)
-       ├─ vkMapMemory if ReBAR → m_energyMapped
+       ├─ CreateGpuBuf(m_energyPartialBuf, 2KB, host-visible)
+       ├─ vkMapMemory → m_energyMapped
        ├─ Create descriptor layout (3 bindings: volt, curr, partials)
        ├─ Create pipeline layout (EnergyPC push constant, 8 bytes)
        ├─ Create m_energyDescPool (maxSets=1, 3 storage buffers)

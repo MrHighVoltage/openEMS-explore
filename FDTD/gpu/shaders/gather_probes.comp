@@ -7,7 +7,7 @@
  *
  * The CPU uploads pre-linearized field indices (dir*N + flat_idx) for each
  * probe point. The shader gathers those field values into a contiguous
- * output array that can be read back via ReBAR or a staging buffer.
+ * host-visible output array the CPU reads after the batch's fence.
  *
  * This avoids downloading the entire field arrays just to read a few probes.
  */

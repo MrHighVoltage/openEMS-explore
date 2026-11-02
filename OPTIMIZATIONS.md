@@ -107,6 +107,12 @@ the Vulkan engine out of contention entirely**, so shader coverage is not a
 convenience, it is the difference between the GPU engine being usable on a
 model and not.
 
+The per-cell access was the BAR mapping again (found 2026-11-01, §1.2):
+`SyncFieldsToHost()` then `memcpy`'d both fields out of it, two 6.3 MB reads
+per hybrid timestep at the ~25 MB/s measured for that mapping, about 0.5 s of
+the 0.77 s.  The fallback and the switch are gone since `3a7633a`: a model with an
+extension that has no shader stops with an error and needs a CPU engine.
+
 ### 1.1 Host paths: dumping, GPU interaction, startup
 
 None of these touch an update kernel; all of them show up in wall clock.
@@ -196,7 +202,7 @@ the larger grid gains more in absolute time.
 this group chronologically but is already in the GPU table below.  It only
 ever helped with `--gpu-no-rebar-fields`; the default ReBAR path kept reading
 mapped VRAM at about 25 MB/s, and every GPU dump held a later timestep than
-its label.  The GPU-side gather that replaced it (`76fa8f6`, `d38071b`), and
+its label.  The fields have not been mapped at all since `0d92e77`.  The GPU-side gather that replaced it (`76fa8f6`, `d38071b`), and
 the measurements, are in
 [FDTD/GPU_PIPELINE_OPTIMIZATION.md](FDTD/GPU_PIPELINE_OPTIMIZATION.md) §4.
 The fusion and pipelining design is in
@@ -241,6 +247,10 @@ crossover against upstream's best CPU configuration at ~55 timesteps.
 | `fbd95a6` | Don't place field buffers in an undersized BAR aperture | **6.4–6.5×** on grids exceeding the 256 MB aperture (803 → 5115 MC/s at 256×224×224) |
 | `ea82f59` | Async field-dump download; request `HOST_CACHED` staging | **~18×** wall clock on a dump-heavy 291³ run (74 s → 16 s), with `--gpu-no-rebar-fields` only; replaced by the row below |
 | `76fa8f6`, `d38071b` | Gather each dump's cells on the GPU at its timestep; keep FD/NF2FF/SAR DFT sums on the GPU; no CPU reads of mapped VRAM | **221× / 115× / 97×** on 160³ with ReBAR (plane / NF2FF / whole-volume dumps: 298 → 1.34 s, 150 → 1.30 s, 299 → 3.08 s); plane and NF2FF dumps now free. Fixes dumps holding a later timestep than their label |
+| `6900f90` | Probes with a start time read their cells during the probe-cache recording | Correctness: such a probe missed the cache once due and read the live fields, which the pipelined loop had already advanced |
+| `0d92e77` | Field buffers always device-local; the BAR mapping, its readers and the GPU line integrals removed; `--gpu-no-rebar-fields` accepted and ignored | **~9×** per run with three runs sharing the RX 6800: 175–210 → 1680–1740 MC/s (6.6–10.9 M cells, measured with `--gpu-no-rebar-fields`). Each run's fields fit the 256 MB BAR, together they did not, and the driver put the rest in system RAM (`amd-requested-vram` above `drm-memory-vram` in `/proc/PID/fdinfo`). A single run is unchanged (160³: 1.39 s median either way); raw data in `python/Tests/results/gpu_cleanup_2026-11-02.txt` |
+| `3a7633a` | No hybrid loop: a model with an extension that has no GPU implementation stops with an error | Simplification; every extension that reaches the GPU engine has a shader, and the hybrid loop was slower than a CPU engine (§1.0) |
+| `b5b9c07` | Remove the never-enabled transfer-queue probe copy, its readback ring and staging fallback, and other dead probe code | Simplification, no behaviour change |
 | `2ed6523` | Reuse shared curl taps in the update shaders | Neutral on RADV (its NIR already CSE'd them); kernels shrink 11–14%. Portability insurance |
 | `49c7efc` | Narrow the compressed-operator index to 8/16/32 bits | **+3.5% to +6.2%**; Coax index buffer 2793 → 698 KB |
 | `fabcaa3` | Single Vulkan 1.3 baseline, negotiate device features | Enablement, not throughput |

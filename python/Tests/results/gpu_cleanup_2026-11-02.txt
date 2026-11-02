@@ -1,0 +1,117 @@
+# GPU cleanup (6900f90 probes with a start time, 0d92e77 device-local fields, 3a7633a no hybrid
+# loop, b5b9c07 dead probe-readback code), 2026-11-02, i9-13900K host.
+# Builds: "old" = 66473d0, "new" = b5b9c07 (+ 1b5dba0, scripts only), both from the portable
+# manylinux2014 container.
+
+## 1. Three concurrent GPU runs and the 256 MB BAR (RX 6800, legacy BAR, before 0d92e77)
+#    An onchip_patch 8-element array sweep, three openEMS --engine gpu runs at a time on the RX 6800,
+#    model size growing with the steering angle.  Each run checked that its own two field buffers fit
+#    the BAR heap (needed + 12.5 %) and put them there; together they did not fit.  Speed per run
+#    (the final "Speed:" line of each run in the sweep log):
+#      2.57 - 2.69 M cells   1748 - 1982 MC/s   (3 x 2 x 31 MB fields: fit)
+#      2.79 M cells           826 MC/s
+#      3.00 M cells           442 MC/s
+#      6.5 - 7.9 M cells      187 - 210 MC/s   (173 - 195 MC/s in the status lines of ang21-23)
+#    gpu_busy_percent read 99 % while they ran.  /proc/PID/fdinfo of three of the slow runs (KiB):
+#      run    amd-requested-vram  drm-memory-vram  drm-memory-gtt  amd-requested-gtt
+#      ang22      540716             461776           185932          106992
+#      ang23      555232             393040           271608          109416
+#      ang24      547944             462184           173828           88068
+#    78 - 162 MB per run asked for VRAM but sat in GTT (system RAM): one or both field arrays.
+#    The sweep restarted with --gpu-no-rebar-fields (the only behaviour since 0d92e77):
+#      10.2 - 10.5 M cells   1679 - 1741 MC/s per run, three at a time
+
+## 2. gpu_dump_check.py, new build, RX 6800 (0000:03:00.0), idle machine
+  cpu dumps            reference, 34 of 34 HDF5 files non-zero
+  cpu noprobe          reference, 34 of 34 HDF5 files non-zero
+  cpu sheet            reference, 34 of 34 HDF5 files non-zero
+  default              OK    211 files, worst 2.3e-05
+  spec auto            OK    211 files, worst 2.3e-05
+  spec 4               OK    211 files, worst 2.3e-05
+  standard loop        OK    211 files, worst 2.3e-05
+  host DFT             OK    211 files, worst 2.3e-05
+  whole fields         OK    211 files, worst 2.3e-05
+  tblock 3:8 chunk 7   OK    211 files, worst 2.3e-05
+  no probe             OK    208 files, worst 2.3e-05
+  sheet                OK    211 files, worst 4.0e-05
+all variants match the CPU
+#    211 files = 208 dump files + 3 probes; every pipelined variant: probe cache 41 cells,
+#    hits=5625, misses=0.
+
+## 3. gpu_tblock_identity.py, new build, RX 6800, defaults (600 TS, 4:12 8:20 16:40 24:48)
+#    mur_rlc, tfsf, pml_mur, pml_mur_unfused, local_abc, local_abc_sa: 43 runs, every one
+#    bit-identical to its case's first flat run -> "all identical".
+
+## 4. Paired old/new, 160^3 PEC (4.1 M cells, 49 MB per field: the old build puts them in the BAR),
+#    4000 TS, the same four cases as gpu_dumps_2026-11-01.txt section 2; run = stepping-loop seconds.
+none       old    r0 rc=0 run    1.327 s   12346.4 MC/s    0 dump datasets
+none       new    r0 rc=0 run    1.347 s   12161.1 MC/s    0 dump datasets
+et_plane   old    r0 rc=0 run    1.379 s   11884.6 MC/s   63 dump datasets
+et_plane   new    r0 rc=0 run    1.380 s   11875.2 MC/s   63 dump datasets
+nf2ff      old    r0 rc=0 run    1.406 s   11650.4 MC/s   12 dump datasets
+nf2ff      new    r0 rc=0 run    1.400 s   11699.3 MC/s   12 dump datasets
+et_volume  old    r0 rc=0 run    3.004 s    5454.8 MC/s   63 dump datasets
+et_volume  new    r0 rc=0 run    3.105 s   5277.13 MC/s   63 dump datasets
+none       new    r1 rc=0 run    1.381 s   11868.2 MC/s    0 dump datasets
+none       old    r1 rc=0 run    1.324 s     12371 MC/s    0 dump datasets
+et_plane   new    r1 rc=0 run    1.340 s   12225.2 MC/s   63 dump datasets
+et_plane   old    r1 rc=0 run    1.404 s   11669.8 MC/s   63 dump datasets
+nf2ff      new    r1 rc=0 run    1.397 s   11731.5 MC/s   12 dump datasets
+nf2ff      old    r1 rc=0 run    1.398 s   11717.1 MC/s   12 dump datasets
+et_volume  new    r1 rc=0 run    2.974 s   5509.99 MC/s   63 dump datasets
+et_volume  old    r1 rc=0 run    3.005 s   5451.59 MC/s   63 dump datasets
+#    Six more rounds of the no-dump case (order alternating), old-dl = old with --gpu-no-rebar-fields:
+none       old    r0 rc=0 run    1.355 s   12090.6 MC/s    0 dump datasets
+none       old-dl r0 rc=0 run    1.390 s   11785.3 MC/s    0 dump datasets
+none       new    r0 rc=0 run    1.390 s   11785.8 MC/s    0 dump datasets
+none       new    r1 rc=0 run    1.404 s     11672 MC/s    0 dump datasets
+none       old-dl r1 rc=0 run    1.397 s   11725.3 MC/s    0 dump datasets
+none       old    r1 rc=0 run    1.398 s   11719.1 MC/s    0 dump datasets
+none       old    r2 rc=0 run    1.329 s   12324.1 MC/s    0 dump datasets
+none       old-dl r2 rc=0 run    1.340 s   12226.8 MC/s    0 dump datasets
+none       new    r2 rc=0 run    1.358 s   12061.4 MC/s    0 dump datasets
+none       new    r3 rc=0 run    1.397 s   11729.8 MC/s    0 dump datasets
+none       old-dl r3 rc=0 run    1.333 s   12287.6 MC/s    0 dump datasets
+none       old    r3 rc=0 run    1.395 s   11746.1 MC/s    0 dump datasets
+none       old    r4 rc=0 run    1.392 s   11773.3 MC/s    0 dump datasets
+none       old-dl r4 rc=0 run    1.322 s   12393.2 MC/s    0 dump datasets
+none       new    r4 rc=0 run    1.398 s     11718 MC/s    0 dump datasets
+none       new    r5 rc=0 run    1.382 s   11851.3 MC/s    0 dump datasets
+none       old-dl r5 rc=0 run    1.359 s   12051.8 MC/s    0 dump datasets
+none       old    r5 rc=0 run    1.401 s   11695.6 MC/s    0 dump datasets
+#    Medians: old 1.394 s, old-dl 1.350 s, new 1.394 s; the spread within each is +-3 %.
+
+## 5. Intel UHD 770 (RPL-S iGPU, Mesa ANV, Vulkan 1.4.354), correctness only: the RX 6800 was running
+#    an unrelated three-job sweep at the time, so no timings from this section are meaningful.
+
+### gpu_dump_check.py, new build (cleanup), --gpu 0000:00:02.0
+  cpu dumps            reference, 34 of 34 HDF5 files non-zero
+  cpu noprobe          reference, 34 of 34 HDF5 files non-zero
+  cpu sheet            reference, 34 of 34 HDF5 files non-zero
+  default              OK    211 files, worst 2.3e-05
+  spec auto            OK    211 files, worst 2.3e-05
+  spec 4               OK    211 files, worst 2.3e-05
+  standard loop        OK    211 files, worst 2.3e-05
+  host DFT             OK    211 files, worst 2.3e-05
+  whole fields         OK    211 files, worst 2.3e-05
+  tblock 3:8 chunk 7   OK    211 files, worst 2.3e-05
+  no probe             OK    208 files, worst 2.3e-05
+  sheet                OK    211 files, worst 4.0e-05
+all variants match the CPU
+#    Probe cache: 41 unique cells recorded; hits=5625, misses=0.
+
+### the same check, previous build (66473d0), --only "default,spec auto"
+  default              FAIL (4725 probe reads missed the probe cache)
+  spec auto            FAIL (4725 probe reads missed the probe cache)
+#    Probe cache: 6 unique cells recorded (ut1 only); hits=900, misses=4725 (84 %).
+#    Probe errors against --engine=sse, relative to each probe's largest magnitude:
+old default   ut1 5.7e-07, ut_late 4.7e-02, it_late 3.3e-02
+old spec-auto ut1 5.7e-07, ut_late 4.8e-01, it_late 3.3e-01
+new default   ut1 5.7e-07, ut_late 6.4e-07, it_late 4.4e-07
+new spec-auto ut1 5.7e-07, ut_late 6.4e-07, it_late 4.4e-07
+
+### gpu_tblock_identity.py, new build, --gpu 0000:00:02.0 (defaults: 600 TS, schedules 4:12 8:20 16:40 24:48)
+#    mur_rlc, tfsf, pml_mur, pml_mur_unfused, local_abc, local_abc_sa: flat, flat again, flat Mur
+#    unfused and every blocked schedule bit-identical to the first flat run -> "all identical".
+
+### --gpu-no-rebar-fields: accepted ("No effect: the GPU field buffers are always device-local"), rc=0.

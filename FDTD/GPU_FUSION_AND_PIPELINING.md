@@ -216,8 +216,8 @@ them into a compact output buffer:
 ```
 GPU field buffers (650 MB)
     ↓ gather_probes.comp (1 thread per probe cell)
-GPU probe output buffer (few KB)
-    ↓ ReBAR direct read or staging download
+GPU probe output buffer (few KB, host-visible)
+    ↓ memcpy from the mapping
 CPU probe cache (few KB)
 ```
 
@@ -237,7 +237,7 @@ would need changes to every probe type), we use a **recording approach**:
 3. After `PA->Process()`, deduplicate the recorded cells and build:
    - GPU index buffer (pre-linearized field indices)
    - GPU field selector buffer (0=volt, 1=curr)
-   - GPU output buffer (HOST_VISIBLE for ReBAR, with staging fallback)
+   - GPU output buffer (host-visible, persistently mapped)
    - CPU cache map (`uint64_t key → uint32_t cacheIndex`)
    - Probe gather descriptor set and compute pipeline
 
@@ -260,8 +260,13 @@ GetVolt(n, x, y, z) {
 ```
 
 The cache is a flat `std::vector<float>` with the same layout as the GPU output
-buffer.  `SnapshotProbeCache()` copies from the GPU output (ReBAR memcpy or
-staging download) into this vector.
+buffer.  `SnapshotProbeCache()` copies the mapped GPU output into this vector.
+
+The recording sees only the probes that are due at the timestep it runs at.
+Since `6900f90`, `RunFDTD()` also evaluates every other probe once while it records
+(one with a start time), so that its cells are in the cache too; before, such
+a probe missed the cache once due and read the live fields, which the
+pipelined loop had already computed ahead.
 
 ### 3.5 Speculative Submission
 
@@ -302,7 +307,10 @@ so the public timestep counter doesn't advance until `CommitSpeculative()`.
 
 The pipelined loop activates when `HasPipelinedProcessing()` returns true:
 - `m_hasGPU_Probes == true` (probe gather pipeline was successfully created)
-- `m_hasCPUExtensions == false` (no CPU-only extensions forcing hybrid mode)
+- no enabled field dump reads the whole fields (`SetHostFieldReaders()`)
+
+The hybrid mode for CPU-only extensions that this list used to exclude was
+removed in `3a7633a`; such a model now needs a CPU engine.
 
 When conditions aren't met, `RunFDTD()` falls back to the original sequential
 loop with no behavioral change.
@@ -365,9 +373,8 @@ RunFDTD()
        ├─ Build m_probeCacheMap (unordered_map<uint64_t, uint32_t>)
        ├─ CreateGpuBuf: m_probeIdxBuf, m_probeSelBuf (device-local)
        ├─ Upload index + selector data
-       ├─ CreateGpuBuf: m_probeOutBuf (ReBAR or device-local)
-       ├─ vkMapMemory if ReBAR → m_probeOutMapped
-       ├─ CreateGpuBuf: m_probeStagingBuf (if no ReBAR)
+       ├─ CreateGpuBuf: m_probeOutBuf (host-visible)
+       ├─ vkMapMemory → m_probeOutMapped
        ├─ Create desc pool (1 set, 5 storage buffers)
        ├─ Allocate + write probe gather desc set
        ├─ Create probe pipeline layout (if needed)
@@ -466,7 +473,7 @@ temporal relationship between compute and processing is preserved.
 ### 7.4 CalcTotalEnergyEstimate Bypass
 
 Energy estimation (`CalcTotalEnergyEstimate`) does NOT use the probe cache — it
-uses the full-field GPU energy reduction shader or direct ReBAR reads.  When
+uses the full-field GPU energy reduction shader.  When
 called during the pipelined loop, `EnablePipelinedReading(false)` has been
 called, so `GetVolt`/`GetCurr` fall through to the normal drain+read path.
 
