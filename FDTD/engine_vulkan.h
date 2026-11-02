@@ -79,10 +79,6 @@ public:
 	uint32_t GetOpIdxBits() const { return m_opIdxBits; }
 
 	static Engine_Vulkan* New(const Operator* op);
-	//! Prefer ReBAR HOST_VISIBLE allocations for main field buffers.
-	//! When false, volt/curr stay device-local for maximum dGPU bandwidth.
-	static void SetPreferReBARFieldBuffers(bool prefer) { s_preferReBARFieldBuffers = prefer; }
-	static bool GetPreferReBARFieldBuffers() { return s_preferReBARFieldBuffers; }
 	//! Enable per-batch GPU timestamp profiling and fence-wait accounting.
 	static void SetEnableProfiling(bool enable) { s_enableProfiling = enable; }
 	static bool GetEnableProfiling() { return s_enableProfiling; }
@@ -105,11 +101,6 @@ public:
 
 	//! GPU-side energy estimation — avoids downloading entire field arrays.
 	double CalcFastEnergyGPU() const;
-
-	//! GPU-side voltage line integral — avoids full field download for probes.
-	double CalcVoltageIntegralGPU(const unsigned int* start, const unsigned int* stop) const;
-	//! GPU-side current line integral.
-	double CalcCurrentIntegralGPU(const unsigned int* start, const unsigned int* stop) const;
 
 	// --- Pipelined processing support -------------------------------------
 	//! Begin recording cell accesses. Call before PA->Process().
@@ -138,10 +129,8 @@ public:
 	void DrainGPU() const;
 
 	// --- Field access (lazy sync from GPU) --------------------------------
-	// Once the host copy is current, reads come from it.  Before that, a few
-	// scattered reads go straight to the ReBAR mapping; a bulk reader would pay
-	// an uncached PCIe read per value there (about 25 MB/s on an RX 6800), so
-	// past BarReadLimit() of them the fields come over by DMA instead.
+	// Probes read the probe cache in the pipelined loop.  Any other read
+	// brings both fields over by DMA, once per batch.
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
@@ -160,15 +149,7 @@ public:
 			// Fallback: not in cache — must drain GPU
 		}
 		if (!m_gpuDrained) DrainGPU();
-		if (m_hostDirty)
-		{
-			if (m_voltMapped && m_barReads < BarReadLimit())
-			{
-				++m_barReads;
-				return m_voltMapped[linIdx];
-			}
-			SyncFieldsToHost();
-		}
+		if (m_hostDirty) SyncFieldsToHost();
 		return Engine::GetVolt(n,x,y,z);
 	}
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
@@ -190,15 +171,7 @@ public:
 			m_probeCacheMisses++;
 		}
 		if (!m_gpuDrained) DrainGPU();
-		if (m_hostDirty)
-		{
-			if (m_currMapped && m_barReads < BarReadLimit())
-			{
-				++m_barReads;
-				return m_currMapped[linIdx];
-			}
-			SyncFieldsToHost();
-		}
+		if (m_hostDirty) SyncFieldsToHost();
 		return Engine::GetCurr(n,x,y,z);
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
@@ -287,8 +260,6 @@ private:
 	VkBuffer       m_stagingBuf;
 	VkDeviceMemory m_stagingMem;
 	VkDeviceSize   m_fieldBufSize; // 3 * Nx * Ny * Nz * sizeof(float)
-	FDTD_FLOAT*    m_voltMapped;   //!< Persistently mapped VRAM pointer (ReBAR), or nullptr
-	FDTD_FLOAT*    m_currMapped;   //!< Persistently mapped VRAM pointer (ReBAR), or nullptr
 	uint32_t       m_fieldN;       //!< Nx * Ny * Nz (cached for fast index computation)
 	uint32_t       m_strideYZ;     //!< Ny * Nz (cached for fast index computation)
 
@@ -347,10 +318,6 @@ private:
 	//! The timestep the device fields hold once the submitted batches are
 	//! done; ahead of numTS while a speculative batch is uncommitted.
 	unsigned int m_liveTS = 0;
-	//! Scattered field reads served from the ReBAR mapping since the fields
-	//! last changed; see GetVolt().
-	mutable size_t m_barReads = 0;
-	size_t BarReadLimit() const { return std::max<size_t>(1024, (size_t)m_fieldN / 256); }
 	bool         m_deviceDirty;
 	bool         m_hasCPUExtensions;
 	bool         m_hasGPUExcitation;
@@ -390,7 +357,6 @@ private:
 	VkPipelineCache m_pipelineCache;
 
 	// ---- Runtime configuration (static) ---------------------------------
-	static bool s_preferReBARFieldBuffers;
 	static bool s_enableProfiling;
 
 	// ---- Optional profiling ---------------------------------------------
@@ -482,7 +448,7 @@ private:
 	void CreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
 	                            VkMemoryPropertyFlags memProps,
 	                            VkBuffer& buf, VkDeviceMemory& mem);
-	//! Allocation probe used for optional memory classes such as ReBAR.
+	//! Like CreateBufferWithMemory, but returns false instead of throwing.
 	bool TryCreateBufferWithMemory(VkDeviceSize size, VkBufferUsageFlags usage,
 	                               VkMemoryPropertyFlags memProps,
 	                               VkBuffer& buf, VkDeviceMemory& mem);
@@ -823,7 +789,7 @@ private:
 	// ---- GPU energy reduction -----------------------------------------
 	static constexpr uint32_t ENERGY_NUM_WG = 256; //!< workgroups for energy reduction
 	GpuBuf       m_energyPartialBuf;   //!< [2 * ENERGY_NUM_WG] float partials (E, H)
-	float*       m_energyMapped = nullptr; //!< ReBAR-mapped readback (or nullptr)
+	float*       m_energyMapped = nullptr; //!< m_energyPartialBuf, persistently mapped
 	VkDescriptorSetLayout m_energyDescLayout = VK_NULL_HANDLE;
 	VkPipelineLayout      m_energyPipeLayout = VK_NULL_HANDLE;
 	VkPipeline            m_energyPipeline   = VK_NULL_HANDLE;

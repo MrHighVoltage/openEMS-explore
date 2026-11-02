@@ -203,14 +203,6 @@ double* Engine_Interface_FDTD::GetRawInterpolatedDualField(const unsigned int* p
 
 double Engine_Interface_FDTD::CalcVoltageIntegral(const unsigned int* start, const unsigned int* stop) const
 {
-#ifdef WITH_GPU
-	if (m_Eng->GetType() == Engine::GPU)
-	{
-		const Engine_Vulkan* gpuEng = static_cast<const Engine_Vulkan*>(m_Eng);
-		return gpuEng->CalcVoltageIntegralGPU(start, stop);
-	}
-#endif
-
 	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
 	{
 		cerr << "Engine_Interface_FDTD::CalcVoltageIntegral: Error, only a 1D/line integration is allowed" << endl;

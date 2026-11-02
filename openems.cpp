@@ -397,14 +397,10 @@ openEMS::optionDesc()
 #endif
 
 #ifdef WITH_GPU
+	// Accepted so that existing scripts keep working.
 	optdesc.addBoolSwitch("gpu-no-rebar-fields",
-		[this](bool val)
-		{
-			if (!val) return;
-			Engine_Vulkan::SetPreferReBARFieldBuffers(false);
-			cout << "openEMS - GPU field buffers forced to DEVICE_LOCAL (ReBAR disabled for volt/curr)" << endl;
-		},
-		"Use DEVICE_LOCAL memory for GPU field buffers instead of ReBAR HOST_VISIBLE mappings"
+		[](bool) {},
+		"No effect: the GPU field buffers are always device-local"
 	);
 
 	optdesc.addBoolSwitch("gpu-profile",

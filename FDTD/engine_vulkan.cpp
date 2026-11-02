@@ -51,7 +51,6 @@ using std::cerr;
 using std::cout;
 using std::endl;
 
-bool Engine_Vulkan::s_preferReBARFieldBuffers = true;
 bool Engine_Vulkan::s_enableProfiling = false;
 const char* const Engine_Vulkan::s_profileStageNames[Engine_Vulkan::PROFILE_STAGES] = {
 	"pre-V ext", "Yee V", "post-V ext", "V apply+exc", "pre-I ext", "Yee I", "post-I+exc"};
@@ -384,39 +383,12 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 		const VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 		                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		const VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		const VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-		                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 		const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 		                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-		bool fieldsOk = false;
-		if (s_preferReBARFieldBuffers)
-		{
-			VkBuffer tmpA = VK_NULL_HANDLE, tmpB = VK_NULL_HANDLE;
-			VkDeviceMemory tmpAM = VK_NULL_HANDLE, tmpBM = VK_NULL_HANDLE;
-			if (allocBuffer(fieldSize, fieldUsage, rebar, tmpA, tmpAM) &&
-			    allocBuffer(fieldSize, fieldUsage, rebar, tmpB, tmpBM))
-			{
-				bufA = tmpA; memA = tmpAM;
-				bufB = tmpB; memB = tmpBM;
-				fieldsOk = true;
-			}
-			else
-			{
-				if (tmpB) vkDestroyBuffer(device, tmpB, nullptr);
-				if (tmpBM) vkFreeMemory(device, tmpBM, nullptr);
-				if (tmpA) vkDestroyBuffer(device, tmpA, nullptr);
-				if (tmpAM) vkFreeMemory(device, tmpAM, nullptr);
-			}
-		}
-
-		if (!fieldsOk)
-		{
-			if (!allocBuffer(fieldSize, fieldUsage, dLoc, bufA, memA) ||
-			    !allocBuffer(fieldSize, fieldUsage, dLoc, bufB, memB))
-				return fail("Vulkan preflight: unable to allocate field buffers on selected GPU");
-		}
+		if (!allocBuffer(fieldSize, fieldUsage, dLoc, bufA, memA) ||
+		    !allocBuffer(fieldSize, fieldUsage, dLoc, bufB, memB))
+			return fail("Vulkan preflight: unable to allocate field buffers on selected GPU");
 
 		if (!allocBuffer(fieldSize, stagingUsage, host, bufStaging, memStaging))
 			return fail("Vulkan preflight: unable to allocate staging buffer on selected GPU/host memory");
@@ -464,8 +436,6 @@ Engine_Vulkan::Engine_Vulkan(const Operator* op) : Engine(op)
 	m_stagingBuf = VK_NULL_HANDLE;
 	m_stagingMem = VK_NULL_HANDLE;
 	m_fieldBufSize = 0;
-	m_voltMapped = nullptr;
-	m_currMapped = nullptr;
 	m_fieldN     = 0;
 	m_strideYZ   = 0;
 
@@ -663,17 +633,8 @@ void Engine_Vulkan::Init()
 
 	// Upload initial (zero) field data to GPU
 	runStartupStep("UploadInitialFields", [&]() {
-		if (m_voltMapped)
-		{
-			// ReBAR: direct memcpy through the persistently mapped pointer
-			memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
-			memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
-		}
-		else
-		{
-			UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-			UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
-		}
+		UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
 	});
 
 	m_hostDirty  = false;
@@ -711,12 +672,6 @@ void Engine_Vulkan::Init()
 			cout << "  Uncompressed operator: one coeff set per cell, no index"
 			     << " (tables: " << (4 * m_coeffCompBufSize / 1024) << " KB)" << endl;
 	}
-	if (m_voltMapped)
-		cout << "  ReBAR active — scattered CPU field reads from VRAM, bulk reads by DMA" << endl;
-	else
-		cout << "  ReBAR not available — using staging buffer for field sync" << endl;
-	if (!s_preferReBARFieldBuffers)
-		cout << "  Field-buffer ReBAR disabled by configuration (device-local volt/curr)" << endl;
 	if (m_hasCPUExtensions)
 		cout << "  WARNING: CPU extensions present — hybrid mode (slower)" << endl;
 	else
@@ -762,7 +717,7 @@ void Engine_Vulkan::Reset()
 		     << ", misses=" << m_probeCacheMisses
 		     << " (" << missPct << "% miss)" << endl;
 		if (m_probeCacheMisses > 0)
-			cout << "  Note: probe cache misses trigger fallback field reads (can be slow with ReBAR on dGPU)." << endl;
+			cout << "  Note: each probe cache miss read the live fields, which the pipelined loop had computed ahead." << endl;
 	}
 	CleanupVulkan();
 	Engine::Reset();
@@ -1326,93 +1281,14 @@ void Engine_Vulkan::CreateBuffers()
 	VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 	                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-	// --- Try ReBAR (resizable BAR): DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT ---
-	// This allows the CPU to read field data directly from VRAM without any
-	// staging-buffer copy, eliminating the 352 MB download bottleneck.
-	VkMemoryPropertyFlags rebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-
-	// Probe whether a suitable memory type exists for the volt buffer
-	if (s_preferReBARFieldBuffers)
-	{
-		VkBufferCreateInfo ci{};
-		ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		ci.size  = m_fieldBufSize;
-		ci.usage = devRW;
-		ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		VkBuffer probeBuf;
-		vkCreateBuffer(m_device, &ci, nullptr, &probeBuf);
-		VkMemoryRequirements memReq;
-		vkGetBufferMemoryRequirements(m_device, probeBuf, &memReq);
-		uint32_t rebarIdx = FindMemoryTypeSoft(memReq.memoryTypeBits, rebar);
-		vkDestroyBuffer(m_device, probeBuf, nullptr);
-
-		// A DEVICE_LOCAL|HOST_VISIBLE memory type exists on virtually every
-		// modern driver, but on a machine *without* resizable BAR it is backed
-		// by the legacy 256 MB PCI aperture. Drivers do not fail an allocation
-		// that overflows that aperture -- they silently place the surplus in
-		// system RAM while still reporting the DEVICE_LOCAL property, so the
-		// allocation-success check below cannot detect it. The update kernels
-		// then stream volt/curr across PCIe every timestep. Measured on an
-		// RX 6800 with a 256 MB BAR (256x224x224 cells, 147 MB per field):
-		// 803 MCells/s in that state vs. 5159 MCells/s with plain device-local
-		// buffers -- a 6.4x loss to buy a host-read convenience.
-		// So require the backing heap to actually hold both field buffers
-		// (plus headroom for the operator index / staging / PML allocations
-		// that also compete for it) before preferring ReBAR.
-		if (rebarIdx != UINT32_MAX)
-		{
-			VkPhysicalDeviceMemoryProperties mp;
-			vkGetPhysicalDeviceMemoryProperties(m_physDevice, &mp);
-			const VkDeviceSize heapSize =
-				mp.memoryHeaps[mp.memoryTypes[rebarIdx].heapIndex].size;
-			const VkDeviceSize needed = 2 * (VkDeviceSize)m_fieldBufSize;
-			// 12.5% headroom for the other host-visible allocations.
-			if (heapSize < needed + needed / 8)
-			{
-				if (g_settings.GetVerboseLevel() > 0)
-					cout << "  ReBAR aperture too small ("
-					     << (heapSize >> 20) << " MB) for 2x"
-					     << (m_fieldBufSize >> 20)
-					     << " MB of field buffers — using device-local memory"
-					     << endl;
-				rebarIdx = UINT32_MAX;
-			}
-		}
-
-			if (rebarIdx != UINT32_MAX)
-			{
-				// A compatible memory type does not guarantee that the aperture is
-				// large enough for both fields. Keep every step recoverable.
-				if (TryCreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_voltBuf, m_voltMem) &&
-				    vkMapMemory(m_device, m_voltMem, 0, m_fieldBufSize, 0, (void**)&m_voltMapped) == VK_SUCCESS &&
-				    TryCreateBufferWithMemory(m_fieldBufSize, devRW, rebar, m_currBuf, m_currMem) &&
-				    vkMapMemory(m_device, m_currMem, 0, m_fieldBufSize, 0, (void**)&m_currMapped) == VK_SUCCESS)
-				{
-					// Both mappings are ready.
-				}
-				else
-				{
-					if (m_currMapped) vkUnmapMemory(m_device, m_currMem);
-					if (m_voltMapped) vkUnmapMemory(m_device, m_voltMem);
-					m_currMapped = nullptr;
-					m_voltMapped = nullptr;
-					if (m_currBuf) vkDestroyBuffer(m_device, m_currBuf, nullptr);
-					if (m_currMem) vkFreeMemory(m_device, m_currMem, nullptr);
-					if (m_voltBuf) vkDestroyBuffer(m_device, m_voltBuf, nullptr);
-					if (m_voltMem) vkFreeMemory(m_device, m_voltMem, nullptr);
-					m_voltBuf = m_currBuf = VK_NULL_HANDLE;
-					m_voltMem = m_currMem = VK_NULL_HANDLE;
-				}
-		}
-	}
-
-	// Fallback: plain device-local (requires staging for CPU access)
-	if (m_voltBuf == VK_NULL_HANDLE)
-		CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_voltBuf, m_voltMem);
-	if (m_currBuf == VK_NULL_HANDLE)
-		CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_currBuf, m_currMem);
+	// The fields stay in device-local memory; the host reads them by DMA.  A
+	// host-visible device-local type (the PCI BAR) would let the CPU read them
+	// in place, but with a legacy 256 MB BAR the driver silently spills what
+	// does not fit into system RAM, and the update kernels then stream the
+	// fields over PCIe.  On an RX 6800 that cost 6.4x for a 256x224x224 grid,
+	// and about 10x for three runs that each fit but shared the card.
+	CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_voltBuf, m_voltMem);
+	CreateBufferWithMemory(m_fieldBufSize, devRW, dLoc, m_currBuf, m_currMem);
 
 	// Compressed coefficient buffers (read-only, always device-local)
 	const Operator_Vulkan* opVk = dynamic_cast<const Operator_Vulkan*>(Op);
@@ -1454,16 +1330,14 @@ void Engine_Vulkan::CreateBuffers()
 	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_iiCompBuf, m_iiCompMem);
 	CreateBufferWithMemory(m_coeffCompBufSize, devRO, dLoc, m_ivCompBuf, m_ivCompMem);
 
-	// Staging buffer (still needed for coefficient uploads, excitation data,
-	// and fallback field sync when ReBAR is not available)
+	// Staging buffer: coefficient and field uploads, and field downloads
 	VkBufferUsageFlags stgUse = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 	                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	// Prefer a HOST_CACHED type: this buffer is read back by the CPU in
-	// DownloadFromDeviceBuffer() (field sync without ReBAR, energy/probe
-	// fallback), and a plain HOST_VISIBLE|HOST_COHERENT type can land on
-	// write-combined memory -- fast to write, ~10x slower than a cached
-	// read for the CPU to read back. Falls back to the plain flags on
-	// drivers without a cached host-visible type.
+	// DownloadFromDeviceBuffer(), and a plain HOST_VISIBLE|HOST_COHERENT
+	// type can land on write-combined memory -- fast to write, ~10x slower
+	// than a cached read for the CPU to read back. Falls back to the plain
+	// flags on drivers without a cached host-visible type.
 	if (!TryCreateBufferWithMemory(m_fieldBufSize, stgUse, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
 	                                m_stagingBuf, m_stagingMem))
 		CreateBufferWithMemory(m_fieldBufSize, stgUse, host, m_stagingBuf, m_stagingMem);
@@ -3996,9 +3870,6 @@ void Engine_Vulkan::SyncFieldsToHost() const
 		     << ", not " << numTS << "." << endl;
 		m_warnedStaleRead = true;
 	}
-	// Always by DMA into the cached staging buffer, even with ReBAR: a CPU
-	// read of mapped VRAM is an uncached PCIe read per load, about 25 MB/s on
-	// an RX 6800, which made a 64^3 field sync take 250 ms.
 	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
 		m_voltBuf, volt_ptr->data(), m_fieldBufSize);
 	const_cast<Engine_Vulkan*>(this)->DownloadFromDeviceBuffer(
@@ -4010,16 +3881,8 @@ void Engine_Vulkan::SyncFieldsToDevice()
 {
 	DrainGPU();  // must complete any pending GPU work before overwriting
 	if (!m_deviceDirty) return;
-	if (m_voltMapped && m_currMapped)
-	{
-		std::memcpy(m_voltMapped, volt_ptr->data(), m_fieldBufSize);
-		std::memcpy(m_currMapped, curr_ptr->data(), m_fieldBufSize);
-	}
-	else
-	{
-		UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
-		UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
-	}
+	UploadToDeviceBuffer(m_voltBuf, volt_ptr->data(), m_fieldBufSize);
+	UploadToDeviceBuffer(m_currBuf, curr_ptr->data(), m_fieldBufSize);
 	m_deviceDirty = false;
 }
 
@@ -6456,7 +6319,6 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		numTS += iterTS;
 		m_liveTS = numTS;
 		m_hostDirty = true;
-		m_barReads = 0;
 	}
 	else
 	{
@@ -6592,8 +6454,6 @@ void Engine_Vulkan::CleanupVulkan()
 	if (m_excDescLayout)  vkDestroyDescriptorSetLayout(m_device, m_excDescLayout, nullptr);
 
 	// Buffers
-	if (m_voltMapped) { vkUnmapMemory(m_device, m_voltMem); m_voltMapped = nullptr; }
-	if (m_currMapped) { vkUnmapMemory(m_device, m_currMem); m_currMapped = nullptr; }
 	destroyBufMem(m_voltBuf, m_voltMem);
 	destroyBufMem(m_currBuf, m_currMem);
 	destroyBufMem(m_opIndexBuf, m_opIndexMem);
@@ -7350,166 +7210,6 @@ double Engine_Vulkan::CalcFastEnergyGPU() const
 	}
 
 	return EPS0 * E_energy + MUE0 * H_energy;
-}
-
-// ===========================================================================
-// GPU Voltage/Current Integral (probe support)
-// ===========================================================================
-
-double Engine_Vulkan::CalcVoltageIntegralGPU(const unsigned int* start, const unsigned int* stop) const
-{
-	// For voltage/current probes: read directly from mapped VRAM if ReBAR is available,
-	// or do a targeted small read.  The key insight is that probes only access a few cells
-	// along a line — we just need DrainGPU(), then read directly.  With ReBAR, this is
-	// zero-copy.  Without ReBAR, we fall back to the full sync (unavoidable without
-	// a dedicated gather dispatch, but this is still better than the generic path because
-	// we avoid going through virtual GetVolt calls).
-
-	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
-		return 0.0;
-
-	// When recording probe accesses or reading from probe cache, go through
-	// GetVolt() which handles recording and cache lookup.
-	if (m_recordingProbeAccess || m_pipelinedReading)
-	{
-		double result = 0.0;
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += (double)GetVolt(n, pos[0], pos[1], pos[2]);
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= (double)GetVolt(n, pos[0], pos[1], pos[2]);
-			}
-		}
-		return result;
-	}
-
-	DrainGPU();
-
-	double result = 0.0;
-	uint32_t N   = m_fieldN;
-	uint32_t sYZ = m_strideYZ;
-
-	if (m_voltMapped)
-	{
-		// ReBAR: direct VRAM read — no download needed
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += (double)m_voltMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= (double)m_voltMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
-			}
-		}
-	}
-	else
-	{
-		// No ReBAR — must sync full fields (cached after first call per batch)
-		if (m_hostDirty) SyncFieldsToHost();
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += Engine::GetVolt(n, pos[0], pos[1], pos[2]);
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= Engine::GetVolt(n, pos[0], pos[1], pos[2]);
-			}
-		}
-	}
-	return result;
-}
-
-double Engine_Vulkan::CalcCurrentIntegralGPU(const unsigned int* start, const unsigned int* stop) const
-{
-	if (((start[0]!=stop[0]) + (start[1]!=stop[1]) + (start[2]!=stop[2]))!=1)
-		return 0.0;
-
-	// When recording or in pipelined mode, go through GetCurr() for cache/recording
-	if (m_recordingProbeAccess || m_pipelinedReading)
-	{
-		double result = 0.0;
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += (double)GetCurr(n, pos[0], pos[1], pos[2]);
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= (double)GetCurr(n, pos[0], pos[1], pos[2]);
-			}
-		}
-		return result;
-	}
-
-	DrainGPU();
-
-	double result = 0.0;
-	uint32_t N   = m_fieldN;
-	uint32_t sYZ = m_strideYZ;
-
-	if (m_currMapped)
-	{
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += (double)m_currMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= (double)m_currMapped[n * N + pos[0] * sYZ + pos[1] * numLines[2] + pos[2]];
-			}
-		}
-	}
-	else
-	{
-		if (m_hostDirty) SyncFieldsToHost();
-		for (int n = 0; n < 3; ++n)
-		{
-			if (start[n] < stop[n])
-			{
-				unsigned int pos[3] = {start[0], start[1], start[2]};
-				for (; pos[n] < stop[n]; ++pos[n])
-					result += Engine::GetCurr(n, pos[0], pos[1], pos[2]);
-			}
-			else if (start[n] > stop[n])
-			{
-				unsigned int pos[3] = {stop[0], stop[1], stop[2]};
-				for (; pos[n] < start[n]; ++pos[n])
-					result -= Engine::GetCurr(n, pos[0], pos[1], pos[2]);
-			}
-		}
-	}
-	return result;
 }
 
 #endif // WITH_GPU

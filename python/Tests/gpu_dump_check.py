@@ -25,12 +25,11 @@ neighbour.  The probes' time series must be within --tol of their largest
 magnitude, and no probe read may miss the GPU's probe cache.  For scale:
 --engine=basic differs from sse by about 3e-5.
 
-The variants cover the GPU paths a dump can take: the default (ReBAR on a
-small grid), device-local fields, speculative depths auto and 4, the standard
-loop (OPENEMS_GPU_PIPELINE=0), frequency-domain dumps summed on the host
-(OPENEMS_GPU_DUMP_DFT=0), whole-field dumps (OPENEMS_GPU_DUMP_GATHER=0),
-forced temporal blocking with short submits, a model without probes, and
-the hybrid loop.
+The variants cover the GPU paths a dump can take: the default, speculative
+depths auto and 4, the standard loop (OPENEMS_GPU_PIPELINE=0),
+frequency-domain dumps summed on the host (OPENEMS_GPU_DUMP_DFT=0),
+whole-field dumps (OPENEMS_GPU_DUMP_GATHER=0), forced temporal blocking with
+short submits, a model without probes, and the hybrid loop.
 
 --ref adds the default GPU run of another build, reported but not counted.
 
@@ -299,7 +298,6 @@ def nonzero(d):
 VARIANTS = [
 	# name, model, environment, options
 	("default", "dumps", {}, []),
-	("device-local", "dumps", {}, ["--gpu-no-rebar-fields"]),
 	("spec auto", "dumps", {"OPENEMS_GPU_SPEC_DEPTH": "auto"}, []),
 	("spec 4", "dumps", {"OPENEMS_GPU_SPEC_DEPTH": "4"}, []),
 	("standard loop", "dumps", {"OPENEMS_GPU_PIPELINE": "0"}, []),
