@@ -150,6 +150,7 @@ protected:
 	bool m_debugCSX;
 	bool m_DumpStats;
 	bool m_debugBox, m_debugPEC, m_no_simulation;
+	bool m_exactEndCriteria;
 
 	double endCrit;
 	int m_OverSampling;

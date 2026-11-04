@@ -100,6 +100,7 @@ openEMS::openEMS()
 	m_debugCSX = false;
 	m_debugBox = m_debugPEC = m_no_simulation = false;
 	m_DumpStats = false;
+	m_exactEndCriteria = false;
 
 #if OPENEMS_ENABLE_AVX2
 	m_engine = EngineType_AVX2_Multithreaded; //default engine type
@@ -470,6 +471,21 @@ openEMS::optionDesc()
 		},
 		"dump simulation statistics to '" OPENEMS_RUN_STAT_FILE
 		"' and '" OPENEMS_STAT_FILE "'"
+	);
+
+	optdesc.addBoolSwitch("exact-endcriteria",
+		[this](bool val)
+		{
+			if (!val) return;
+			cout << "openEMS - evaluating the end criteria on a fixed timestep schedule "
+			     << "for a machine-independent stopping point (reduces speed)" << endl;
+			m_exactEndCriteria = true;
+		},
+		"evaluate the energy end criteria every Nyquist timesteps for the whole "
+		"run, not only during its first minute and then every few seconds of "
+		"wall-clock time, so the run stops at the same timestep regardless of "
+		"machine speed/load; costs performance, useful mainly for engine/code "
+		"verification"
 	);
 
 	return optdesc;
@@ -1826,6 +1842,9 @@ bool openEMS::CheckAbortCond()
 	return false;
 }
 
+//! Wall-clock time of a run (s) during which the end criteria is evaluated every Nyquist period, see RunFDTD()
+static const double EXACT_ENDCRIT_TIME = 60;
+
 void openEMS::RunFDTD()
 {
 	cout << "Running FDTD engine... this may take a while... grab a cup of coffee?!?" << endl;
@@ -1946,6 +1965,7 @@ void openEMS::RunFDTD()
 	// The benchmark prints its own lines instead of the status every 4 s.
 	std::ostream nullOut(nullptr);
 	std::ostream& status = bench ? nullOut : cout;
+
 	double speed = 0;
 	double t_diff;
 	double t_run;
@@ -1954,6 +1974,58 @@ void openEMS::RunFDTD()
 	gettimeofday(&currTime,NULL);
 	timeval startTime = currTime;
 	timeval prevTime= currTime;
+
+	// The end criteria is evaluated on a fixed timestep schedule, every Nyquist period,
+	// during the first EXACT_ENDCRIT_TIME seconds: a wall-clock schedule lets a short
+	// simulation run several times longer than necessary, the more the faster the engine.
+	// After that only with the wall-clock progress report, which then is a small overshoot
+	// and saves the (full-domain) energy estimates -- unless --exact-endcriteria asks
+	// for a machine-independent stopping point. The steady-state detection keeps its
+	// verdict current itself, at the end of every period, and is read after every
+	// batch of timesteps. The benchmark never stops on an end criteria.
+	bool exactEndCrit = (Eng_Ext_SSD==NULL) && !bench;
+	if (exactEndCrit)
+	{
+		unsigned int endCritInterval = FDTD_Op->GetExcitationSignal()->GetNyquistNum();
+		if (m_exactEndCriteria)
+			cout << "Exact-endcriteria: evaluating the end criteria every "
+			     << endCritInterval << " timestep(s) (this excitation's Nyquist rate)" << endl;
+		else if (g_settings.GetVerboseLevel()>0)
+			cout << "Evaluating the end criteria every " << endCritInterval << " timestep(s) during the first "
+			     << EXACT_ENDCRIT_TIME << " s, with the progress report after that" << endl;
+		ProcField->SetProcessInterval(endCritInterval);
+	}
+
+	// The end criteria after a batch of timesteps: false stops the run on a numerical failure.
+	auto checkEndCriteria = [&]() -> bool
+	{
+		if (bench)
+			return true;
+		if (Eng_Ext_SSD)
+		{
+			change = Eng_Ext_SSD->GetLastDiff();
+			return validateChange();
+		}
+		if (ProcField->CheckTimestep())
+		{
+			if (!sampleEnergy())
+				return false;
+			if (exactEndCrit && maxE)
+				change = currE/maxE;
+			return validateChange();
+		}
+		return true;
+	};
+	// After the first EXACT_ENDCRIT_TIME seconds, only with the progress report.
+	auto relaxEndCriteria = [&]()
+	{
+		if (!exactEndCrit || m_exactEndCriteria || (CalcDiffTime(currTime,startTime)<=EXACT_ENDCRIT_TIME))
+			return;
+		exactEndCrit = false;
+		if (g_settings.GetVerboseLevel()>0)
+			cout << "Evaluating the end criteria with the progress report only from here on" << endl;
+		ProcField->ClearProcessInterval();
+	};
 
 	if (m_DumpStats)
 		InitRunStatistics(OPENEMS_RUN_STAT_FILE);
@@ -2124,13 +2196,9 @@ void openEMS::RunFDTD()
 				}
 			}
 
-			// --- Energy estimation ---
-			if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
-			{
-				// Energy computation needs full field access — disable pipelined reading
-				if (!sampleEnergy())
-					break;
-			}
+			// --- End criteria, on the drained GPU ---
+			if (!checkEndCriteria())
+				break;
 
 			currTS = FDTD_Eng->GetNumberOfTimesteps();
 			if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
@@ -2138,6 +2206,7 @@ void openEMS::RunFDTD()
 			// --- Timing and status output ---
 			gettimeofday(&currTime,NULL);
 			t_diff = CalcDiffTime(currTime,prevTime);
+			relaxEndCriteria();
 
 			if (t_diff>4)
 			{
@@ -2147,21 +2216,19 @@ void openEMS::RunFDTD()
 				status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 				if (Eng_Ext_SSD==NULL)
 				{
-					if (!sampleEnergy())
-						break;
-					if (maxE)
-						change = currE/maxE;
-					if (!validateChange())
-						break;
+					if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
+					{
+						if (!sampleEnergy())
+							break;
+						if (maxE)
+							change = currE/maxE;
+						if (!validateChange())
+							break;
+					}
 					status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 				}
 				else
-				{
-					change = Eng_Ext_SSD->GetLastDiff();
-					if (!validateChange())
-						break;
 					status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
-				}
 				prevTime=currTime;
 				prevTS=currTS;
 
@@ -2211,11 +2278,8 @@ void openEMS::RunFDTD()
 		if (bench)
 			bench->NoteInterval(step);
 
-		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
-		{
-			if (!sampleEnergy())
-				break;
-		}
+		if (!checkEndCriteria())
+			break;
 
 //		cout << " do " << step << " steps; current: " << eng.GetNumberOfTimesteps() << endl;
 		currTS = FDTD_Eng->GetNumberOfTimesteps();
@@ -2224,6 +2288,7 @@ void openEMS::RunFDTD()
 		gettimeofday(&currTime,NULL);
 
 		t_diff = CalcDiffTime(currTime,prevTime);
+		relaxEndCriteria();
 
 		if (t_diff>4)
 		{
@@ -2233,21 +2298,19 @@ void openEMS::RunFDTD()
 			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 			if (Eng_Ext_SSD==NULL)
 			{
-				if (!sampleEnergy())
-					break;
-				if (maxE)
-					change = currE/maxE;
-				if (!validateChange())
-					break;
+				if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
+				{
+					if (!sampleEnergy())
+						break;
+					if (maxE)
+						change = currE/maxE;
+					if (!validateChange())
+						break;
+				}
 				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 			}
 			else
-			{
-				change = Eng_Ext_SSD->GetLastDiff();
-				if (!validateChange())
-					break;
 				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
-			}
 			prevTime=currTime;
 			prevTS=currTS;
 
@@ -2306,9 +2369,13 @@ void openEMS::RunFDTD()
 	{
 		if (Eng_Ext_SSD == NULL)
 			cout << "RunFDTD: residual field energy reached -"
-			     << fabs(10.0*log10(endCrit)) << " dB; stopping simulation." << endl;
+			     << fabs(10.0*log10(endCrit)) << " dB after " << FDTD_Eng->GetNumberOfTimesteps()
+			     << " timesteps (-" << setprecision(2) << std::fixed << fabs(10.0*log10(change))
+			     << " dB); stopping simulation." << endl;
 		else
-			cout << "RunFDTD: steady-state criterion reached; stopping simulation." << endl;
+			cout << "RunFDTD: steady-state criterion of " << setprecision(2) << std::fixed
+			     << 10.0*log10(endCrit) << " dB reached after " << FDTD_Eng->GetNumberOfTimesteps()
+			     << " timesteps (" << 10.0*log10(change) << " dB); stopping simulation." << endl;
 	}
 
 	if (!bench && (change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
