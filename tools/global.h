@@ -55,6 +55,11 @@ public:
 	//! Restore the temporarily overwritten verbose level
 	void RestoreVerboseLevel() {m_VerboseLevel=m_SavedVerboseLevel;}
 
+	//! Set the GPU device of the gpu engine, a number of the device list; -1: the best one
+	void SetGPUDevice(int device) {m_GPUDevice=device;}
+	//! Get the GPU device of the gpu engine, -1 if the best one is to be chosen
+	int GetGPUDevice() const {return m_GPUDevice;}
+
 	// openEMS has different modules, and some options may be relevant
 	// only to a single module, such as the upcoming Tiling engine.
 	// Putting all getters and setters into the main openEMS class would
@@ -131,6 +136,7 @@ protected:
 	bool m_legacyHDF5;
 	int m_VerboseLevel;
 	int m_SavedVerboseLevel;
+	int m_GPUDevice;
 
 	OptionDesc* m_optionDesc;
 };

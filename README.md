@@ -138,8 +138,11 @@ Full tables, the method, and the cases where this fork is *not* faster are in
 
 Engine selection is via `--engine=<name>`; this fork adds `avx2`,
 `avx2-multithreaded` and `gpu` to the upstream set. The GPU engine requires
-`-DWITH_GPU=ON` at configure time (Vulkan SDK with `glslc`), and
-`OPENEMS_GPU_INDEX` selects the device when more than one is present.
+`-DWITH_GPU=ON` at configure time (Vulkan SDK with `glslc`).
+`--gpu-device=<n>` selects the device when more than one is present, a number
+of the list `--verbose=1` prints (as upstream; `OPENEMS_GPU_INDEX` still
+works). A cylindrical mesh runs on the multithreaded engine only, and an
+explicit `--engine=gpu` on one is an error.
 
 ---
 

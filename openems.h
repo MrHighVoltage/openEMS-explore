@@ -173,6 +173,7 @@ protected:
 	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_AVX2, EngineType_AVX2_Multithreaded};
 #endif
 	EngineType m_engine;
+	bool m_engineGiven; //!< --engine named an engine, not "fastest"
 	unsigned int m_engine_numThreads;
 	bool m_numThreadsGiven; //!< --numThreads was given, 0 (calibrate) included
 	std::string m_cpuCoresOption; //!< --cpu-cores; empty where not given

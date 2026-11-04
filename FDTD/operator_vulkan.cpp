@@ -127,7 +127,7 @@ Operator_Vulkan::~Operator_Vulkan()
 
 Operator_Vulkan* Operator_Vulkan::New()
 {
-	cout << "Create Vulkan GPU operator" << endl;
+	// openEMS::SetupFDTD() announces the operator once the GPU preflight found a device
 	Operator_Vulkan* op = new Operator_Vulkan();
 	op->Init();
 	return op;

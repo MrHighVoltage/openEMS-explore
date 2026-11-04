@@ -105,6 +105,7 @@ openEMS::openEMS()
 #else
 	m_engine = EngineType_Multithreaded; // default portable engine type
 #endif
+	m_engineGiven = false;
 	m_engine_numThreads = 0;
 	m_numThreadsGiven = false;
 	m_gpuTBMBOption = 0;
@@ -246,6 +247,7 @@ openEMS::optionDesc()
 	optdesc.addStringOption("engine", "fastest",
 		[this](const std::string& val)
 		{
+			m_engineGiven = (val != "fastest");
 			if (val == "fastest")
 			{
 				// default, don't show console output
@@ -397,6 +399,15 @@ openEMS::optionDesc()
 #endif
 
 #ifdef WITH_GPU
+	optdesc.addIntOption("gpu-device", -1,
+		[](int val)
+		{
+			g_settings.SetGPUDevice(val);
+		},
+		"GPU device of --engine=gpu, a number of the device list printed at "
+		"--verbose=1 (default: OPENEMS_GPU_INDEX, else the first discrete GPU)"
+	);
+
 	// Accepted so that existing scripts keep working.
 	optdesc.addBoolSwitch("gpu-no-rebar-fields",
 		[](bool) {},
@@ -1018,6 +1029,26 @@ bool openEMS::SetupOperator()
 		m_engine = EngineType_Multithreaded;
 	}
 #endif
+	// A cylindrical mesh runs on the multithreaded engine only. An explicit --engine=gpu
+	// fails rather than report a CPU run as a GPU one (benchmark/bench.py rows).
+#ifdef WITH_GPU
+	if (CylinderCoords && (m_engine == EngineType_GPU))
+	{
+		if (m_engineGiven)
+		{
+			cerr << "openEMS::SetupOperator: Error: the GPU engine does not run on a cylindrical mesh, "
+			        "use --engine=multithreaded" << endl;
+			return false;
+		}
+		cout << "openEMS - the GPU engine does not run on a cylindrical mesh, using the multithreaded engine" << endl;
+		m_engine = EngineType_Multithreaded;
+	}
+#endif
+	if (CylinderCoords && ((m_engine == EngineType_AVX2) || (m_engine == EngineType_AVX2_Multithreaded)))
+	{
+		cout << "openEMS - the AVX2 engine does not run on a cylindrical mesh, using the multithreaded engine" << endl;
+		m_engine = EngineType_Multithreaded;
+	}
 	if (CylinderCoords)
 	{
 		if (m_CC_MultiGrid.size()>0)
@@ -1580,10 +1611,10 @@ int openEMS::SetupFDTD()
 				strictCoeffReserve,
 				&preflightErr))
 		{
-			cerr << "openEMS::SetupFDTD: GPU memory preflight failed before operator generation: "
+			cerr << "openEMS::SetupFDTD: GPU preflight failed before operator generation: "
 			     << preflightErr << endl;
 			cerr << "  Hint: reduce mesh size, disable strict reserve (OPENEMS_GPU_PREFLIGHT_STRICT=0), "
-			     << "or use a different GPU via OPENEMS_GPU_INDEX." << endl;
+			     << "or use a different GPU via --gpu-device." << endl;
 			Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 			return 2;
 		}
@@ -1592,6 +1623,9 @@ int openEMS::SetupFDTD()
 			cout << "openEMS::SetupFDTD: GPU preflight passed (strict coefficient reserve enabled)." << endl;
 		else
 			cout << "openEMS::SetupFDTD: GPU preflight passed (core field/staging allocations)." << endl;
+		// upstream's operator line, only once a usable device exists: benchmark/bench.py
+		// takes it for "the GPU engine can run"
+		cout << "Create FDTD operator (GPU)" << endl;
 	}
 #endif
 

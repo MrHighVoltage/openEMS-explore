@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <iomanip>
 #include <sstream>
 
 using std::cerr;
@@ -157,9 +158,12 @@ struct PmlCoeffKeyHash
 
 Engine_Vulkan* Engine_Vulkan::New(const Operator* op)
 {
-	cout << "Create Vulkan GPU engine" << endl;
 	Engine_Vulkan* e = new Engine_Vulkan(op);
 	e->Init();
+	// upstream's engine line, which benchmark/bench.py reads the backend from
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(e->m_physDevice, &props);
+	cout << "Create FDTD engine (GPU, backend: Vulkan (" << props.deviceName << "))" << endl;
 	return e;
 }
 
@@ -207,6 +211,106 @@ static std::string VulkanVersionString(uint32_t v)
 	return os.str();
 }
 
+namespace {
+//! A device the engine can run on: it implements the engine baseline and has a compute queue.
+struct VulkanComputeDevice
+{
+	VkPhysicalDevice dev;
+	uint32_t computeQueueFamily;
+	VkPhysicalDeviceProperties props;
+	VkDeviceSize memory;    //!< the largest device-local heap
+};
+
+//! The devices the engine can run on, in vkEnumeratePhysicalDevices() order: the
+//! numbers of --gpu-device and OPENEMS_GPU_INDEX. \a sawBelowBaseline tells whether a
+//! device was left out for implementing an older Vulkan version.
+std::vector<VulkanComputeDevice> ListComputeDevices(VkInstance instance, bool& sawBelowBaseline)
+{
+	sawBelowBaseline = false;
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(instance, &count, nullptr);
+	std::vector<VkPhysicalDevice> devs(count);
+	if (count > 0)
+		vkEnumeratePhysicalDevices(instance, &count, devs.data());
+
+	std::vector<VulkanComputeDevice> devices;
+	for (VkPhysicalDevice d : devs)
+	{
+		// the single engine baseline is enforced here rather than discovering a
+		// missing 1.3 feature later, halfway through pipeline creation
+		if (!VulkanDeviceMeetsBaseline(d)) { sawBelowBaseline = true; continue; }
+		uint32_t qfCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, nullptr);
+		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, qfProps.data());
+		for (uint32_t i = 0; i < qfCount; ++i)
+		{
+			if (!(qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+				continue;
+			VulkanComputeDevice c{};
+			c.dev = d;
+			c.computeQueueFamily = i;
+			vkGetPhysicalDeviceProperties(d, &c.props);
+			VkPhysicalDeviceMemoryProperties mp{};
+			vkGetPhysicalDeviceMemoryProperties(d, &mp);
+			for (uint32_t h = 0; h < mp.memoryHeapCount; ++h)
+				if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+					c.memory = std::max(c.memory, mp.memoryHeaps[h].size);
+			devices.push_back(c);
+			break;
+		}
+	}
+	return devices;
+}
+
+//! "n: name (Vulkan, x.x GiB[, integrated])", the device line of upstream's GPU engine
+std::string DeviceLine(size_t n, const VulkanComputeDevice& d)
+{
+	std::ostringstream line;
+	line << n << ": " << d.props.deviceName << " (Vulkan, " << std::fixed << std::setprecision(1)
+	     << d.memory / 1073741824.0 << " GiB";
+	if (d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+		line << ", integrated";
+	else if (d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+		line << ", CPU";
+	line << ")";
+	return line.str();
+}
+
+//! The device to run on: --gpu-device, else OPENEMS_GPU_INDEX, else the first discrete GPU,
+//! else the first device. An invalid --gpu-device throws; an invalid OPENEMS_GPU_INDEX
+//! falls back to the automatic choice, with a warning if \a report.
+size_t ChooseComputeDevice(const std::vector<VulkanComputeDevice>& devices, bool report)
+{
+	const int chosen = g_settings.GetGPUDevice();
+	if (chosen >= 0)
+	{
+		if (chosen < (int)devices.size())
+			return chosen;
+		std::ostringstream err;
+		err << "--gpu-device=" << chosen << ", but there " << (devices.size()==1 ? "is " : "are ")
+		    << devices.size() << " GPU device" << (devices.size()==1 ? "" : "s");
+		for (size_t n = 0; n < devices.size(); ++n)
+			err << (n==0 ? ": " : ", ") << DeviceLine(n, devices[n]);
+		throw std::runtime_error(err.str());
+	}
+	if (const char* env = std::getenv("OPENEMS_GPU_INDEX"))
+	{
+		char* end = nullptr;
+		const long idx = std::strtol(env, &end, 10);
+		if (end && *end == '\0' && idx >= 0 && idx < (long)devices.size())
+			return idx;
+		if (report)
+			cerr << "Engine_Vulkan: invalid OPENEMS_GPU_INDEX='" << env << "' (valid range: 0.."
+			     << (int)devices.size()-1 << "), using automatic GPU selection." << endl;
+	}
+	for (size_t n = 0; n < devices.size(); ++n)
+		if (devices[n].props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+			return n;
+	return 0;
+}
+} // namespace
+
 bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny, unsigned int Nz,
                                                bool strictCoeffReserve, std::string* errMsg)
 {
@@ -249,38 +353,9 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 		if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS)
 			return fail("Vulkan preflight: failed to create Vulkan instance");
 
-		uint32_t devCount = 0;
-		vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
-		if (devCount == 0)
-			return fail("Vulkan preflight: no Vulkan physical devices found");
-		std::vector<VkPhysicalDevice> devs(devCount);
-		vkEnumeratePhysicalDevices(instance, &devCount, devs.data());
-
-		struct Candidate { VkPhysicalDevice dev; uint32_t qf; VkPhysicalDeviceProperties props; };
-		std::vector<Candidate> cands;
 		bool sawBelowBaseline = false;
-		for (auto& d : devs)
-		{
-			if (!VulkanDeviceMeetsBaseline(d)) { sawBelowBaseline = true; continue; }
-			uint32_t qfCount = 0;
-			vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, nullptr);
-			if (qfCount == 0) continue;
-			std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-			vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, qfProps.data());
-			for (uint32_t i = 0; i < qfCount; ++i)
-			{
-				if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
-				{
-					Candidate c{};
-					c.dev = d;
-					c.qf = i;
-					vkGetPhysicalDeviceProperties(d, &c.props);
-					cands.push_back(c);
-					break;
-				}
-			}
-		}
-		if (cands.empty())
+		const std::vector<VulkanComputeDevice> devices = ListComputeDevices(instance, sawBelowBaseline);
+		if (devices.empty())
 		{
 			if (sawBelowBaseline)
 				return fail("Vulkan preflight: no GPU implementing Vulkan " +
@@ -289,35 +364,25 @@ bool Engine_Vulkan::PreflightAllocationForGrid(unsigned int Nx, unsigned int Ny,
 				            "older version -- update the graphics driver)");
 			return fail("Vulkan preflight: no compute-capable GPU found");
 		}
-
-		int forcedIndex = -1;
-		if (const char* envGpuIndex = std::getenv("OPENEMS_GPU_INDEX"))
+		// upstream's device list, also with --no-simulation (benchmark/bench.py reads it);
+		// the preflight runs once, before the engine opens the device
+		if (g_settings.GetVerboseLevel() > 0)
 		{
-			char* endPtr = nullptr;
-			long idx = std::strtol(envGpuIndex, &endPtr, 10);
-			if (endPtr && *endPtr == '\0' && idx >= 0 && idx < (long)cands.size())
-				forcedIndex = (int)idx;
+			cout << "GPU devices:" << endl;
+			for (size_t n = 0; n < devices.size(); ++n)
+				cout << "  " << DeviceLine(n, devices[n]) << endl;
 		}
-
-		uint32_t computeQf = cands[0].qf;
-		phys = cands[0].dev;
-		if (forcedIndex >= 0)
+		size_t chosen = 0;
+		try
 		{
-			phys = cands[forcedIndex].dev;
-			computeQf = cands[forcedIndex].qf;
+			chosen = ChooseComputeDevice(devices, true);
 		}
-		else
+		catch (const std::exception& e)
 		{
-			for (const auto& c : cands)
-			{
-				if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-				{
-					phys = c.dev;
-					computeQf = c.qf;
-					break;
-				}
-			}
+			return fail(e.what());
 		}
+		phys = devices[chosen].dev;
+		const uint32_t computeQf = devices[chosen].computeQueueFamily;
 
 		float priority = 1.0f;
 		VkDeviceQueueCreateInfo qci{};
@@ -722,49 +787,9 @@ void Engine_Vulkan::InitVulkan()
 	VK_CHECK(vkCreateInstance(&instInfo, nullptr, &m_instance));
 
 	// --- Physical device ---
-	uint32_t devCount = 0;
-	vkEnumeratePhysicalDevices(m_instance, &devCount, nullptr);
-	if (devCount == 0)
-		throw std::runtime_error("Engine_Vulkan: no Vulkan-capable GPU found");
-
-	std::vector<VkPhysicalDevice> devs(devCount);
-	vkEnumeratePhysicalDevices(m_instance, &devCount, devs.data());
-
-	struct GpuCandidate {
-		VkPhysicalDevice dev;
-		uint32_t computeQueueFamily;
-		VkPhysicalDeviceProperties props;
-	};
-
-	std::vector<GpuCandidate> candidates;
-	candidates.reserve(devs.size());
-
 	bool sawBelowBaseline = false;
-	for (auto& dev : devs)
-	{
-		// Enforce the single engine baseline here rather than discovering a
-		// missing 1.3 feature later, halfway through pipeline creation.
-		if (!VulkanDeviceMeetsBaseline(dev)) { sawBelowBaseline = true; continue; }
-		uint32_t qfCount = 0;
-		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, nullptr);
-		std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-		vkGetPhysicalDeviceQueueFamilyProperties(dev, &qfCount, qfProps.data());
-
-		for (uint32_t i = 0; i < qfCount; i++)
-		{
-			if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
-			{
-				GpuCandidate c{};
-				c.dev = dev;
-				c.computeQueueFamily = i;
-				vkGetPhysicalDeviceProperties(dev, &c.props);
-				candidates.push_back(c);
-				break;
-			}
-		}
-	}
-
-	if (candidates.empty())
+	const std::vector<VulkanComputeDevice> devices = ListComputeDevices(m_instance, sawBelowBaseline);
+	if (devices.empty())
 	{
 		if (sawBelowBaseline)
 			throw std::runtime_error(
@@ -774,58 +799,10 @@ void Engine_Vulkan::InitVulkan()
 				"-- update the graphics driver, or build without WITH_GPU)");
 		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
 	}
-
-	// Optional override: OPENEMS_GPU_INDEX=<n> selects the n-th compute-capable
-	// Vulkan device from vkEnumeratePhysicalDevices() order.
-	int forcedIndex = -1;
-	if (const char* envGpuIndex = std::getenv("OPENEMS_GPU_INDEX"))
-	{
-		char* endPtr = nullptr;
-		long idx = std::strtol(envGpuIndex, &endPtr, 10);
-		if (endPtr && *endPtr == '\0' && idx >= 0 && idx < (long)candidates.size())
-			forcedIndex = (int)idx;
-		else
-			cerr << "Engine_Vulkan: invalid OPENEMS_GPU_INDEX='" << envGpuIndex
-			     << "' (valid range: 0.." << (int)candidates.size()-1
-			     << "), using automatic GPU selection." << endl;
-	}
-
-	if (forcedIndex >= 0)
-	{
-		m_physDevice = candidates[forcedIndex].dev;
-		m_computeQueueFamily = candidates[forcedIndex].computeQueueFamily;
-	}
-	else
-	{
-		// Default policy: prefer discrete GPU, fall back to first compute-capable.
-		m_physDevice = candidates[0].dev;
-		m_computeQueueFamily = candidates[0].computeQueueFamily;
-		for (const auto& c : candidates)
-		{
-			if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-			{
-				m_physDevice = c.dev;
-				m_computeQueueFamily = c.computeQueueFamily;
-				break;
-			}
-		}
-	}
-
-	// Print Vulkan device inventory once for easier multi-GPU selection.
-	cout << "Engine_Vulkan: compute-capable Vulkan devices:" << endl;
-	for (size_t i = 0; i < candidates.size(); ++i)
-	{
-		cout << "  [" << i << "] " << candidates[i].props.deviceName;
-		if (candidates[i].props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-			cout << " (discrete)";
-		else if (candidates[i].props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
-			cout << " (integrated)";
-		cout << endl;
-	}
-	if (forcedIndex >= 0)
-		cout << "Engine_Vulkan: forcing GPU index " << forcedIndex << " via OPENEMS_GPU_INDEX" << endl;
-	if (m_physDevice == VK_NULL_HANDLE)
-		throw std::runtime_error("Engine_Vulkan: no compute-capable GPU found");
+	// the preflight has listed the devices and reported an invalid choice
+	const VulkanComputeDevice& chosen = devices[ChooseComputeDevice(devices, false)];
+	m_physDevice = chosen.dev;
+	m_computeQueueFamily = chosen.computeQueueFamily;
 
 	// --- Logical device ---
 	float priority = 1.0f;
