@@ -26,11 +26,14 @@
  * By switching on Engine::EngineType once and calling a templated inner
  * loop with a concrete engine type, all field accesses use static dispatch.
  *
- * The interpolation logic mirrors Engine_Interface_FDTD exactly.
+ * The interpolation is Engine_Interface_FDTD's own, InterpolateField() and
+ * InterpolateDualField(), as for GetEField() etc., including the seam of a
+ * closed mesh (the alpha direction of a closed cylindrical mesh).
  */
 
 #include "FDTD/engine.h"
 #include "FDTD/engine_sse.h"
+#include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/operator.h"
 #include "processfields.h"
 #include "tools/constants.h"
@@ -204,19 +207,21 @@ static RawFieldFunc<EngT> GetDualFieldFunc(ProcessFields::DumpType type)
 	}
 }
 
-//--- Interpolated primary field extraction (E, J, D, rotH) -------------------
+//--- Interpolated field extraction ------------------------------------------
 
-template<typename EngT>
-static void ExtractPrimaryFieldSlice(
-	const EngT* eng, const Operator* op, const MaterialContext& mat,
+//! The interpolated field (\a Dual: H or B, else E, J, D or rotH) at the dump positions of lines [startI, endI) in x
+template<typename EngT, bool Dual>
+static void ExtractFieldSlice(
+	const EngT* eng, const Engine_Interface_FDTD* fdtd_if, const MaterialContext& mat,
 	RawFieldFunc<EngT> rawFunc,
-	Engine_Interface_Base::InterpolationType interp,
 	unsigned int numLines[3], unsigned int* posLines[3],
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> &field,
 	unsigned int startI, unsigned int endI)
 {
+	const Operator* op = fdtd_if->GetFDTDOperator();
+	auto raw = [eng, op, &mat, rawFunc](unsigned int n, const unsigned int* p) {return rawFunc(eng, op, mat, n, p);};
 	unsigned int pos[3];
-	unsigned int iPos[3];
+	double out[3];
 
 	for (unsigned int i = startI; i < endI; ++i)
 	{
@@ -227,150 +232,10 @@ static void ExtractPrimaryFieldSlice(
 			for (unsigned int k = 0; k < numLines[2]; ++k)
 			{
 				pos[2] = posLines[2][k];
-				iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-				double out[3];
-
-				switch (interp)
-				{
-				default:
-				case Engine_Interface_Base::NO_INTERPOLATION:
-					for (int n = 0; n < 3; ++n)
-						out[n] = rawFunc(eng, op, mat, n, pos);
-					break;
-				case Engine_Interface_Base::NODE_INTERPOLATE:
-					for (int n = 0; n < 3; ++n)
-					{
-						iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-						if (pos[n] == op->GetNumberOfLines(n, true) - 1)
-						{
-							--iPos[n];
-							out[n] = rawFunc(eng, op, mat, n, iPos);
-							++iPos[n];
-							continue;
-						}
-						double delta = op->GetEdgeLength(n, iPos);
-						out[n] = rawFunc(eng, op, mat, n, iPos);
-						if (delta == 0.0) { out[n] = 0; continue; }
-						if (pos[n] == 0) continue;
-						--iPos[n];
-						double deltaDown = op->GetEdgeLength(n, iPos);
-						double deltaRel = delta / (delta + deltaDown);
-						out[n] = out[n] * (1.0 - deltaRel) + rawFunc(eng, op, mat, n, iPos) * deltaRel;
-						++iPos[n];
-					}
-					break;
-				case Engine_Interface_Base::CELL_INTERPOLATE:
-					for (int n = 0; n < 3; ++n)
-					{
-						iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-						int nP = (n+1) % 3;
-						int nPP = (n+2) % 3;
-						if ((pos[0] == op->GetNumberOfLines(0, true) - 1) ||
-						    (pos[1] == op->GetNumberOfLines(1, true) - 1) ||
-						    (pos[2] == op->GetNumberOfLines(2, true) - 1))
-						{
-							out[n] = 0;
-							continue;
-						}
-						out[n]  = rawFunc(eng, op, mat, n, iPos);
-						++iPos[nP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						++iPos[nPP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						--iPos[nP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						--iPos[nPP];
-						out[n] /= 4.0;
-					}
-					break;
-				}
-
-				field(0, i, j, k) = out[0];
-				field(1, i, j, k) = out[1];
-				field(2, i, j, k) = out[2];
-			}
-		}
-	}
-}
-
-//--- Interpolated dual field extraction (H, B) -------------------------------
-
-template<typename EngT>
-static void ExtractDualFieldSlice(
-	const EngT* eng, const Operator* op, const MaterialContext& mat,
-	RawFieldFunc<EngT> rawFunc,
-	Engine_Interface_Base::InterpolationType interp,
-	unsigned int numLines[3], unsigned int* posLines[3],
-	ArrayLib::ArrayNIJK<FDTD_FLOAT> &field,
-	unsigned int startI, unsigned int endI)
-{
-	unsigned int pos[3];
-	unsigned int iPos[3];
-
-	for (unsigned int i = startI; i < endI; ++i)
-	{
-		pos[0] = posLines[0][i];
-		for (unsigned int j = 0; j < numLines[1]; ++j)
-		{
-			pos[1] = posLines[1][j];
-			for (unsigned int k = 0; k < numLines[2]; ++k)
-			{
-				pos[2] = posLines[2][k];
-				iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-				double out[3];
-
-				switch (interp)
-				{
-				default:
-				case Engine_Interface_Base::NO_INTERPOLATION:
-					for (int n = 0; n < 3; ++n)
-						out[n] = rawFunc(eng, op, mat, n, pos);
-					break;
-				case Engine_Interface_Base::NODE_INTERPOLATE:
-					for (int n = 0; n < 3; ++n)
-					{
-						iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-						int nP = (n+1) % 3;
-						int nPP = (n+2) % 3;
-						if ((pos[0] == op->GetNumberOfLines(0, true) - 1) ||
-						    (pos[1] == op->GetNumberOfLines(1, true) - 1) ||
-						    (pos[2] == op->GetNumberOfLines(2, true) - 1) ||
-						    (pos[nP] == 0) || (pos[nPP] == 0))
-						{
-							out[n] = 0;
-							continue;
-						}
-						out[n]  = rawFunc(eng, op, mat, n, iPos);
-						--iPos[nP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						--iPos[nPP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						++iPos[nP];
-						out[n] += rawFunc(eng, op, mat, n, iPos);
-						++iPos[nPP];
-						out[n] /= 4.0;
-					}
-					break;
-				case Engine_Interface_Base::CELL_INTERPOLATE:
-					for (int n = 0; n < 3; ++n)
-					{
-						iPos[0] = pos[0]; iPos[1] = pos[1]; iPos[2] = pos[2];
-						double delta = op->GetEdgeLength(n, iPos, true);
-						out[n] = rawFunc(eng, op, mat, n, iPos);
-						if (pos[n] >= op->GetNumberOfLines(n, true) - 1)
-						{
-							out[n] = 0;
-							continue;
-						}
-						++iPos[n];
-						double deltaUp = op->GetEdgeLength(n, iPos, true);
-						double deltaRel = delta / (delta + deltaUp);
-						out[n] = out[n] * (1.0 - deltaRel) + rawFunc(eng, op, mat, n, iPos) * deltaRel;
-						--iPos[n];
-					}
-					break;
-				}
-
+				if (Dual)
+					fdtd_if->InterpolateDualField(pos, out, raw);
+				else
+					fdtd_if->InterpolateField(pos, out, raw);
 				field(0, i, j, k) = out[0];
 				field(1, i, j, k) = out[1];
 				field(2, i, j, k) = out[2];
@@ -383,9 +248,8 @@ static void ExtractDualFieldSlice(
 
 template<typename EngT>
 static bool CalcFieldForEngine(
-	const EngT* eng, const Operator* op, const MaterialContext& mat,
+	const EngT* eng, const Engine_Interface_FDTD* fdtd_if, const MaterialContext& mat,
 	ProcessFields::DumpType dumpType,
-	Engine_Interface_Base::InterpolationType interp,
 	unsigned int numLines[3], unsigned int* posLines[3],
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> &field,
 	unsigned int numThreads)
@@ -405,9 +269,9 @@ static bool CalcFieldForEngine(
 	{
 		// Single-threaded path
 		if (primaryFunc)
-			ExtractPrimaryFieldSlice<EngT>(eng, op, mat, primaryFunc, interp, numLines, posLines, field, 0, numLines[0]);
+			ExtractFieldSlice<EngT, false>(eng, fdtd_if, mat, primaryFunc, numLines, posLines, field, 0, numLines[0]);
 		else
-			ExtractDualFieldSlice<EngT>(eng, op, mat, dualFunc, interp, numLines, posLines, field, 0, numLines[0]);
+			ExtractFieldSlice<EngT, true>(eng, fdtd_if, mat, dualFunc, numLines, posLines, field, 0, numLines[0]);
 	}
 	else
 	{
@@ -427,14 +291,14 @@ static bool CalcFieldForEngine(
 			if (primaryFunc)
 			{
 				threads.emplace_back(
-					ExtractPrimaryFieldSlice<EngT>,
-					eng, op, std::cref(mat), primaryFunc, interp, numLines, posLines, std::ref(field), startI, endI);
+					ExtractFieldSlice<EngT, false>,
+					eng, fdtd_if, std::cref(mat), primaryFunc, numLines, posLines, std::ref(field), startI, endI);
 			}
 			else
 			{
 				threads.emplace_back(
-					ExtractDualFieldSlice<EngT>,
-					eng, op, std::cref(mat), dualFunc, interp, numLines, posLines, std::ref(field), startI, endI);
+					ExtractFieldSlice<EngT, true>,
+					eng, fdtd_if, std::cref(mat), dualFunc, numLines, posLines, std::ref(field), startI, endI);
 			}
 			startI = endI;
 		}

@@ -425,8 +425,7 @@ bool ProcessFields::CalcFieldFromFootprint(ArrayLib::ArrayNIJK<FDTD_FLOAT> &fiel
 	view.sn = m_gpuLines[0].size() * view.sa;
 	const FieldCalc::MaterialContext mat = MaterialContextOf(fdtd_if);
 	if (!FieldCalc::CalcFieldForEngine<FieldCalc::FootprintView>(
-			&view, fdtd_if->GetFDTDOperator(), mat, type, m_Eng_Interface->GetInterpolationType(),
-			numLines, posLines, field, CalcThreads()))
+			&view, fdtd_if, mat, type, numLines, posLines, field, CalcThreads()))
 		return false;
 	if (view.missed)
 	{
@@ -444,7 +443,6 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 	if (fdtd_if)
 	{
 		const Engine* eng = fdtd_if->GetFDTDEngine();
-		const Operator* op = fdtd_if->GetFDTDOperator();
 		const FieldCalc::MaterialContext mat = MaterialContextOf(fdtd_if);
 		const unsigned int nThreads = CalcThreads();
 
@@ -453,8 +451,7 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 		{
 		case Engine::SSE:
 			ok = FieldCalc::CalcFieldForEngine<Engine_sse>(
-				static_cast<const Engine_sse*>(eng), op, mat, m_DumpType,
-				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
+				static_cast<const Engine_sse*>(eng), fdtd_if, mat, m_DumpType, numLines, posLines, field, nThreads);
 			break;
 		case Engine::AVX2:
 			// Covers both Engine_AVX2 and Engine_AVX2_Multithread -- they share
@@ -467,8 +464,7 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 			// dump (vs. ~12% for SSE with this fast path), because AVX2 was the
 			// only multithreaded engine still hitting that fallback.
 			ok = FieldCalc::CalcFieldForEngine<Engine_AVX2>(
-				static_cast<const Engine_AVX2*>(eng), op, mat, m_DumpType,
-				m_Eng_Interface->GetInterpolationType(), numLines, posLines, field, nThreads);
+				static_cast<const Engine_AVX2*>(eng), fdtd_if, mat, m_DumpType, numLines, posLines, field, nThreads);
 			break;
 #ifdef WITH_GPU
 		case Engine::GPU:
@@ -488,15 +484,14 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 			// buffers first so those reads do not see a stale host copy.
 			vk->SyncFieldsToHost();
 			ok = FieldCalc::CalcFieldForEngine<Engine>(
-				eng, op, mat,
-				m_DumpType, m_Eng_Interface->GetInterpolationType(),
+				eng, fdtd_if, mat, m_DumpType,
 				numLines, posLines, field, nThreads);
 			break;
 		}
 #endif
 		case Engine::BASIC:
 			ok = FieldCalc::CalcFieldForEngine<Engine>(
-				eng, op, mat, m_DumpType, m_Eng_Interface->GetInterpolationType(),
+				eng, fdtd_if, mat, m_DumpType,
 				numLines, posLines, field, nThreads);
 			break;
 		default:
