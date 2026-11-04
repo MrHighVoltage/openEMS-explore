@@ -1,0 +1,65 @@
+/*
+ * Debye dispersive material, post-voltage update and Apply2Voltages in one
+ * pass (Engine_Ext_DebyeMaterial).
+ *
+ * Sparse dispatch: one thread per Debye cell, in the dispersive apply slot.
+ * The cell voltage there is still the one Engine_Ext_DebyeMaterial's
+ * DoPostVoltageUpdates() reads on the CPU: everything that writes the field
+ * between the Yee update and that hook -- UPML post, TF/SF injection -- has a
+ * higher priority and comes before this slot here too, and the dispersive
+ * apply is the first apply.  So with V_raw = V:
+ *
+ *   V^(n+1) = (V_raw - pre) * solve
+ *   ade     = V_raw - V^(n+1)        (DoPostVoltageUpdates, volt_ADE)
+ *   V       = V_raw - ade            (Apply2Voltages)
+ *   W_k    += drive_k * V^(n+1)
+ *
+ * `precise` keeps the CPU's operations: no fused multiply-add.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) buffer VoltBuf   { float volt[];    };
+layout(set=0, binding=1) buffer PoleBuf   { float W[];       };  // [poles][3][count]
+layout(set=0, binding=2) buffer PreBuf    { float pre_ADE[]; };  // [3][count]
+layout(set=0, binding=3) buffer PosIdxBuf { uint  posIdx[];  };  // [3][count]: x,y,z indices
+layout(set=0, binding=4) buffer RelaxBuf  { float relax[];   };  // [poles][3][count], used by the pre pass
+layout(set=0, binding=5) buffer DriveBuf  { float drive[];   };  // [poles][3][count]
+layout(set=0, binding=6) buffer SolveBuf  { float solve[];   };  // [3][count]
+
+layout(push_constant) uniform PC {
+    uint count;       // number of Debye cells
+    uint Nx, Ny, Nz;  // global grid dimensions
+    uint poles;       // number of Debye poles (DispPC's hasLorADE slot)
+    // Temporal blocking: this dispatch owns entries [entryBase, entryEnd) of
+    // the list, which the host sorted by x.  The flat sweep passes (0, ~0).
+    uint entryBase, entryEnd;
+};
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x + entryBase;
+    if (gid >= count || gid >= entryEnd) return;
+
+    uint N   = Nx * Ny * Nz;
+    uint sYZ = Ny * Nz;
+    uint g_base = posIdx[gid] * sYZ + posIdx[count + gid] * Nz + posIdx[2*count + gid];
+
+    for (uint n = 0; n < 3; n++)
+    {
+        uint g = n * N + g_base;
+        uint a = n * count + gid;
+        float v_raw = volt[g];
+        precise float v   = (v_raw - pre_ADE[a]) * solve[a];
+        precise float ade = v_raw - v;
+        precise float v_new = v_raw - ade;
+        volt[g] = v_new;
+        for (uint o = 0; o < poles; o++)
+        {
+            uint k = (o * 3 + n) * count + gid;
+            precise float w = W[k] + drive[k] * v;
+            W[k] = w;
+        }
+    }
+}

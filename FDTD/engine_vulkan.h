@@ -26,6 +26,7 @@
 class Operator_Ext_Excitation;
 class Operator_Ext_UPML;
 class Operator_Ext_LorentzMaterial;
+class Operator_Ext_DebyeMaterial;
 class Engine_Ext_SteadyState;
 class Operator_Ext_TFSF;
 class Operator_Ext_Mur_ABC;
@@ -481,6 +482,10 @@ private:
 	//! Returns true if anything was dispatched, so the caller can skip a
 	//! barrier it does not need.
 	bool RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
+	//! The Debye entries of m_gpuDisp: the pre pass (\a apply false) or the post+apply
+	//! pass, all entries (x0 < 0) or those of the slab [x0,x1); returns whether it dispatched.
+	//! With \a barrierEach, a barrier follows every dispatch, as in the flat apply loops.
+	bool RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach) const;
 
 	//! Push constant struct for UPML shaders.  The trailing slab range
 	//! defaults to "everything", so the flat path is unaffected.
@@ -563,6 +568,14 @@ private:
 		uint32_t count = 0;
 		bool voltLorADEOn = false, currLorADEOn = false;
 		bool voltADEOn = false, currADEOn = false;
+		//! A Debye material (Operator_Ext_DebyeMaterial): voltage side only, its own
+		//! pre pass and a post+apply pass instead of the Lorentz shaders, both on
+		//! debyeDesc; voltPC carries the pole count in its hasLorADE slot.
+		bool debye = false;
+		uint32_t poles = 0;
+		GpuBuf debyeW, debyePre;                          // pole states [poles][3][count], pre sum [3][count]
+		GpuBuf debyeRelax, debyeDrive, debyeSolve;        // [poles][3][count], [poles][3][count], [3][count]
+		VkDescriptorSet debyeDesc = VK_NULL_HANDLE;
 	};
 
 	//! TF/SF GPU state (all injection points flattened).
@@ -677,6 +690,7 @@ private:
 	VkDescriptorSetLayout m_upmlPreCurrDescLayout  = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_upmlPostCurrDescLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_dispPreDescLayout      = VK_NULL_HANDLE;
+	VkDescriptorSetLayout m_debyeDescLayout        = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_dispApplyDescLayout    = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_tfsfDescLayout         = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_murPreDescLayout       = VK_NULL_HANDLE;
@@ -690,6 +704,7 @@ private:
 	VkPipelineLayout m_upmlPrePipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_upmlPostPipeLayout= VK_NULL_HANDLE;
 	VkPipelineLayout m_dispPrePipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_debyePipeLayout   = VK_NULL_HANDLE;
 	VkPipelineLayout m_dispApplyPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_tfsfPipeLayout    = VK_NULL_HANDLE;
 	VkPipelineLayout m_murUpdatePipeLayout = VK_NULL_HANDLE;
@@ -704,6 +719,8 @@ private:
 	VkPipeline m_upmlPreCurrPipeline   = VK_NULL_HANDLE;
 	VkPipeline m_upmlPostCurrPipeline  = VK_NULL_HANDLE;
 	VkPipeline m_dispPreVoltPipeline   = VK_NULL_HANDLE;
+	VkPipeline m_debyePreVoltPipeline   = VK_NULL_HANDLE;
+	VkPipeline m_debyeApplyVoltPipeline = VK_NULL_HANDLE;
 	VkPipeline m_dispPreCurrPipeline   = VK_NULL_HANDLE;
 	VkPipeline m_dispApplyVoltPipeline = VK_NULL_HANDLE;
 	VkPipeline m_dispApplyCurrPipeline = VK_NULL_HANDLE;
@@ -774,6 +791,7 @@ private:
 	void SetupGPUExtensions();     //!< Detect and setup all GPU-native extensions
 	void SetupGPU_UPML();          //!< Upload PML data and create descriptors/pipelines
 	void SetupGPU_Dispersive();    //!< Upload dispersive ADE data
+	void SetupGPU_Debye(const Operator_Ext_DebyeMaterial* deb);  //!< One Debye material, called by SetupGPU_Dispersive()
 	void SetupGPU_TFSF();          //!< Flatten and upload TF/SF injection points
 	void SetupGPU_Mur();           //!< Upload Mur ABC data
 	void SetupGPU_RLC();           //!< Upload lumped RLC data

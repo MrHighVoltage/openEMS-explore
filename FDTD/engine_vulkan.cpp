@@ -19,6 +19,8 @@
 #include "extensions/operator_ext_upml.h"
 #include "extensions/engine_ext_lorentzmaterial.h"
 #include "extensions/operator_ext_lorentzmaterial.h"
+#include "extensions/engine_ext_debyematerial.h"
+#include "extensions/operator_ext_debyematerial.h"
 #include "extensions/engine_ext_tfsf.h"
 #include "extensions/operator_ext_tfsf.h"
 #include "extensions/engine_ext_mur_abc.h"
@@ -1560,6 +1562,7 @@ void Engine_Vulkan::SetupGPUExcitation()
 	{
 		return dynamic_cast<Engine_Ext_UPML*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_LorentzMaterial*>(ext) != nullptr ||
+		       dynamic_cast<Engine_Ext_DebyeMaterial*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_TFSF*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_Mur_ABC*>(ext) != nullptr ||
 		       dynamic_cast<Engine_Ext_LumpedRLC*>(ext) != nullptr ||
@@ -1784,6 +1787,12 @@ void Engine_Vulkan::SetupGPUExtensions()
 			totalDescSets += lor->m_Order * 4;
 			totalStorageBindings += lor->m_Order * 20;
 		}
+		else if (dynamic_cast<Operator_Ext_DebyeMaterial*>(ext))
+		{
+			numDispOrders += 1;
+			totalDescSets += 1;
+			totalStorageBindings += 7;
+		}
 		else if (auto* tfsf = dynamic_cast<Operator_Ext_TFSF*>(ext))
 		{
 			numTFSF++;
@@ -1917,6 +1926,8 @@ void Engine_Vulkan::CreateExtensionDescriptorLayouts()
 	// Dispersive: pre=7 (field, ADE, LorADE, posIdx, int, ext, Lor), apply=3
 	m_dispPreDescLayout   = makeLayout(7);
 	m_dispApplyDescLayout = makeLayout(3);
+	// Debye: one set for both passes (field, pole state, pre sum, posIdx, relax, drive, solve)
+	m_debyeDescLayout     = makeLayout(7);
 
 	// TF/SF: 6 bindings (field, amp, delta, idx, delay, signal)
 	m_tfsfDescLayout = makeLayout(6);
@@ -2032,6 +2043,17 @@ void Engine_Vulkan::CreateExtensionPipelines()
 		mod = CreateShaderModule(gpu_spirv::dispersive_apply_current_data, gpu_spirv::dispersive_apply_current_size);
 		m_dispApplyCurrPipeline = makePipeline(mod, m_dispApplyPipeLayout);
 		vkDestroyShaderModule(m_device, mod, nullptr);
+
+		if (std::any_of(m_gpuDisp.begin(), m_gpuDisp.end(), [](const GpuDispData& d) {return d.debye;}))
+		{
+			m_debyePipeLayout = makePipeLayout(m_debyeDescLayout, sizeof(DispPC));
+			mod = CreateShaderModule(gpu_spirv::debye_pre_voltage_data, gpu_spirv::debye_pre_voltage_size);
+			m_debyePreVoltPipeline = makePipeline(mod, m_debyePipeLayout);
+			vkDestroyShaderModule(m_device, mod, nullptr);
+			mod = CreateShaderModule(gpu_spirv::debye_apply_voltage_data, gpu_spirv::debye_apply_voltage_size);
+			m_debyeApplyVoltPipeline = makePipeline(mod, m_debyePipeLayout);
+			vkDestroyShaderModule(m_device, mod, nullptr);
+		}
 	}
 
 	// --- TF/SF pipelines ---
@@ -2309,6 +2331,11 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 	for (size_t eIdx = 0; eIdx < nExts; eIdx++)
 	{
 		Operator_Extension* ext = Op->GetExtension(eIdx);
+		if (auto* deb = dynamic_cast<Operator_Ext_DebyeMaterial*>(ext))
+		{
+			SetupGPU_Debye(deb);
+			continue;
+		}
 		auto* lor = dynamic_cast<Operator_Ext_LorentzMaterial*>(ext);
 		if (!lor) continue;
 
@@ -2475,6 +2502,87 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 	}
 
 	m_hasGPU_Dispersive = !m_gpuDisp.empty();
+}
+
+// A Debye material is one entry of m_gpuDisp, like a Lorentz order, with its
+// own two passes (debye_pre_voltage, debye_apply_voltage) on one descriptor set.
+void Engine_Vulkan::SetupGPU_Debye(const Operator_Ext_DebyeMaterial* deb)
+{
+	const uint32_t cnt = deb->m_LM_Count.at(0);
+	const uint32_t poles = (uint32_t)deb->m_PoleCount;
+	if (cnt == 0 || poles == 0)
+		return;
+	VkBufferUsageFlags usage   = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkBufferUsageFlags rwUsage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags dLoc = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	GpuDispData data;
+	data.debye     = true;
+	data.poles     = poles;
+	data.count     = cnt;
+	data.voltADEOn = true;    // the passes run in the voltage pre and apply slots
+	data.currADEOn = false;
+	data.voltPC = {cnt, numLines[0], numLines[1], numLines[2], poles};
+	data.currPC = data.voltPC;
+
+	// sorted by x, as the Lorentz entries, so that a slab is a contiguous run
+	std::vector<uint32_t> perm(cnt);
+	for (uint32_t i = 0; i < cnt; i++)
+		perm[i] = i;
+	unsigned int* const* pos = deb->m_LM_pos[0];
+	std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return pos[0][a] < pos[0][b]; });
+	std::vector<uint32_t> sortedX(cnt);
+	for (uint32_t i = 0; i < cnt; i++)
+		sortedX[i] = pos[0][perm[i]];
+	BuildSlabEntryIndex(sortedX, data.xStart);
+
+	const VkDeviceSize cellSize = 3 * (VkDeviceSize)cnt * sizeof(FDTD_FLOAT);
+	const VkDeviceSize poleSize = poles * cellSize;
+	const VkDeviceSize idxSize  = 3 * (VkDeviceSize)cnt * sizeof(uint32_t);
+
+	std::vector<uint32_t> posIdx(3 * cnt);
+	for (int n = 0; n < 3; n++)
+		for (uint32_t i = 0; i < cnt; i++)
+			posIdx[n * cnt + i] = pos[n][perm[i]];
+	CreateGpuBuf(data.posIdx, idxSize, usage, dLoc);
+	UploadGpuBuf(data.posIdx, posIdx.data(), idxSize);
+
+	// state, zero-initialized
+	std::vector<float> zeros(poles * 3 * cnt, 0.0f);
+	CreateGpuBuf(data.debyeW, poleSize, rwUsage, dLoc);
+	UploadGpuBuf(data.debyeW, zeros.data(), poleSize);
+	CreateGpuBuf(data.debyePre, cellSize, rwUsage, dLoc);
+	UploadGpuBuf(data.debyePre, zeros.data(), cellSize);
+
+	// coefficients: [poles][3][count] and [3][count], in the sorted order
+	auto upload = [&](GpuBuf& gb, FDTD_FLOAT* const* const* arr, uint32_t nPoles)
+	{
+		std::vector<float> flat(nPoles * 3 * cnt);
+		for (uint32_t o = 0; o < nPoles; o++)
+			for (int n = 0; n < 3; n++)
+				for (uint32_t i = 0; i < cnt; i++)
+					flat[(o * 3 + n) * cnt + i] = arr[o][n][perm[i]];
+		const VkDeviceSize size = flat.size() * sizeof(float);
+		CreateGpuBuf(gb, size, usage, dLoc);
+		UploadGpuBuf(gb, flat.data(), size);
+	};
+	upload(data.debyeRelax, deb->v_relax_ADE, poles);
+	upload(data.debyeDrive, deb->v_drive_ADE, poles);
+	FDTD_FLOAT* const* solve = deb->v_solve_ADE;
+	upload(data.debyeSolve, &solve, 1);
+
+	VkDescriptorSetAllocateInfo ai{};
+	ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	ai.descriptorPool     = m_extDescPool;
+	ai.descriptorSetCount = 1;
+	ai.pSetLayouts        = &m_debyeDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &data.debyeDesc));
+	VkBuffer bufs[7]      = {m_voltBuf, data.debyeW.buffer, data.debyePre.buffer, data.posIdx.buffer,
+	                         data.debyeRelax.buffer, data.debyeDrive.buffer, data.debyeSolve.buffer};
+	VkDeviceSize sizes[7] = {m_fieldBufSize, poleSize, cellSize, idxSize, poleSize, poleSize, cellSize};
+	WriteDescriptorBuffers(m_device, data.debyeDesc, bufs, sizes, 7);
+
+	m_gpuDisp.push_back(std::move(data));
 }
 
 namespace
@@ -3616,7 +3724,7 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
 	for (const auto& d : m_gpuDisp)
 	{
-		if (!d.voltADEOn) continue;
+		if (!d.voltADEOn || d.debye) continue;
 		uint32_t groups = (d.count + 255) / 256;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 		                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
@@ -3624,6 +3732,7 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		vkCmdDispatch(cmd, groups, 1, 1);
 		dispatchedPreVolt = true;
 	}
+	dispatchedPreVolt = RecordDebyeVoltPhase(cmd, false, -1, -1, false) || dispatchedPreVolt;
 	RecordLocalABCPhase(cmd, 0);
 
 	// Barrier: all pre-voltage writes must complete before Yee update
@@ -4734,7 +4843,7 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 	bool any = false;
 	for (const auto& d : m_gpuDisp)
 	{
-		if (isVolt ? !d.voltADEOn : !d.currADEOn)
+		if ((isVolt ? !d.voltADEOn : !d.currADEOn) || d.debye)
 			continue;
 		const uint32_t b = d.xStart[x0], e = d.xStart[x1];
 		if (e <= b)
@@ -4753,6 +4862,42 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &desc, 0, nullptr);
 		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &pc);
 		vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+		any = true;
+	}
+	// Debye cells are not Lorentz cells, so the two need no barrier between them
+	if (isVolt)
+		any = RecordDebyeVoltPhase(cmd, isApply, x0, x1, false) || any;
+	return any;
+}
+
+bool Engine_Vulkan::RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach) const
+{
+	VkMemoryBarrier barrier{};
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	bool any = false;
+	for (const auto& d : m_gpuDisp)
+	{
+		if (!d.debye)
+			continue;
+		DispPC pc = d.voltPC;
+		if (x0 >= 0)
+		{
+			pc.entryBase = d.xStart[x0];
+			pc.entryEnd  = d.xStart[x1];
+			if (pc.entryEnd <= pc.entryBase)
+				continue;
+		}
+		const uint32_t n = (x0 >= 0) ? pc.entryEnd - pc.entryBase : d.count;
+		if (!any)
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                  apply ? m_debyeApplyVoltPipeline : m_debyePreVoltPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_debyePipeLayout, 0, 1, &d.debyeDesc, 0, nullptr);
+		vkCmdPushConstants(cmd, m_debyePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &pc);
+		vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+		if (barrierEach)
+			CmdComputeBarrier(cmd, barrier);
 		any = true;
 	}
 	return any;
@@ -5461,13 +5606,14 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispPreVoltPipeline);
 				for (const auto& d : m_gpuDisp)
 				{
-					if (!d.voltADEOn) continue;
+					if (!d.voltADEOn || d.debye) continue;
 					uint32_t groups = (d.count + 255) / 256;
 					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 					                        m_dispPrePipeLayout, 0, 1, &d.preVoltDesc, 0, nullptr);
 					vkCmdPushConstants(cmd, m_dispPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispPC), &d.voltPC);
 					vkCmdDispatch(cmd, groups, 1, 1);
 				}
+				RecordDebyeVoltPhase(cmd, false, -1, -1, false);
 				CmdComputeBarrier(cmd, barrier);
 			}
 			RecordLocalABCPhase(cmd, 0);
@@ -5523,7 +5669,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
 			for (const auto &d : m_gpuDisp)
 			{
-				if (!d.voltADEOn)
+				if (!d.voltADEOn || d.debye)
 					continue;
 				DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 				uint32_t groups = (d.count + 255) / 256;
@@ -5534,6 +5680,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 				vkCmdDispatch(cmd, groups, 1, 1);
 				CmdComputeBarrier(cmd, barrier);
 			}
+			RecordDebyeVoltPhase(cmd, true, -1, -1, true);
 			if (!m_gpuMur.empty())
 				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_murApplyVoltPipeline);
 			for (const auto &m : m_gpuMur)
@@ -5761,7 +5908,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dispApplyVoltPipeline);
 		for (const auto &d : m_gpuDisp)
 		{
-			if (!d.voltADEOn)
+			if (!d.voltADEOn || d.debye)
 				continue;
 			DispPC dpc = {d.count, numLines[0], numLines[1], numLines[2], 0};
 			uint32_t groups = (d.count + 255) / 256;
@@ -5771,6 +5918,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			vkCmdDispatch(cmd, groups, 1, 1);
 			CmdComputeBarrier(cmd, barrier);
 		}
+		RecordDebyeVoltPhase(cmd, true, -1, -1, true);
 
 		// Mur apply (overwrites boundary voltages)
 		if (murSeparate)
@@ -6185,6 +6333,8 @@ void Engine_Vulkan::CleanupExtensions()
 	destroyPipeline(m_upmlPreCurrPipeline);
 	destroyPipeline(m_upmlPostCurrPipeline);
 	destroyPipeline(m_dispPreVoltPipeline);
+	destroyPipeline(m_debyePreVoltPipeline);
+	destroyPipeline(m_debyeApplyVoltPipeline);
 	destroyPipeline(m_dispPreCurrPipeline);
 	destroyPipeline(m_dispApplyVoltPipeline);
 	destroyPipeline(m_dispApplyCurrPipeline);
@@ -6200,6 +6350,7 @@ void Engine_Vulkan::CleanupExtensions()
 	destroyPipeLayout(m_upmlPrePipeLayout);
 	destroyPipeLayout(m_upmlPostPipeLayout);
 	destroyPipeLayout(m_dispPrePipeLayout);
+	destroyPipeLayout(m_debyePipeLayout);
 	destroyPipeLayout(m_dispApplyPipeLayout);
 	destroyPipeLayout(m_tfsfPipeLayout);
 	destroyPipeLayout(m_murUpdatePipeLayout);
@@ -6216,6 +6367,7 @@ void Engine_Vulkan::CleanupExtensions()
 	destroyDescLayout(m_upmlPreCurrDescLayout);
 	destroyDescLayout(m_upmlPostCurrDescLayout);
 	destroyDescLayout(m_dispPreDescLayout);
+	destroyDescLayout(m_debyeDescLayout);
 	destroyDescLayout(m_dispApplyDescLayout);
 	destroyDescLayout(m_tfsfDescLayout);
 	destroyDescLayout(m_murPreDescLayout);
@@ -6245,6 +6397,8 @@ void Engine_Vulkan::CleanupExtensions()
 		DestroyGpuBuf(d.posIdx);
 		DestroyGpuBuf(d.vIntADE);    DestroyGpuBuf(d.vExtADE); DestroyGpuBuf(d.vLorADE);
 		DestroyGpuBuf(d.iIntADE);    DestroyGpuBuf(d.iExtADE); DestroyGpuBuf(d.iLorADE);
+		DestroyGpuBuf(d.debyeW);     DestroyGpuBuf(d.debyePre);
+		DestroyGpuBuf(d.debyeRelax); DestroyGpuBuf(d.debyeDrive); DestroyGpuBuf(d.debyeSolve);
 	}
 	m_gpuDisp.clear();
 

@@ -96,6 +96,7 @@ if (WITH_GPU)
 		upml_pre_voltage upml_post_voltage upml_pre_current upml_post_current
 		dispersive_pre_voltage dispersive_pre_current
 		dispersive_apply_voltage dispersive_apply_current
+		debye_pre_voltage debye_apply_voltage
 		tfsf_voltage tfsf_current
 		mur_pre_voltage mur_post_voltage mur_apply_voltage update_voltages_mur
 		rlc_pre_voltage rlc_apply_voltage
