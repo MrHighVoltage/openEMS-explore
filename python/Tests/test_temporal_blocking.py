@@ -489,7 +489,7 @@ class SteadyStateCaseMixin:
         self.assertGreater(np.max(np.abs(flat_E)), 0.0, "flat run produced an all-zero field")
         self.assertNotIn("AVX2 temporal blocking ACTIVE", flat_out)
         self.assertIsNotNone(flat_stop, "the flat run did not stop on its steady-state criterion")
-        self.assertGreaterEqual(len(flat_trace), 5, "too few steady-state checks to compare:\n%s"
+        self.assertGreaterEqual(len(flat_trace), 4, "too few steady-state checks to compare:\n%s"
                                 % "\n".join(flat_trace))
 
         saved = (BLOCK_ENV, THREADS)

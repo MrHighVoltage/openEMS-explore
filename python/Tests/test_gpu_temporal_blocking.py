@@ -19,9 +19,20 @@ The grid is 64 x-lines in four 16-line tiles (k=4, W=16, satisfying the hard
 W>=2k constraint). OPENEMS_GPU_TEMPORAL_BLOCK_MB=1 shrinks the tile target so
 the "grid already fits cache" guard -- the right call for real runs -- does
 not refuse a CI-sized grid.
+
+Each model is written to XML by a Python subprocess and run by the build's
+openEMS binary (OPENEMS_TEST_BIN, default build/openEMS; OPENEMS_TEST_PYTHON
+picks the interpreter that writes the XML), so the Python modules never run
+a library they were not built against.
+
+A sine excitation adds steady-state detection. The blocked schedule carries
+it (plans/STEADY_STATE_TEMPORAL_BLOCKING.md), and its cases compare the trace
+of every check (OPENEMS_STEADYSTATE_TRACE=1) and the timestep the run stops
+at, besides the fields.
 """
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -29,29 +40,13 @@ import tempfile
 import textwrap
 import unittest
 
+import h5py
 import numpy as np
 
 
-def _bootstrap_local_openems_runtime():
-    """Prepend the in-tree build to LD_LIBRARY_PATH, re-exec'ing if needed.
-
-    This process never imports openEMS itself -- it only launches subprocesses
-    that do -- but they inherit this environment, which is what lets them find
-    the freshly built library instead of the installed one.
-    """
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    build_dir = os.path.join(repo_root, "build")
-    paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
-    if paths and os.path.abspath(paths[0]) == os.path.abspath(build_dir):
-        return
-    paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(build_dir)]
-    os.environ["LD_LIBRARY_PATH"] = ":".join([build_dir] + paths)
-    os.execvpe(sys.executable, [sys.executable] + sys.argv, os.environ)
-
-
-_bootstrap_local_openems_runtime()
-
-import h5py  # noqa: E402
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+OPENEMS_BIN = os.environ.get("OPENEMS_TEST_BIN", os.path.join(REPO_ROOT, "build", "openEMS"))
+XML_PYTHON = os.environ.get("OPENEMS_TEST_PYTHON", sys.executable)
 
 NX, NY, NZ = 64, 32, 32
 TIMESTEPS = 120
@@ -65,19 +60,30 @@ OBJ_X_LO, OBJ_X_HI = 38, 54
 
 ACTIVE_MARK = "trapezoidal temporal blocking active"
 
+# A Gaussian pulse for a fixed number of timesteps, or a sine in a lossy
+# dielectric until the steady state is reached (about a thousand timesteps).
+# With 1 mm cells the period is 74 timesteps and the processing interval 9,
+# which does not divide it; with 0.925 mm cells 80 and 10, which does.
+GAUSS_SETUP = "FDTD = openEMS(NrTS=%d, EndCriteria=0)\nFDTD.SetGaussExcite(5e9, 5e9)" % TIMESTEPS
+SINE_SETUP = "FDTD = openEMS(NrTS=20000, EndCriteria=1e-3)\nFDTD.SetSinusExcite(5e9)"
+LOSSY_SETUP = """
+lossy = CSX.AddMaterial("lossy", epsilon=2.0, kappa=0.1)
+lossy.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]], priority=1)
+"""
+DELTA_P74, DELTA_P80 = 1e-3, 0.925e-3
+
 _SCRIPT_TEMPLATE = """
 import numpy as np
 from CSXCAD import ContinuousStructure
 from openEMS import openEMS
 
-FDTD = openEMS(NrTS={timesteps}, EndCriteria=0)
-FDTD.SetGaussExcite(5e9, 5e9)
+{fdtd_setup}
 FDTD.SetBoundaryCond({boundary!r})
 
 CSX = ContinuousStructure()
 FDTD.SetCSX(CSX)
 mesh = CSX.GetGrid()
-mesh.SetDeltaUnit(1e-3)
+mesh.SetDeltaUnit({delta})
 mesh.SetLines("x", np.arange({nx}, dtype=float))
 mesh.SetLines("y", np.arange({ny}, dtype=float))
 mesh.SetLines("z", np.arange({nz}, dtype=float))
@@ -93,32 +99,39 @@ dumpE.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
 dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
 dumpH.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
 
-FDTD.Run({sim_path!r}, cleanup=True, engine="gpu")
+FDTD.Write2XML({xml!r})
 """
 
 
-def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
-    """Run one small GPU simulation in a subprocess.
+def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GAUSS_SETUP, delta=1e-3):
+    """Write one small model to XML and run it on the GPU engine.
 
     Returns (output, E_time_series, H_time_series). `block_env` is the value
     of OPENEMS_GPU_TEMPORAL_BLOCK for this run, or None for the flat sweep
     (blocking explicitly off: it is on by default for large grids); the two
     runs being compared must differ in *only* that.
     """
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     sim_path = os.path.join(tempfile.gettempdir(), "gputblk_%s" % tag)
     shutil.rmtree(sim_path, ignore_errors=True)
+    os.makedirs(sim_path)
+    xml = os.path.join(sim_path, "model.xml")
 
     script = _SCRIPT_TEMPLATE.format(
-        timesteps=TIMESTEPS, boundary=boundary, nx=NX, ny=NY, nz=NZ,
-        exc_x=EXC_X, sim_path=sim_path,
+        fdtd_setup=fdtd_setup, delta=delta, boundary=boundary, nx=NX, ny=NY, nz=NZ,
+        exc_x=EXC_X, xml=xml,
         extra_setup=textwrap.dedent(extra_setup).strip(),
     )
-    script_path = os.path.join(tempfile.gettempdir(), "gputblk_%s.py" % tag)
+    script_path = os.path.join(sim_path, "model.py")
     with open(script_path, "w") as f:
         f.write(script)
+    proc = subprocess.run([XML_PYTHON, script_path], cwd=sim_path, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not os.path.exists(xml):
+        shutil.rmtree(sim_path, ignore_errors=True)
+        raise RuntimeError("writing the model failed (tag=%s, rc=%s):\n%s\n%s"
+                           % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
 
     env = dict(os.environ)
+    env["OPENEMS_STEADYSTATE_TRACE"] = "1"
     env["OPENEMS_GPU_INDEX"] = GPU_INDEX
     env.pop("OPENEMS_GPU_TEMPORAL_BLOCK", None)
     env.pop("OPENEMS_GPU_TEMPORAL_BLOCK_MB", None)
@@ -129,11 +142,11 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
         env["OPENEMS_GPU_TEMPORAL_BLOCK"] = "0"
     env.update(extra_env or {})
 
-    proc = subprocess.run([sys.executable, script_path], cwd=repo_root, env=env,
+    proc = subprocess.run([OPENEMS_BIN, xml, "--engine=gpu"], cwd=sim_path, env=env,
                           capture_output=True, text=True, timeout=300)
     try:
         if proc.returncode != 0:
-            raise RuntimeError("simulation subprocess failed (tag=%s, rc=%s):\n%s\n%s"
+            raise RuntimeError("simulation failed (tag=%s, rc=%s):\n%s\n%s"
                                % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
 
         def _load(name):
@@ -144,7 +157,6 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup=""):
         E, H = _load("Et.h5"), _load("Ht.h5")
     finally:
         shutil.rmtree(sim_path, ignore_errors=True)
-        os.remove(script_path)
 
     return proc.stdout + proc.stderr, E, H
 
@@ -153,6 +165,17 @@ def _relevant_lines(output):
     """The lines that say what ConfigureTemporalBlocking() decided."""
     lines = [l for l in output.splitlines() if "temporal blocking" in l]
     return "\n".join(lines) if lines else "(no 'temporal blocking' line in the output at all)"
+
+
+def _steady_trace(output):
+    """Every steady-state check of a run, as OPENEMS_STEADYSTATE_TRACE prints it."""
+    return [l for l in output.splitlines() if l.startswith("SteadyState check:")]
+
+
+def _stop_timestep(output):
+    """The timestep a run stopped at on its steady-state criterion, or None."""
+    m = re.search(r"steady-state criterion of .* reached after (\d+) timesteps", output)
+    return int(m.group(1)) if m else None
 
 
 class GPUTemporalBlockingTest(unittest.TestCase):
@@ -344,18 +367,55 @@ class GPUTemporalBlockingTest(unittest.TestCase):
             ab.AddBox([xl[2], yl[2], zl[26]], [xl[-3], yl[-3], zl[26]], priority=20)
             """)
 
-    def test_refuses_steady_state_detection_and_stays_correct(self):
-        """A periodic excitation switches on steady-state detection, which
-        needs the energy of the whole grid at one timestep -- something a
-        blocked schedule never has. Blocking must decline, not silently
-        differ."""
-        setup = "FDTD.SetSinusExcite(5e9)"
-        flat_out, flat_E, flat_H = _run("ssd_flat", ["PEC"] * 6, None, extra_setup=setup)
-        out, E, H = _run("ssd_blocked", ["PEC"] * 6, BLOCK_ENV, extra_setup=setup)
-        self.assertNotIn(ACTIVE_MARK, out, "blocking engaged with steady-state detection on")
-        self.assertIn("steady-state detection", out, _relevant_lines(out))
-        self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
-                        "the fallback path changed results")
+    def _compare_steady(self, tag, boundary, extra_setup, delta, schedules):
+        """A sine model run until it stops on its own, flat and blocked.
+
+        The blocked schedule samples and sums each slab as it passes a
+        check's timestep, and the host evaluates the check after the batch:
+        the verdict of every check and the timestep the run stops at must be
+        those of the flat sweep, besides the fields.
+        """
+        setup = LOSSY_SETUP + textwrap.dedent(extra_setup)
+        flat_out, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_setup=setup,
+                                        fdtd_setup=SINE_SETUP, delta=delta)
+        flat_trace, flat_stop = _steady_trace(flat_out), _stop_timestep(flat_out)
+        self.assertGreater(float(np.max(np.abs(flat_E))), 0.0, "flat run produced an all-zero field")
+        self.assertIsNotNone(flat_stop, "the flat run did not stop on its steady-state criterion")
+        self.assertGreaterEqual(len(flat_trace), 4, "too few steady-state checks to compare")
+        for env in schedules:
+            with self.subTest(schedule=env):
+                out, E, H = _run("%s_%s" % (tag, env.replace(":", "_")), boundary, env,
+                                 extra_setup=setup, fdtd_setup=SINE_SETUP, delta=delta)
+                self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+                self.assertEqual(flat_trace, _steady_trace(out),
+                                 "schedule %s: the steady-state checks differ from the flat sweep's" % env)
+                self.assertEqual(flat_stop, _stop_timestep(out),
+                                 "schedule %s stopped at another timestep" % env)
+                self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
+                                "schedule %s is not bit-identical to the flat sweep" % env)
+
+    def test_steady_state_schedule_sweep(self):
+        """Steady-state detection under several (k, W), 4:13 and 6:20 with a
+        folded tail, on a period (74) the processing interval (9) does not
+        divide, so checks fall anywhere in a block."""
+        self._compare_steady("ss_sweep", ["PEC"] * 6, "", DELTA_P74, ("2:8", "4:16", "3:12", "4:13", "6:20"))
+
+    def test_steady_state_period_multiple(self):
+        """A period of 80 and a processing interval of 10, which divides it."""
+        self._compare_steady("ss_p80", ["PEC"] * 6, "", DELTA_P80, ("5:16", "3:12"))
+
+    def test_steady_state_with_extensions(self):
+        """Mur, a lumped port and an RLC element, which write the fields in
+        the voltage phase the detection reads, and UPML. (A parallel RLC: the
+        series one of test_lumped_rlc_and_port goes NaN when read from XML.)"""
+        setup = """
+            rlc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=0)
+            rlc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
+            port = CSX.AddLumpedElement("port_R", ny="z", caps=False, R=50.0)
+            port.AddBox([xl[%d], yl[10], zl[10]], [xl[%d] + 1, yl[22], zl[22]], priority=10)
+            """ % (OBJ_X_LO, OBJ_X_HI, EXC_X, EXC_X)
+        self._compare_steady("ss_mur", ["MUR"] * 6, setup, DELTA_P74, ("4:16", "3:12"))
+        self._compare_steady("ss_pml", ["PML_8"] * 6, "", DELTA_P74, ("4:16",))
 
 
 if __name__ == "__main__":
