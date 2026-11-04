@@ -27,11 +27,22 @@ still fitting cache). That failure is itself the useful signal while slab
 support is still being added extension-by-extension: it tells you which one
 is still missing, rather than reporting a green, meaningless test.
 
-Simulations run in a subprocess so the engine's stdout -- a C++-level side
-effect of ConfigureTemporalBlocking(), not something the Python bindings
-surface -- can be captured cleanly, and so OPENEMS_AVX2_TEMPORAL_BLOCK can be
-set for one run and not the other without disturbing this process's own
-environment.
+Each model is written to XML by a Python subprocess and simulated by the
+openEMS binary of the build (OPENEMS_TEST_BIN, default build/openEMS), so the
+engine's stdout -- a C++-level side effect of ConfigureTemporalBlocking(), not
+something the Python bindings surface -- can be captured cleanly, and so
+OPENEMS_AVX2_TEMPORAL_BLOCK can be set for one run and not the other without
+disturbing this process's own environment. The Python modules only write the
+XML, with whatever library they were built against (OPENEMS_TEST_PYTHON picks
+another interpreter): running the build's library under modules built for
+another one fails, or worse, works with a different class layout.
+
+A sine excitation adds steady-state detection, which the blocked schedule
+carries since the energy of a check is summed per slab (plans/STEADY_STATE_
+TEMPORAL_BLOCKING.md). The steady-state cases (Test10-12) run a lossy model
+until it stops on its own and compare more than the fields: the trace of
+every check (OPENEMS_STEADYSTATE_TRACE=1: timestep, energy, verdict, all
+digits) and the timestep the run stopped at must be identical too.
 
 The grid is 64 x-lines split into four 16-line tiles (OPENEMS_AVX2_TEMPORAL_
 BLOCK=4:16, i.e. k=4, W=16, satisfying the engine's hard W>=2k constraint),
@@ -48,6 +59,7 @@ to reconcile something other than vacuum.
 """
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -55,44 +67,12 @@ import tempfile
 import textwrap
 import unittest
 
+import h5py
 import numpy as np
 
-
-def _bootstrap_local_openems_runtime():
-    """Prepend the in-tree build to LD_LIBRARY_PATH, re-exec'ing if needed.
-
-    Only this (parent) process needs to see libopenEMS.so directly -- it
-    never imports CSXCAD/openEMS itself, it only launches subprocesses that
-    do. But the subprocesses inherit this process's environment, so fixing
-    LD_LIBRARY_PATH here is what lets them find the freshly built library
-    without every helper below having to know about `build/`.
-    """
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    build_dir = os.path.join(repo_root, "build")
-
-    if not os.path.exists(os.path.join(build_dir, "libopenEMS.so")):
-        return
-
-    paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
-    if paths and os.path.abspath(paths[0]) == os.path.abspath(build_dir):
-        return
-
-    paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(build_dir)]
-    os.environ["LD_LIBRARY_PATH"] = ":".join([build_dir] + paths)
-
-    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
-    if spec is not None:
-        module = spec.parent or spec.name
-        argv = [sys.executable, "-m", module] + sys.argv[1:]
-    else:
-        argv = [sys.executable] + sys.argv
-    os.execvpe(argv[0], argv, os.environ)
-
-
-_bootstrap_local_openems_runtime()
-
-import h5py  # noqa: E402
-
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+OPENEMS_BIN = os.environ.get("OPENEMS_TEST_BIN", os.path.join(REPO_ROOT, "build", "openEMS"))
+XML_PYTHON = os.environ.get("OPENEMS_TEST_PYTHON", sys.executable)
 
 # ---------------------------------------------------------------------------
 # Grid shared by every case: 64 x-lines, four 16-line tiles.
@@ -109,19 +89,33 @@ OBJ_X_LO, OBJ_X_HI = 38, 54
 LUMPED_X_LO, LUMPED_X_HI = 46, 50
 
 
+# The excitation and end criteria of the cases: a Gaussian pulse for a fixed
+# number of timesteps, or a sine until the steady state is reached.
+GAUSS_SETUP = "FDTD = openEMS(NrTS=%d, EndCriteria=0)\nFDTD.SetGaussExcite(5e9, 5e9)" % TIMESTEPS
+SINE_SETUP = "FDTD = openEMS(NrTS=20000, EndCriteria=1e-3)\nFDTD.SetSinusExcite(5e9)"
+
+# The steady-state cases fill the grid with a lossy dielectric, so that the
+# sine settles within about a thousand timesteps (twelve checks). With 1 mm
+# cells the period is 74 timesteps and the probe and dump interval 9, which
+# does not divide it; with 0.925 mm cells they are 80 and 10, which does.
+LOSSY_SETUP = """
+lossy = CSX.AddMaterial("lossy", epsilon=2.0, kappa=0.1)
+lossy.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]], priority=1)
+"""
+DELTA_P74, DELTA_P80 = 1e-3, 0.925e-3
+
 _SCRIPT_TEMPLATE = """
 import numpy as np
 from CSXCAD import ContinuousStructure
 from openEMS import openEMS
 
-FDTD = openEMS(NrTS={timesteps}, EndCriteria=0)
-FDTD.SetGaussExcite(5e9, 5e9)
+{fdtd_setup}
 FDTD.SetBoundaryCond({boundary!r})
 
 CSX = ContinuousStructure()
 FDTD.SetCSX(CSX)
 mesh = CSX.GetGrid()
-mesh.SetDeltaUnit(1e-3)
+mesh.SetDeltaUnit({delta})
 mesh.SetLines("x", np.arange({nx}, dtype=float))
 mesh.SetLines("y", np.arange({ny}, dtype=float))
 mesh.SetLines("z", np.arange({nz}, dtype=float))
@@ -137,44 +131,51 @@ dumpE.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
 dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
 dumpH.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
 
-FDTD.Run({sim_path!r}, cleanup=True, engine="avx2-multithreaded", numThreads={threads})
+FDTD.Write2XML({xml!r})
 """
 
 
-def _run(tag, boundary, extra_setup, blocked):
-    """Run one small avx2-multithreaded simulation in a subprocess.
+def _run(tag, boundary, extra_setup, blocked, fdtd_setup=GAUSS_SETUP, delta=1e-3):
+    """Write one small model to XML and run it on the avx2-multithreaded engine.
 
     Returns (stdout, E_time_series, H_time_series). `blocked` selects whether
     OPENEMS_AVX2_TEMPORAL_BLOCK[_FORCE] are set for this particular run --
     the two runs being compared must differ in *only* that.
     """
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     sim_path = os.path.join(tempfile.gettempdir(), "tblk_%s" % tag)
     shutil.rmtree(sim_path, ignore_errors=True)
+    os.makedirs(sim_path)
+    xml = os.path.join(sim_path, "model.xml")
 
     script = _SCRIPT_TEMPLATE.format(
-        timesteps=TIMESTEPS,
+        fdtd_setup=fdtd_setup,
+        delta=delta,
         boundary=boundary,
         nx=NX, ny=NY, nz=NZ,
         extra_setup=textwrap.dedent(extra_setup).strip(),
         exc_x=EXC_X,
-        threads=THREADS,
-        sim_path=sim_path,
+        xml=xml,
     )
-    script_path = os.path.join(tempfile.gettempdir(), "tblk_%s.py" % tag)
+    script_path = os.path.join(sim_path, "model.py")
     with open(script_path, "w") as f:
         f.write(script)
+    proc = subprocess.run([XML_PYTHON, script_path], cwd=sim_path, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not os.path.exists(xml):
+        shutil.rmtree(sim_path, ignore_errors=True)
+        raise RuntimeError("writing the model failed (tag=%s, rc=%s):\n%s\n%s"
+                           % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
 
     env = dict(os.environ)
     env.pop("OPENEMS_AVX2_TEMPORAL_BLOCK", None)
     env.pop("OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", None)
+    env["OPENEMS_STEADYSTATE_TRACE"] = "1"
     if blocked:
         env["OPENEMS_AVX2_TEMPORAL_BLOCK"] = BLOCK_ENV
         env["OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE"] = "1"
 
     proc = subprocess.run(
-        [sys.executable, script_path],
-        cwd=repo_root,
+        [OPENEMS_BIN, xml, "--engine=avx2-multithreaded", "--numThreads=%d" % THREADS],
+        cwd=sim_path,
         env=env,
         capture_output=True,
         text=True,
@@ -183,7 +184,7 @@ def _run(tag, boundary, extra_setup, blocked):
     try:
         if proc.returncode != 0:
             raise RuntimeError(
-                "simulation subprocess failed (tag=%s, rc=%s):\n%s\n%s"
+                "simulation failed (tag=%s, rc=%s):\n%s\n%s"
                 % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:])
             )
 
@@ -196,9 +197,8 @@ def _run(tag, boundary, extra_setup, blocked):
         H = _load("Ht.h5")
     finally:
         shutil.rmtree(sim_path, ignore_errors=True)
-        os.remove(script_path)
 
-    return proc.stdout, E, H
+    return proc.stdout + proc.stderr, E, H
 
 
 def _relevant_lines(stdout):
@@ -206,6 +206,17 @@ def _relevant_lines(stdout):
     what ConfigureTemporalBlocking() decided -- for failure messages."""
     lines = [l for l in stdout.splitlines() if "temporal blocking" in l]
     return "\n".join(lines) if lines else "(no 'temporal blocking' line in stdout at all)"
+
+
+def _steady_trace(stdout):
+    """Every steady-state check of a run, as OPENEMS_STEADYSTATE_TRACE prints it."""
+    return [l for l in stdout.splitlines() if l.startswith("SteadyState check:")]
+
+
+def _stop_timestep(stdout):
+    """The timestep a run stopped at on its steady-state criterion, or None."""
+    m = re.search(r"steady-state criterion of .* reached after (\d+) timesteps", stdout)
+    return int(m.group(1)) if m else None
 
 
 class TemporalBlockingCaseMixin:
@@ -458,6 +469,89 @@ class Test9_ScheduleSweep(TemporalBlockingCaseMixin, unittest.TestCase):
                     )
         finally:
             BLOCK_ENV, THREADS = saved
+
+
+class SteadyStateCaseMixin:
+    """A sine model run until it stops on its own, flat and blocked.
+
+    Beyond the fields, the steady-state detection has to reach the same
+    verdict at every check and stop the run at the same timestep: the
+    blocked schedule sums the energy of a check per slab and evaluates it at
+    the end of the block, the flat sweep all at once and at once.
+    """
+
+    def _compare_steady(self, tag, boundary, extra_setup, delta, schedules):
+        global BLOCK_ENV, THREADS
+        setup = LOSSY_SETUP + textwrap.dedent(extra_setup)
+        flat_out, flat_E, flat_H = _run(tag + "_flat", boundary, setup, blocked=False,
+                                        fdtd_setup=SINE_SETUP, delta=delta)
+        flat_trace, flat_stop = _steady_trace(flat_out), _stop_timestep(flat_out)
+        self.assertGreater(np.max(np.abs(flat_E)), 0.0, "flat run produced an all-zero field")
+        self.assertNotIn("AVX2 temporal blocking ACTIVE", flat_out)
+        self.assertIsNotNone(flat_stop, "the flat run did not stop on its steady-state criterion")
+        self.assertGreaterEqual(len(flat_trace), 5, "too few steady-state checks to compare:\n%s"
+                                % "\n".join(flat_trace))
+
+        saved = (BLOCK_ENV, THREADS)
+        try:
+            for kw, threads in schedules:
+                BLOCK_ENV, THREADS = kw, threads
+                name = "%s_%s_%d" % (tag, kw.replace(":", "_"), threads)
+                out, E, H = _run(name, boundary, setup, blocked=True, fdtd_setup=SINE_SETUP, delta=delta)
+                self.assertIn("AVX2 temporal blocking ACTIVE", out,
+                              "blocking did not engage with steady-state detection at k:W=%s, "
+                              "%d threads; engine said:\n%s" % (kw, threads, _relevant_lines(out)))
+                self.assertEqual(flat_trace, _steady_trace(out),
+                                 "k:W=%s with %d threads: the steady-state checks differ from the flat sweep's"
+                                 % (kw, threads))
+                self.assertEqual(flat_stop, _stop_timestep(out),
+                                 "k:W=%s with %d threads stopped at another timestep" % (kw, threads))
+                self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
+                                "k:W=%s with %d threads is not bit-identical to the flat sweep"
+                                % (kw, threads))
+        finally:
+            BLOCK_ENV, THREADS = saved
+
+
+class Test10_SteadyStateSweep(SteadyStateCaseMixin, unittest.TestCase):
+    """A lossy cavity driven by a sine, over several (k, W) and thread counts.
+
+    The period (74 timesteps) is not a multiple of the processing interval
+    (9), so the checks fall anywhere in a block, and 6:20 folds a short tail
+    tile into its neighbour.
+    """
+
+    def test_sweep(self):
+        schedules = [(kw, threads) for kw in ("2:8", "4:16", "3:13", "6:20") for threads in (1, 3, 4)]
+        self._compare_steady("ss_sweep", [0, 0, 0, 0, 0, 0], "", DELTA_P74, schedules)
+
+
+class Test11_SteadyStatePeriodMultiple(SteadyStateCaseMixin, unittest.TestCase):
+    """The same with a period of 80 timesteps and a processing interval of
+    10, which divides it: the checks fall on block boundaries or inside, as
+    k divides the interval or not."""
+
+    def test_period_multiple(self):
+        self._compare_steady("ss_p80", [0, 0, 0, 0, 0, 0], "", DELTA_P80, [("5:16", 2), ("3:13", 3)])
+
+
+class Test12_SteadyStateExtensions(SteadyStateCaseMixin, unittest.TestCase):
+    """Steady-state detection next to the extensions that write the fields
+    in the same Apply2Voltages phase: UPML or Mur, a lumped RLC element and
+    a probe. Its hook runs first there and reads before they write."""
+
+    SETUP = """
+    lrc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=0)
+    lrc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
+    probe = CSX.AddProbe("p1", p_type=2)
+    probe.AddBox([xl[49], yl[16], zl[12]], [xl[49], yl[16], zl[12]])
+    """ % (LUMPED_X_LO, LUMPED_X_HI)
+
+    def test_pml(self):
+        self._compare_steady("ss_pml", ["PML_8"] * 6, self.SETUP, DELTA_P74, [("4:16", 2), ("6:20", 3)])
+
+    def test_mur(self):
+        self._compare_steady("ss_mur", ["MUR"] * 6, self.SETUP, DELTA_P74, [("4:16", 2), ("3:13", 4)])
 
 
 if __name__ == "__main__":
