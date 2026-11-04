@@ -143,7 +143,7 @@ void Engine_Ext_TFSF::DoPostVoltageUpdatesImpl(unsigned int startX, unsigned int
 	const unsigned int numTS = (unsigned int)numTS_in;
 	const unsigned int length = m_Op_TFSF->m_Exc->GetLength();
 
-	int p = int(m_Op_TFSF->m_Exc->GetSignalPeriod()/m_Op_TFSF->m_Exc->GetTimestep());
+	int p = (int)m_Op_TFSF->m_Exc->GetSignalPeriodTS();
 
 	// Private to this call -- under blocking this hook runs concurrently on
 	// every worker thread with a numTS that is not the engine's own counter
@@ -261,7 +261,7 @@ void Engine_Ext_TFSF::DoPostCurrentUpdatesImpl(unsigned int startX, unsigned int
 	const unsigned int numTS = (unsigned int)numTS_in;
 	const unsigned int length = m_Op_TFSF->m_Exc->GetLength();
 
-	int p = int(m_Op_TFSF->m_Exc->GetSignalPeriod()/m_Op_TFSF->m_Exc->GetTimestep());
+	int p = (int)m_Op_TFSF->m_Exc->GetSignalPeriodTS();
 
 	// Same private-to-this-call table as the voltage hook, but filled one entry
 	// wider than this hook used to fill it. m_CurrDelay tops out at

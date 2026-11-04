@@ -1595,9 +1595,7 @@ void Engine_Vulkan::SetupGPUExcitation()
 
 	m_hasGPUExcitation = true;
 	m_excSignalLen    = exc->GetLength();
-	m_excSignalPeriod = (exc->GetSignalPeriod() > 0)
-	                    ? (int)(exc->GetSignalPeriod() / exc->GetTimestep())
-	                    : 0;
+	m_excSignalPeriod = (int)exc->GetSignalPeriodTS();
 	for (unsigned int i = 0; i < m_excSignalLen; ++i)
 	{
 		if (!std::isfinite(exc->GetVoltageSignal()[i]) ||
@@ -5075,8 +5073,7 @@ bool Engine_Vulkan::RecordTFSFSlabPhase(VkCommandBuffer cmd, bool volt, int x0, 
 		return false;
 
 	const uint32_t sigLen = (uint32_t)exc->GetLength();
-	const int sigPeriod = (exc->GetSignalPeriod() > 0)
-	                    ? (int)(exc->GetSignalPeriod() / exc->GetTimestep()) : 0;
+	const int sigPeriod = (int)exc->GetSignalPeriodTS();
 	// The flat path injects the voltage at ts+1 and the current at ts.
 	TfsfPC pc = {count, (int32_t)(volt ? ts + 1 : ts), sigLen, sigPeriod, b, e};
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volt ? m_tfsfVoltPipeline : m_tfsfCurrPipeline);
@@ -5487,8 +5484,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		if (tfsfExc)
 		{
 			tfsfSigLen = (uint32_t)tfsfExc->GetLength();
-			tfsfSigPeriod = (tfsfExc->GetSignalPeriod() > 0)
-			              ? (int)(tfsfExc->GetSignalPeriod() / tfsfExc->GetTimestep()) : 0;
+			tfsfSigPeriod = (int)tfsfExc->GetSignalPeriodTS();
 		}
 	}
 

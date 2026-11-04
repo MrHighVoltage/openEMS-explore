@@ -18,6 +18,7 @@
 #ifndef EXCITATION_H
 #define EXCITATION_H
 
+#include <cmath>
 #include <vector>
 #include <string>
 #include "tools/constants.h"
@@ -72,6 +73,13 @@ public:
 
 	//! Get the signal period, 0 if not a periodical signal
 	double GetSignalPeriod() const {return m_SignalPeriod;}
+	//! Get the signal period in timesteps, 0 if not a periodical signal
+	/*!
+	  Rounded, not truncated: the operator shrinks the timestep so that a period is a whole
+	  number TS of timesteps, but period/(period/TS) can come out just below TS, and a
+	  truncated period of TS-1 timesteps would skip one sample of the signal every period.
+	  */
+	unsigned int GetSignalPeriodTS() const {return ((m_SignalPeriod>0) && (m_dT>0)) ? (unsigned int)std::lround(m_SignalPeriod/m_dT) : 0;}
 
 	std::string GetCustomFunction() const {return m_CustomExc_Str;}
 

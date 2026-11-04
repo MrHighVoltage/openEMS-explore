@@ -47,7 +47,7 @@ Operator_Extension* Operator_Ext_SteadyState::Clone(Operator* op)
 bool Operator_Ext_SteadyState::BuildExtension()
 {
 	double dT = m_Op->GetTimestep();
-	m_TS_period = round(m_T_period/dT);
+	m_TS_period = lround(m_T_period/dT); // as Excitation::GetSignalPeriodTS()
 	m_T_period  = m_TS_period*dT;
 	return true;
 }
