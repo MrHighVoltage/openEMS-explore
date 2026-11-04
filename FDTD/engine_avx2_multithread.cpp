@@ -241,7 +241,10 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 		return CalibrateIterateTS(iterTS);
 
 	m_iterTS = iterTS;
-	m_blk_active = (m_blk_k > 1);
+	// A call of one timestep runs flat: a block of depth one is the flat
+	// sweep with the wedges' extra barriers. Dirac and step excitations, whose
+	// Nyquist interval is one timestep, call nothing else.
+	m_blk_active = (m_blk_k > 1) && (iterTS >= 2);
 
 	m_startBarrier->wait(); // start threads
 	m_stopBarrier->wait();  // wait for completion
@@ -695,15 +698,27 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 	unsigned int done = 0;
 	while (done < total)
 	{
-		const int kk = (int)std::min((unsigned int)m_blk_k, total - done);
 		const int t0 = startTS + (int)done;
+		unsigned int depth = std::min((unsigned int)m_blk_k, total - done);
+		for (Engine_Extension* ext : m_Eng_exts)
+			depth = ext->SlabBlockDepth(t0, depth);
+		const int kk = (int)depth;
 
 		for (size_t i = 0; i + 1 < m_blk_edges.size(); ++i)
 			TrapezoidSweep(m_blk_edges[i], m_blk_edges[i + 1], kk, +1, t0, threadID);
 		for (size_t i = 1; i + 1 < m_blk_edges.size(); ++i)
 			TrapezoidSweep(m_blk_edges[i], m_blk_edges[i], kk, -1, t0, threadID);
 
-		done += (unsigned int)kk;
+		// What an extension can only do once the whole grid has passed a
+		// timestep of the block: the steady-state check of a period. Every
+		// slab of the block ended at a barrier, so thread 0 sees all of it.
+		bool deferred = false;
+		for (Engine_Extension* ext : m_Eng_exts)
+			deferred = ext->SlabBlockEnd(t0, depth, (int)threadID) || deferred;
+		if (deferred)
+			SyncWait(threadID, SYNC_HOOK);
+
+		done += depth;
 	}
 
 	if (m_syncStats)
@@ -842,6 +857,7 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 
 		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 		m_iterTS = batch;
+		m_blk_active = (m_blk_k > 1) && (batch >= 2);
 		m_startBarrier->wait();
 		m_stopBarrier->wait();
 		const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -868,7 +884,7 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 	{
 		// Calibration ended inside this call: the rest on the settled schedule.
 		m_iterTS = remaining;
-		m_blk_active = (m_blk_k > 1);
+		m_blk_active = (m_blk_k > 1) && (remaining >= 2);
 		m_startBarrier->wait();
 		m_stopBarrier->wait();
 	}

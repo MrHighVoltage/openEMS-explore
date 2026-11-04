@@ -93,6 +93,22 @@ public: // public access for efficient extension/interface access
 	//! Grid extent as seen by the engine (Operator::GetNumberOfLines(n, true)).
 	inline unsigned int GetNumLines(int n) const { return numLines[n]; }
 
+	// --- The fast energy estimate (Engine_Interface_FDTD::CalcFastEnergy()) ---
+	// sum |V|^2 and sum |I|^2 over x < NX-1, y < NY-1 and every z, in rows
+	// (x,y) numbered x-major. A row is summed over z in float, the rows in
+	// order in double, so the estimate does not depend on who sums a row when:
+	// the blocked schedule sums each row as its slab passes the timestep of a
+	// steady-state check (Engine_Ext_SteadyState), the flat one all at once,
+	// and both give the same bits.
+	//! The number of rows.
+	unsigned int FastEnergyRowCount() const { return (numLines[0] - 1) * (numLines[1] - 1); }
+	//! Sum the rows [first,last) into rows[2r] (|V|^2) and rows[2r+1] (|I|^2).
+	void FastEnergyRows(unsigned int first, unsigned int last, double* rows) const;
+	//! The estimate EPS0*E + MUE0*H from all rows of \a rows, each field summed in row order.
+	double FastEnergy(const double* rows) const;
+	//! The same, the rows summed on the fly.
+	double FastEnergy() const;
+
 	//! Flat field arrays with interleaved polarisations.
 	//! Layout: m_volt[n + z_vec * m_vs_z + y * m_vs_y + x * m_vs_x]
 	//! where n=0,1,2 (polarisation) is the fastest dimension.

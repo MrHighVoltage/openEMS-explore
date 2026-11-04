@@ -15,8 +15,10 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -25,6 +27,9 @@
 #include "operator_ext_steadystate.h"
 #include "FDTD/engine_sse.h"
 #include "FDTD/engine_interface_fdtd.h"
+#if OPENEMS_ENABLE_AVX2
+#include "FDTD/engine_avx2.h"
+#endif
 
 Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext): Engine_Extension(op_ext)
 {
@@ -152,10 +157,27 @@ void Engine_Ext_SteadyState::Apply2Voltages()
 		CheckPeriod(TS, m_Eng_Interface->CalcFastEnergy(), [this, TS](size_t n, unsigned int t) {return RingRecord(TS, n, t);});
 }
 
+void Engine_Ext_SteadyState::SetEngine(Engine* eng)
+{
+	Engine_Extension::SetEngine(eng);
+	m_rows.clear();
+#if OPENEMS_ENABLE_AVX2
+	if (eng && (eng->GetType()==Engine::AVX2) && (m_period>0))
+		m_rows.assign(2*(size_t)static_cast<Engine_AVX2*>(eng)->FastEnergyRowCount(), 0.0);
+#endif
+}
+
+bool Engine_Ext_SteadyState::SupportsSlabApply() const
+{
+	return !m_rows.empty();
+}
+
 bool Engine_Ext_SteadyState::SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const
 {
 	(void)hook;
-	(void)numTS;
+	// every slab has rows of the energy of a check
+	if (IsCheckTimestep((unsigned int)numTS))
+		return true;
 	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
 	{
 		const unsigned int x = m_Op_SS->m_E_probe_pos[0].at(n);
@@ -167,9 +189,55 @@ bool Engine_Ext_SteadyState::SlabTouchesAt(SlabHook hook, unsigned int startX, u
 
 void Engine_Ext_SteadyState::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
 {
+	const unsigned int TS = (unsigned int)numTS;
 	// a handful of values: not worth splitting across threads
 	if (threadID==0)
-		RecordProbes((unsigned int)numTS, startX, stopX);
+		RecordProbes(TS, startX, stopX);
+#if OPENEMS_ENABLE_AVX2
+	if (!IsCheckTimestep(TS) || m_rows.empty() || (threadID<0) || (threadID>=m_NrThreads))
+		return;
+	// This slab's rows of the energy: x in [startX,stopX), below NX-1, every
+	// y below NY-1. The currents of these rows are at timestep TS-1, as in
+	// the flat sweep: a narrowing core updated them at TS-1 itself, and a
+	// widening wedge's extra lines were advanced to TS-1 by the cores.
+	const Engine_AVX2* eng = static_cast<const Engine_AVX2*>(m_Eng);
+	const unsigned int ny = eng->GetNumLines(1)-1;
+	const unsigned int xEnd = std::min(stopX, eng->GetNumLines(0)-1);
+	if (xEnd<=startX)
+		return;
+	const uint64_t first = (uint64_t)startX*ny, rows = (uint64_t)(xEnd-startX)*ny;
+	const uint64_t nThreads = (uint64_t)m_NrThreads, id = (uint64_t)threadID;
+	const uint64_t a = first + rows*id/nThreads, b = first + rows*(id+1)/nThreads;
+	eng->FastEnergyRows((unsigned int)a, (unsigned int)b, m_rows.data());
+#endif
+}
+
+unsigned int Engine_Ext_SteadyState::SlabBlockDepth(int t0, unsigned int k) const
+{
+	(void)t0;
+	// one period at most: one check per block, and the ring of three periods
+	// still holds the two periods of a check at the end of its block
+	return (m_period>0) ? std::min(k, m_period) : k;
+}
+
+bool Engine_Ext_SteadyState::SlabBlockEnd(int t0, unsigned int k, int threadID)
+{
+	if (m_period==0)
+		return false;
+	// the one multiple of the period the block may hold
+	const unsigned int TS = ((unsigned int)t0 + m_period - 1)/m_period*m_period;
+	if ((TS>=(unsigned int)t0+k) || !IsCheckTimestep(TS))
+		return false;
+#if OPENEMS_ENABLE_AVX2
+	if (threadID==0)
+	{
+		const double energy = static_cast<const Engine_AVX2*>(m_Eng)->FastEnergy(m_rows.data());
+		CheckPeriod(TS, energy, [this, TS](size_t n, unsigned int t) {return RingRecord(TS, n, t);});
+	}
+#else
+	(void)threadID;
+#endif
+	return true;
 }
 
 void Engine_Ext_SteadyState::CheckPeriod(unsigned int TS, double energy, const std::function<double(size_t, unsigned int)>& record)

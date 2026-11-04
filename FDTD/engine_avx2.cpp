@@ -16,6 +16,7 @@
 */
 
 #include "engine_avx2.h"
+#include "tools/constants.h"
 #include "tools/denormal.h"
 
 #include <immintrin.h>
@@ -173,6 +174,85 @@ void Engine_AVX2::UpdateVoltages(unsigned int startX, unsigned int numX)
 {
 	for (unsigned int x = startX; x < startX + numX; ++x)
 		UpdateVoltageRows(x, 0, numLines[1]);
+}
+
+// ============================================================================
+// The fast energy estimate, by rows
+// ============================================================================
+
+namespace
+{
+// Horizontal sum of the eight lanes, always in the same order.
+inline float HorizontalSum(__m256 v)
+{
+	__m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+	s = _mm_hadd_ps(s, s);
+	s = _mm_hadd_ps(s, s);
+	return _mm_cvtss_f32(s);
+}
+
+// Row (x,y) of the estimate: sum |V|^2 and sum |I|^2 over every z-vector.
+inline void FastEnergyRow(const f8vector* volt, const f8vector* curr, unsigned int base,
+                          unsigned int nZv, double& e, double& h)
+{
+	__m256 accE = _mm256_setzero_ps();
+	__m256 accH = _mm256_setzero_ps();
+	for (unsigned int z = 0; z < nZv; ++z, base += 3)
+	{
+		const __m256 vx = _mm256_load_ps(volt[base].f);
+		const __m256 vy = _mm256_load_ps(volt[base + 1].f);
+		const __m256 vz = _mm256_load_ps(volt[base + 2].f);
+		accE = _mm256_fmadd_ps(vx, vx, accE);
+		accE = _mm256_fmadd_ps(vy, vy, accE);
+		accE = _mm256_fmadd_ps(vz, vz, accE);
+
+		const __m256 ix = _mm256_load_ps(curr[base].f);
+		const __m256 iy = _mm256_load_ps(curr[base + 1].f);
+		const __m256 iz = _mm256_load_ps(curr[base + 2].f);
+		accH = _mm256_fmadd_ps(ix, ix, accH);
+		accH = _mm256_fmadd_ps(iy, iy, accH);
+		accH = _mm256_fmadd_ps(iz, iz, accH);
+	}
+	e = (double)HorizontalSum(accE);
+	h = (double)HorizontalSum(accH);
+}
+}
+
+void Engine_AVX2::FastEnergyRows(unsigned int first, unsigned int last, double* rows) const
+{
+	const unsigned int ny = numLines[1] - 1;
+	for (unsigned int r = first; r < last; ++r)
+	{
+		const unsigned int base = (r / ny) * m_vs_x + (r % ny) * m_vs_y;
+		FastEnergyRow(m_volt, m_curr, base, numVectors, rows[2 * (size_t)r], rows[2 * (size_t)r + 1]);
+	}
+}
+
+double Engine_AVX2::FastEnergy(const double* rows) const
+{
+	const unsigned int count = FastEnergyRowCount();
+	double E = 0, H = 0;
+	for (unsigned int r = 0; r < count; ++r)
+	{
+		E += rows[2 * (size_t)r];
+		H += rows[2 * (size_t)r + 1];
+	}
+	return EPS0 * E + MUE0 * H;
+}
+
+double Engine_AVX2::FastEnergy() const
+{
+	const unsigned int ny = numLines[1] - 1;
+	const unsigned int count = FastEnergyRowCount();
+	double E = 0, H = 0;
+	for (unsigned int r = 0; r < count; ++r)
+	{
+		double e, h;
+		FastEnergyRow(m_volt, m_curr, (r / ny) * m_vs_x + (r % ny) * m_vs_y, numVectors, e, h);
+		E += e;
+		H += h;
+	}
+	return EPS0 * E + MUE0 * H;
 }
 
 void Engine_AVX2::UpdateVoltageRows(unsigned int x, unsigned int yStart, unsigned int yStop)

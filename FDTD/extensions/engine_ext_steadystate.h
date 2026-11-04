@@ -37,17 +37,33 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
-	// The blocked schedule. The probes are recorded per slab, from the first
-	// Apply2Voltages hook, where every slab sees the values the flat sweep
-	// records; each probe line lies in exactly one slab per timestep. The
-	// records go into a ring of three periods indexed by the absolute
-	// timestep, so that the check of a period can wait for the end of the
-	// block while the block records on. The energy of the check, over the
-	// whole grid, is not there yet, so SupportsSlabApply() stays false.
+	// The blocked schedule (Engine_AVX2_Multithread). This extension only
+	// reads the fields, and it reads them from the first Apply2Voltages hook,
+	// where every slab holds the values the flat sweep reads there: its
+	// voltages after the update and the post-voltage hooks, the currents of the
+	// timestep before. The slabs of one timestep partition the grid, so
+	// - each probe line lies in exactly one slab per timestep, which records
+	//   it into a ring of three periods indexed by the absolute timestep;
+	// - at a check timestep, every slab sums its rows of the energy estimate
+	//   (Engine_AVX2::FastEnergyRows()), and together they cover each row
+	//   once;
+	// - the check itself waits for the end of the block (SlabBlockEnd()),
+	//   when every row is in, and adds the rows in order as the flat sweep
+	//   does (Engine_AVX2::FastEnergy()), while the ring has kept the
+	//   period's records although the block recorded on.
+	// So blocked and flat runs reach the same verdicts, bit for bit, at the
+	// same timesteps. A block holds at most one period (SlabBlockDepth()),
+	// so one check, and records at most one period past it. Needs the AVX2
+	// engine's field layout for the rows: on the others, false.
+	virtual bool SupportsSlabApply() const;
 	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT;}
 	virtual bool SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const;
 	virtual bool SlabHookWritesFields(SlabHook hook) const {(void)hook; return false;}
 	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
+	virtual unsigned int SlabBlockDepth(int t0, unsigned int k) const;
+	virtual bool SlabBlockEnd(int t0, unsigned int k, int threadID);
+
+	virtual void SetEngine(Engine* eng);
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff();
@@ -82,6 +98,8 @@ protected:
 	double m_last_max_diff;
 	//! [probe][TS % m_ringSize]: the probe voltages of the last three periods
 	std::vector<double> m_records;
+	//! The rows of the energy estimate of the check timestep in the blocked schedule, see Engine_AVX2::FastEnergyRows()
+	std::vector<double> m_rows;
 
 	double last_total_energy;
 	Engine_Interface_FDTD* m_Eng_Interface;

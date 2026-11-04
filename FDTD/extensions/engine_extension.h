@@ -171,6 +171,19 @@ public:
 	*/
 	virtual bool SlabHookWritesFields(SlabHook hook) const {(void)hook; return true;}
 
+	//! The deepest block from timestep \a t0 on that this extension allows, at most \a k (and at least 1).
+	virtual unsigned int SlabBlockDepth(int t0, unsigned int k) const {(void)t0; return k;}
+
+	//! Work that needs a timestep of the whole grid, deferred to the end of the block [t0, t0+k).
+	/*!
+	  Called on every thread after the last slab of every block, once every
+	  slab hook of the block has run on every thread. The work itself belongs
+	  on thread 0. Return true if there is any, on every thread alike: the
+	  engine then holds the other threads until thread 0 is done, so the next
+	  block cannot overwrite what it reads.
+	*/
+	virtual bool SlabBlockEnd(int t0, unsigned int k, int threadID) {(void)t0; (void)k; (void)threadID; return false;}
+
 	//! \copydoc DoPreVoltageUpdates
 	virtual void DoPreVoltageUpdatesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
 	{(void)startX; (void)stopX; (void)numTS; (void)threadID;}
