@@ -58,6 +58,9 @@ public:
 	                      unsigned int completedTS, double totalEnergy);
 
 protected:
+	//! With OPENEMS_STEADYSTATE_TRACE=1, print the check of timestep \a TS: the energy and the verdict.
+	void TraceCheck(unsigned int TS, double energy) const;
+
 	Operator_Ext_SteadyState* m_Op_SS;
 	double m_last_max_diff;
 	std::vector<double*> m_E_records;
@@ -66,6 +69,7 @@ protected:
 	double last_total_energy;
 	Engine_Interface_FDTD* m_Eng_Interface;
 	std::function<void()> m_gpuUpdater;
+	bool m_trace; //!< OPENEMS_STEADYSTATE_TRACE
 };
 
 

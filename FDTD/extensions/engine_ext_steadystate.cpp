@@ -16,6 +16,9 @@
 */
 
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
 
 #include "engine_ext_steadystate.h"
 #include "operator_ext_steadystate.h"
@@ -35,6 +38,8 @@ Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext)
 	m_last_max_diff = 1;
 	last_total_energy = 0;
 	m_Eng_Interface = NULL;
+	const char* trace = std::getenv("OPENEMS_STEADYSTATE_TRACE");
+	m_trace = trace && trace[0] == '1';
 }
 
 Engine_Ext_SteadyState::~Engine_Ext_SteadyState()
@@ -103,6 +108,18 @@ void Engine_Ext_SteadyState::UpdateGpuSamples(const float* samples, unsigned int
 	}
 	if (noValid || m_last_max_diff > 1)
 		m_last_max_diff = 1;
+	TraceCheck(completedTS, totalEnergy);
+}
+
+void Engine_Ext_SteadyState::TraceCheck(unsigned int TS, double energy) const
+{
+	if (!m_trace)
+		return;
+	// all digits: the traces of two schedules are compared as text
+	std::ostringstream os;
+	os.precision(17);
+	os << "SteadyState check: TS=" << TS << " energy=" << energy << " diff=" << m_last_max_diff << "\n";
+	std::cout << os.str() << std::flush;
 }
 
 void Engine_Ext_SteadyState::Apply2Voltages()
@@ -159,6 +176,7 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int rel_pos, const std::functi
 	}
 	if ((no_valid) || (m_last_max_diff>1))
 		m_last_max_diff = 1;
+	TraceCheck(m_Eng->GetNumberOfTimesteps(), curr_total_energy);
 }
 
 void Engine_Ext_SteadyState::Apply2Current()
