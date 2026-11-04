@@ -3669,28 +3669,11 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	bool dispatchedPreVolt = false;
 
-	// --- Pre-voltage: UPML pre-voltage, Mur pre-voltage ---
-	// UPML pre-voltage (highest priority, runs first)
-	if (!m_gpuUPML.empty())
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreVoltPipeline);
-	for (const auto& u : m_gpuUPML)
-	{
-		uint32_t groups = (u.totalCells + 255) / 256;
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_upmlPrePipeLayout, 0, 1, &u.preVoltDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
-		vkCmdDispatch(cmd, groups, 1, 1);
-		dispatchedPreVolt = true;
-	}
-	// UPML pre-voltage swaps the field for its flux in the PML cells, and the
-	// CPU runs it before every other extension (ENG_EXT_PRIO_UPML).  A Mur
-	// face or a dispersive material reaching into a PML region reads those
-	// cells, so it has to wait -- without the barrier it reads either.
-	if (dispatchedPreVolt && (m_hasGPU_Mur || m_hasGPU_RLC || !m_gpuDisp.empty() || !m_gpuLocalABC.empty()))
-	{
-		CmdComputeBarrier(cmd, barrier);
-		dispatchedPreVolt = false;
-	}
+	// --- Pre-voltage: Mur, RLC, dispersive and absorbing sheets, then UPML ---
+	// Engine::DoPreVoltageUpdates() runs the extensions in reverse priority
+	// order, so UPML (ENG_EXT_PRIO_UPML) comes last: a Mur face or a dispersive
+	// material reaching into a PML region reads the field there before UPML
+	// swaps it for its flux.  The fused path and the blocked one do the same.
 
 	// Mur pre-voltage (saves boundary values before Yee update)
 	if (!m_gpuMur.empty())
@@ -3735,6 +3718,23 @@ void Engine_Vulkan::RecordVoltageExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	dispatchedPreVolt = RecordDebyeVoltPhase(cmd, false, -1, -1, false) || dispatchedPreVolt;
 	RecordLocalABCPhase(cmd, 0);
 
+	// UPML pre-voltage, after the reads above
+	if (!m_gpuUPML.empty())
+	{
+		if (dispatchedPreVolt || !m_gpuLocalABC.empty())
+			CmdComputeBarrier(cmd, barrier);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreVoltPipeline);
+		for (const auto& u : m_gpuUPML)
+		{
+			uint32_t groups = (u.totalCells + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_upmlPrePipeLayout, 0, 1, &u.preVoltDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+			dispatchedPreVolt = true;
+		}
+	}
+
 	// Barrier: all pre-voltage writes must complete before Yee update
 	if (dispatchedPreVolt)
 	{
@@ -3751,24 +3751,8 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	bool dispatchedPreCurr = false;
 
-	// --- Pre-current: UPML pre-current ---
-	if (!m_gpuUPML.empty())
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreCurrPipeline);
-	for (const auto& u : m_gpuUPML)
-	{
-		uint32_t groups = (u.totalCells + 255) / 256;
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-			                        m_upmlPrePipeLayout, 0, 1, &u.preCurrDesc, 0, nullptr);
-		vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
-		vkCmdDispatch(cmd, groups, 1, 1);
-		dispatchedPreCurr = true;
-	}
-	// As for the voltage: UPML first, then whatever reads the same cells.
-	if (dispatchedPreCurr && (!m_gpuDisp.empty() || !m_gpuLocalABC.empty()))
-	{
-		CmdComputeBarrier(cmd, barrier);
-		dispatchedPreCurr = false;
-	}
+	// --- Pre-current: dispersive and absorbing sheets, then UPML ---
+	// In reverse priority order, as for the voltage.
 
 	// Dispersive pre-current
 	if (!m_gpuDisp.empty())
@@ -3784,6 +3768,23 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 		dispatchedPreCurr = true;
 	}
 	RecordLocalABCPhase(cmd, 3);
+
+	// UPML pre-current, after the reads above
+	if (!m_gpuUPML.empty())
+	{
+		if (dispatchedPreCurr || !m_gpuLocalABC.empty())
+			CmdComputeBarrier(cmd, barrier);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upmlPreCurrPipeline);
+		for (const auto& u : m_gpuUPML)
+		{
+			uint32_t groups = (u.totalCells + 255) / 256;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        m_upmlPrePipeLayout, 0, 1, &u.preCurrDesc, 0, nullptr);
+			vkCmdPushConstants(cmd, m_upmlPrePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PmlPC), &u.pc);
+			vkCmdDispatch(cmd, groups, 1, 1);
+			dispatchedPreCurr = true;
+		}
+	}
 
 	if (dispatchedPreCurr)
 	{
