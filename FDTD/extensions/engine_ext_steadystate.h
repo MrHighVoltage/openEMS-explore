@@ -54,7 +54,10 @@ public:
 	// So blocked and flat runs reach the same verdicts, bit for bit, at the
 	// same timesteps. A block holds at most one period (SlabBlockDepth()),
 	// so one check, and records at most one period past it. Needs the AVX2
-	// engine's field layout for the rows: on the others, false.
+	// engine's field layout for the rows: on the others, false. The Vulkan
+	// engine does the same on the GPU, with sums by x-plane, and hands the
+	// check to CheckPeriod() once its batch is done (Engine_Vulkan::
+	// RecordSteadyStateEnergy()).
 	virtual bool SupportsSlabApply() const;
 	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT;}
 	virtual bool SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const;
@@ -67,9 +70,8 @@ public:
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff();
+	//! Called by GetLastDiff(): the GPU engine evaluates the checks it has computed (Engine_Vulkan::UpdateSteadyStateResult()).
 	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}
-	void UpdateGpuSamples(const float* samples, unsigned int ringPeriods,
-	                      unsigned int completedTS, double totalEnergy);
 
 	//! Is \a TS a timestep the last two periods are compared at?
 	bool IsCheckTimestep(unsigned int TS) const;
@@ -82,6 +84,14 @@ public:
 	  periods normalises the difference, are those of that ring.
 	  */
 	void CheckPeriod(unsigned int TS, double energy, const std::function<double(size_t, unsigned int)>& record);
+
+	//! The timestep at position \a t of that ring of two periods at the check timestep \a TS
+	static unsigned int RingTimestep(unsigned int TS, unsigned int period, unsigned int t)
+	{
+		// TS sits at TS%(2p), and the ring holds everything back to TS-2p+1
+		const unsigned int p2 = 2*period;
+		return TS - ((TS%p2 + p2 - t)%p2);
+	}
 
 protected:
 	//! Record the probes on x-lines in [startX,stopX) at timestep \a TS.

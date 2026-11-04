@@ -1,0 +1,86 @@
+/*
+ * The energy estimate of reduce_energy.comp, by x-plane, for the
+ * steady-state detection.
+ *
+ *   E = sum( volt[0]^2 + volt[1]^2 + volt[2]^2 ),  H the same of curr
+ *
+ * over the cells of the x-planes [xLo, xLo + gl_NumWorkGroups.y). Every plane
+ * is cut into `chunks` runs of `chunkCells` cells, one workgroup each, and
+ * each workgroup writes one (E, H) pair of floats into its check's slot:
+ *
+ *   partials[slotBase + 2*(x*chunks + chunk) + {0,1}]
+ *
+ * A plane's partials depend only on the plane, not on which dispatch summed
+ * it, so the blocked schedule -- which sums each slab's planes as the slab
+ * passes the check timestep -- and the flat one -- all planes at once -- write
+ * the same bits, and the host adds them in plane order.
+ *
+ * Dispatch: vkCmdDispatch(cmd, chunks, number of planes, 1).
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly buffer VoltBuf { float volt[]; };
+layout(set=0, binding=1) readonly buffer CurrBuf { float curr[]; };
+layout(set=0, binding=2) writeonly buffer OutBuf  { float partials[]; };
+
+layout(push_constant) uniform PC {
+    uint N;           // cells per component
+    uint planeCells;  // cells per x-plane
+    uint chunkCells;  // cells per workgroup
+    uint chunks;      // workgroups per plane
+    uint xLo;         // first plane of this dispatch
+    uint slotBase;    // first float of this check's slot
+};
+
+shared float s_E[256];
+shared float s_H[256];
+
+void main()
+{
+    uint lid   = gl_LocalInvocationID.x;
+    uint chunk = gl_WorkGroupID.x;
+    uint x     = xLo + gl_WorkGroupID.y;
+
+    uint planeBase = x * planeCells;
+    uint begin = chunk * chunkCells;
+    uint end   = min(begin + chunkCells, planeCells);
+
+    float accE = 0.0;
+    float accH = 0.0;
+    for (uint c = begin + lid; c < end; c += 256u)
+    {
+        uint i = planeBase + c;
+        float v0 = volt[i];
+        float v1 = volt[N + i];
+        float v2 = volt[2u * N + i];
+        accE += fma(v0, v0, fma(v1, v1, v2 * v2));
+
+        float c0 = curr[i];
+        float c1 = curr[N + i];
+        float c2 = curr[2u * N + i];
+        accH += fma(c0, c0, fma(c1, c1, c2 * c2));
+    }
+
+    s_E[lid] = accE;
+    s_H[lid] = accH;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (lid < s)
+        {
+            s_E[lid] += s_E[lid + s];
+            s_H[lid] += s_H[lid + s];
+        }
+        barrier();
+    }
+
+    if (lid == 0u)
+    {
+        uint o = slotBase + 2u * (x * chunks + chunk);
+        partials[o]      = s_E[0];
+        partials[o + 1u] = s_H[0];
+    }
+}

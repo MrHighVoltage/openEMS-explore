@@ -73,11 +73,7 @@ void Engine_Ext_SteadyState::RecordProbes(unsigned int TS, unsigned int startX, 
 
 double Engine_Ext_SteadyState::RingRecord(unsigned int TS, size_t n, unsigned int t) const
 {
-	// t is a position in a ring of two periods, which holds TS at TS%(2p) and
-	// everything before it back to TS-2p+1: that is timestep TS-((TS-t)%(2p)).
-	const unsigned int p2 = 2*m_period;
-	const unsigned int ts = TS - ((TS%p2 + p2 - t)%p2);
-	return m_records[n*m_ringSize + ts%m_ringSize];
+	return m_records[n*m_ringSize + RingTimestep(TS, m_period, t)%m_ringSize];
 }
 
 double Engine_Ext_SteadyState::GetLastDiff()
@@ -85,57 +81,6 @@ double Engine_Ext_SteadyState::GetLastDiff()
 	if (m_gpuUpdater)
 		m_gpuUpdater();
 	return m_last_max_diff;
-}
-
-void Engine_Ext_SteadyState::UpdateGpuSamples(const float* samples, unsigned int ringPeriods,
-	                                           unsigned int completedTS, double totalEnergy)
-{
-	const unsigned int p = m_Op_SS->m_TS_period;
-	const unsigned int completedPeriods = completedTS / p;
-	if (!samples || p == 0 || ringPeriods < 3 || completedPeriods < 2)
-		return;
-
-	bool noValid = true;
-	m_last_max_diff = 0;
-	if (last_total_energy > 0)
-	{
-		m_last_max_diff = std::abs(totalEnergy - last_total_energy) / last_total_energy;
-		noValid = false;
-	}
-	last_total_energy = totalEnergy;
-
-	const unsigned int ringSize = ringPeriods * p;
-	const unsigned int oldPeriod = completedPeriods - 2;
-	const unsigned int newPeriod = completedPeriods - 1;
-	const size_t count = m_Op_SS->m_E_probe_dir.size();
-	std::vector<double> currPow(count, 0.0);
-	std::vector<double> diffPow(count, 0.0);
-	double maxPow = 0;
-	for (size_t probe = 0; probe < count; ++probe)
-	{
-		const float* history = samples + probe * ringSize;
-		for (unsigned int nt = 0; nt < p; ++nt)
-		{
-			const double oldValue = history[(oldPeriod * p + nt) % ringSize];
-			const double newValue = history[(newPeriod * p + nt) % ringSize];
-			currPow[probe] += newValue * newValue;
-			const double delta = oldValue - newValue;
-			diffPow[probe] += delta * delta;
-		}
-		maxPow = std::max(maxPow, currPow[probe]);
-	}
-
-	for (size_t probe = 0; probe < count; ++probe)
-	{
-		if (currPow[probe] > maxPow * 1e-2)
-		{
-			m_last_max_diff = std::max(m_last_max_diff, diffPow[probe] / currPow[probe]);
-			noValid = false;
-		}
-	}
-	if (noValid || m_last_max_diff > 1)
-		m_last_max_diff = 1;
-	TraceCheck(completedTS, totalEnergy);
 }
 
 void Engine_Ext_SteadyState::TraceCheck(unsigned int TS, double energy) const

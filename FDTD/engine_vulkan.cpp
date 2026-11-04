@@ -3298,6 +3298,34 @@ void Engine_Vulkan::SetupGPU_SteadyState()
 	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_steadyPipeline));
 	vkDestroyShaderModule(m_device, mod, nullptr);
 
+	// The energy of a check, by x-plane, into one of STEADY_CHECK_SLOTS slots
+	// that the host reads once the check's batch is done: no drain, and the
+	// energy of the check's own timestep.
+	m_steadyChunks = (m_strideYZ + STEADY_ENERGY_CHUNK - 1) / STEADY_ENERGY_CHUNK;
+	m_steadySlotFloats = 2ull * numLines[0] * m_steadyChunks;
+	const VkDeviceSize energySize = STEADY_CHECK_SLOTS * m_steadySlotFloats * sizeof(float);
+	CreateGpuBuf(m_steadyEnergy, energySize, storage, hostVisible);
+	VK_CHECK(vkMapMemory(m_device, m_steadyEnergy.memory, 0, energySize, 0,
+	                     (void**)&m_steadyEnergyMapped));
+	VK_CHECK(vkCreateDescriptorSetLayout(m_device, &dli, nullptr, &m_steadyEnergyDescLayout));
+	VkPushConstantRange energyPC = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SteadyEnergyPC)};
+	pli.pSetLayouts = &m_steadyEnergyDescLayout;
+	pli.pPushConstantRanges = &energyPC;
+	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_steadyEnergyPipeLayout));
+	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_steadyEnergyDescPool));
+	ai.descriptorPool = m_steadyEnergyDescPool;
+	ai.pSetLayouts = &m_steadyEnergyDescLayout;
+	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_steadyEnergyDescSet));
+	VkBuffer energyBufs[3] = {m_voltBuf, m_currBuf, m_steadyEnergy.buffer};
+	VkDeviceSize energySizes[3] = {m_fieldBufSize, m_fieldBufSize, energySize};
+	WriteDescriptorBuffers(m_device, m_steadyEnergyDescSet, energyBufs, energySizes, 3);
+	mod = CreateShaderModule(gpu_spirv::reduce_energy_planes_data, gpu_spirv::reduce_energy_planes_size);
+	stage.module = mod;
+	ci.stage = stage;
+	ci.layout = m_steadyEnergyPipeLayout;
+	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_steadyEnergyPipeline));
+	vkDestroyShaderModule(m_device, mod, nullptr);
+
 	m_gpuSteadyStateExt->SetGpuUpdater([this]() { UpdateSteadyStateResult(); });
 }
 
@@ -3485,17 +3513,90 @@ bool Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts, ui
 	return true;
 }
 
+void Engine_Vulkan::RecordSteadyStateEnergy(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo, uint32_t xHi) const
+{
+	if (!m_steadyEnergyPipeline || !m_gpuSteadyStateExt->IsCheckTimestep(ts) || xHi <= xLo)
+		return;
+	// The slot of the check, as ScheduleSteadyStateChecks() registered it.
+	const uint32_t slot = (ts / m_steadyPeriod) % STEADY_CHECK_SLOTS;
+	const SteadyEnergyPC pc = {m_fieldN, m_strideYZ, STEADY_ENERGY_CHUNK, m_steadyChunks, xLo,
+	                           (uint32_t)(slot * m_steadySlotFloats)};
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_steadyEnergyPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                        m_steadyEnergyPipeLayout, 0, 1, &m_steadyEnergyDescSet, 0, nullptr);
+	vkCmdPushConstants(cmd, m_steadyEnergyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(SteadyEnergyPC), &pc);
+	vkCmdDispatch(cmd, m_steadyChunks, xHi - xLo, 1);
+
+	// The current update after it writes the currents it reads.
+	VkMemoryBarrier barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	CmdComputeBarrier(cmd, barrier);
+}
+
+void Engine_Vulkan::ScheduleSteadyStateChecks(unsigned int iterTS)
+{
+	if (!m_steadyEnergyPipeline || iterTS == 0)
+		return;
+	const uint32_t p = m_steadyPeriod;
+	const uint32_t first = numTS, last = numTS + iterTS - 1;
+	// A check needs its two periods of probe records, which the ring of three
+	// keeps until the GPU computes the timestep one period after the check,
+	// and its slot of partials, until a check STEADY_CHECK_SLOTS periods later
+	// takes it. A batch holds at most one period (IterateTS()); a check this
+	// batch would overrun is evaluated first, waiting for its batch if need be.
+	// In a run that reads GetLastDiff() after every batch, that never waits.
+	uint32_t newest = 0;
+	for (uint32_t ts = (first + p - 1) / p * p; ts <= last; ts += p)
+		if (m_gpuSteadyStateExt->IsCheckTimestep(ts))
+			newest = ts;
+	while (!m_steadyChecks.empty())
+	{
+		const uint32_t ts = m_steadyChecks.front().ts;
+		if (last <= ts + p && (newest == 0 || newest < ts + STEADY_CHECK_SLOTS * p))
+			break;
+		EvaluateSteadyStateChecks(ts + 1);
+	}
+	for (uint32_t ts = (first + p - 1) / p * p; ts <= last; ts += p)
+		if (m_gpuSteadyStateExt->IsCheckTimestep(ts))
+			m_steadyChecks.push_back({ts, m_cmdIdx, m_submitCount + 1});  // the submit after this recording
+}
+
+void Engine_Vulkan::EvaluateSteadyStateChecks(unsigned int before)
+{
+	while (!m_steadyChecks.empty() && m_steadyChecks.front().ts < before)
+	{
+		const SteadyCheck c = m_steadyChecks.front();
+		// Only for the batch that computed the check, not a drain. A newer
+		// serial means the batch was waited for before its slot was reused.
+		if (m_gpuInFlight[c.cmdSlot] && m_submitSerial[c.cmdSlot] == c.serial)
+			vkWaitForFences(m_device, 1, &m_fences[c.cmdSlot], VK_TRUE, UINT64_MAX);
+		m_steadyChecks.pop_front();
+
+		// The planes in order, as the CPU engines add their rows.
+		const float* partials = m_steadyEnergyMapped
+		                      + ((c.ts / m_steadyPeriod) % STEADY_CHECK_SLOTS) * m_steadySlotFloats;
+		double E = 0, H = 0;
+		for (uint64_t i = 0; i < m_steadySlotFloats; i += 2)
+		{
+			E += (double)partials[i];
+			H += (double)partials[i + 1];
+		}
+		const float* history = m_steadyHistoryMapped;
+		const uint32_t p = m_steadyPeriod, ring = m_steadyRingSize, ts = c.ts;
+		m_gpuSteadyStateExt->CheckPeriod(ts, EPS0 * E + MUE0 * H, [history, p, ring, ts](size_t n, unsigned int t)
+		{
+			return (double)history[n * ring + Engine_Ext_SteadyState::RingTimestep(ts, p, t) % ring];
+		});
+	}
+}
+
 void Engine_Vulkan::UpdateSteadyStateResult()
 {
-	if (!m_gpuSteadyStateExt || !m_steadyHistoryMapped || m_steadyPeriod == 0)
-		return;
-	const uint32_t completedPeriods = numTS / m_steadyPeriod;
-	if (completedPeriods < 2 || completedPeriods == m_steadyLastCompletedPeriods)
-		return;
-	DrainGPU();
-	const double energy = CalcFastEnergyGPU();
-	m_gpuSteadyStateExt->UpdateGpuSamples(m_steadyHistoryMapped, 3, numTS, energy);
-	m_steadyLastCompletedPeriods = completedPeriods;
+	// Every check the run has passed, as the CPU engines have them by now.
+	EvaluateSteadyStateChecks(numTS);
 }
 
 void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
@@ -4593,12 +4694,8 @@ TemporalBlockingPlan Engine_Vulkan::PlanTemporalBlocking(const TemporalBlockingR
 	//
 	// GPU probes need nothing: the gather is recorded once at the end of each
 	// batch, after the last trapezoid, when the whole grid is at one timestep.
-	if (m_steadyPipeline != VK_NULL_HANDLE)
-	{
-		plan.why = "steady-state detection integrates energy over the whole grid, "
-		           "which a blocked schedule never has at one timestep";
-		return plan;
-	}
+	// The steady-state detection samples and sums each slab as it passes the
+	// timestep (RecordSlabSweep()), and is evaluated after the batch.
 
 	const int NX = (int)numLines[0];
 	uint64_t planeBytes, tableBytes, totalBytes;
@@ -5244,9 +5341,17 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			}
 		}
 
-		// --- Steady-state probes on these x-lines, where the flat path samples them ---
+		// --- Steady-state detection, where the flat path has it ---
+		// The probes on these x-lines, and at a check the energy of these
+		// planes: their voltages are final for ts, and their currents are
+		// those of ts-1 -- a narrowing core advanced its x-lines to ts-1
+		// itself, a widening wedge's extra lines the cores did. The E ranges
+		// of one timestep partition the grid, so every plane is summed once.
 		if (eHi > eLo)
+		{
 			RecordSteadyStateSample(cmd, ts, (uint32_t)eLo, (uint32_t)eHi);
+			RecordSteadyStateEnergy(cmd, ts, (uint32_t)eLo, (uint32_t)eHi);
+		}
 
 		// --- Current update on [An, min(Bn, NX-1)) ---
 		// The Yee current update never touches the last x-line (it reads volt
@@ -5389,12 +5494,18 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		m_dumpKeepFrom = numTS;
 
 	// On some drivers (notably RADV/AMDGPU), very long command buffers can
-	// trigger GPU watchdog resets. Split batches into smaller submits.
-	if (iterTS > m_maxTSPerSubmit)
+	// trigger GPU watchdog resets. Split batches into smaller submits. With
+	// steady-state detection, a batch holds at most one period, so that it
+	// cannot overwrite the probe records of a check it computes
+	// (ScheduleSteadyStateChecks()); runs call for less than half a period.
+	unsigned int maxBatch = m_maxTSPerSubmit;
+	if (m_steadyEnergyPipeline && m_steadyPeriod < maxBatch)
+		maxBatch = m_steadyPeriod;
+	if (iterTS > maxBatch)
 	{
 		if (g_settings.GetVerboseLevel() > 1)
 			cout << "Engine_Vulkan: splitting " << iterTS
-			     << " timesteps into chunks of " << m_maxTSPerSubmit
+			     << " timesteps into chunks of " << maxBatch
 			     << " (progress every ~" << m_chunkProgressIntervalSec << " s)"
 			     << endl;
 
@@ -5402,7 +5513,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		unsigned int remaining = iterTS;
 		while (remaining > 0)
 		{
-			unsigned int chunk = std::min(remaining, m_maxTSPerSubmit);
+			unsigned int chunk = std::min(remaining, maxBatch);
 			if (!IterateTS(chunk))
 				return false;
 			remaining -= chunk;
@@ -5499,6 +5610,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		}
 	}
 
+	// The steady-state checks this batch computes, and room for them.
+	ScheduleSteadyStateChecks(iterTS);
+
 	// Wait for this slot if it is still in-flight from a previous round
 	if (m_gpuInFlight[m_cmdIdx])
 	{
@@ -5554,7 +5668,10 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	// timestep and the result is bit-identical to the flat sweep.
 	if (!m_tbAnnounced)
 		const_cast<Engine_Vulkan*>(this)->ConfigureTemporalBlocking();
-	if (m_tbActive)
+	// A batch of one timestep runs flat: a block of depth one is the flat
+	// sweep with the wedges' extra dispatches and barriers. Dirac and step
+	// excitations, whose Nyquist interval is one timestep, ask for no more.
+	if (m_tbActive && iterTS >= 2)
 	{
 		// k is clamped to the call's timestep count, so a short IterateTS
 		// (openems.cpp passes the number of steps until the next probe or
@@ -5744,6 +5861,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 			if (m_validateStages)
 				RecordGPUFieldValidation(cmd, 32);
 			RecordSteadyStateSample(cmd, ts);
+			RecordSteadyStateEnergy(cmd, ts, 0, numLines[0]);
 			stageMark();
 
 			// --- Fused current update (Yee + UPML pre + UPML post) ---
@@ -5986,6 +6104,7 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		if (m_validateStages)
 			RecordGPUFieldValidation(cmd, 32);
 		RecordSteadyStateSample(cmd, ts);
+		RecordSteadyStateEnergy(cmd, ts, 0, numLines[0]);
 		stageMark();
 
 		// === Pre-current extensions (GPU) ===
@@ -6318,7 +6437,24 @@ void Engine_Vulkan::CleanupExtensions()
 	m_gpuSteadyStateExt = nullptr;
 	m_steadyProbeCount = m_steadyPeriod = m_steadyRingSize = 0;
 	m_steadyProbeX.clear();
-	m_steadyLastCompletedPeriods = 0;
+	if (m_steadyEnergyMapped)
+	{
+		vkUnmapMemory(m_device, m_steadyEnergy.memory);
+		m_steadyEnergyMapped = nullptr;
+	}
+	destroyPipeline(m_steadyEnergyPipeline);
+	destroyPipeLayout(m_steadyEnergyPipeLayout);
+	if (m_steadyEnergyDescPool)
+	{
+		vkDestroyDescriptorPool(m_device, m_steadyEnergyDescPool, nullptr);
+		m_steadyEnergyDescPool = VK_NULL_HANDLE;
+	}
+	destroyDescLayout(m_steadyEnergyDescLayout);
+	DestroyGpuBuf(m_steadyEnergy);
+	m_steadyEnergyDescSet = VK_NULL_HANDLE;
+	m_steadyChecks.clear();
+	m_steadyChunks = 0;
+	m_steadySlotFloats = 0;
 
 	destroyPipeline(m_localAbcPipeline);
 	destroyPipeLayout(m_localAbcPipeLayout);

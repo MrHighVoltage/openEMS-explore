@@ -378,6 +378,13 @@ private:
 	void SetupGPU_SteadyState();
 	//! Sample the steady-state probes on the x-lines [xLo,xHi) at timestep \a ts; false if there are none.
 	bool RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo = 0, uint32_t xHi = UINT32_MAX) const;
+	//! At a steady-state check timestep \a ts, sum the energy of the x-planes [xLo,xHi) into the check's slot.
+	void RecordSteadyStateEnergy(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo, uint32_t xHi) const;
+	//! Register the checks of the batch of \a iterTS timesteps about to be recorded, after making room for them.
+	void ScheduleSteadyStateChecks(unsigned int iterTS);
+	//! Evaluate the registered checks before timestep \a before, in order, once their batches are done.
+	void EvaluateSteadyStateChecks(unsigned int before);
+	//! GetLastDiff(): evaluate every check before the current timestep.
 	void UpdateSteadyStateResult();
 	void SetupGPU_LocalABC();
 	void RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) const;
@@ -665,8 +672,28 @@ private:
 	uint32_t m_steadyProbeCount = 0;
 	uint32_t m_steadyPeriod = 0;
 	uint32_t m_steadyRingSize = 0;
-	uint32_t m_steadyLastCompletedPeriods = 0;
 	std::vector<uint32_t> m_steadyProbeX;  //!< x-line of every steady-state probe, sorted
+	// The energy of a check, by x-plane (reduce_energy_planes.comp), into one
+	// of STEADY_CHECK_SLOTS slots, which the host reads once the batch is done.
+	static constexpr uint32_t STEADY_CHECK_SLOTS = 4;
+	static constexpr uint32_t STEADY_ENERGY_CHUNK = 4096;  //!< cells per workgroup
+	struct SteadyEnergyPC { uint32_t N, planeCells, chunkCells, chunks, xLo, slotBase; };
+	struct SteadyCheck
+	{
+		uint32_t ts;     //!< the check's timestep, a multiple of the period
+		int cmdSlot;     //!< m_cmdBufs slot whose batch computes it
+		uint64_t serial; //!< that batch's m_submitSerial
+	};
+	std::deque<SteadyCheck> m_steadyChecks;  //!< recorded, not yet evaluated, in timestep order
+	uint32_t m_steadyChunks = 0;             //!< workgroups per x-plane
+	uint64_t m_steadySlotFloats = 0;         //!< floats of one check's partials
+	GpuBuf m_steadyEnergy;
+	float* m_steadyEnergyMapped = nullptr;
+	VkDescriptorSetLayout m_steadyEnergyDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_steadyEnergyPipeLayout = VK_NULL_HANDLE;
+	VkPipeline m_steadyEnergyPipeline = VK_NULL_HANDLE;
+	VkDescriptorPool m_steadyEnergyDescPool = VK_NULL_HANDLE;
+	VkDescriptorSet m_steadyEnergyDescSet = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_steadyDescLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_steadyPipeLayout = VK_NULL_HANDLE;
 	VkPipeline m_steadyPipeline = VK_NULL_HANDLE;
