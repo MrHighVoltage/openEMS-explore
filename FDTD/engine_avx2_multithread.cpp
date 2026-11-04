@@ -511,20 +511,20 @@ void Engine_AVX2_Multithread::SplitRange(int lo, int hi, unsigned int nThreads,
 // The blocked path pays every barrier once per timestep *per tile*, so three
 // kinds are left out. An extension that does not implement a hook is skipped
 // along with its barrier. With barrier elision on (OPENEMS_AVX2_TBLOCK_ELIDE,
-// default), so is one whose SlabTouches() says it cannot reach this slab -- a
+// default), so is one whose SlabTouchesAt() says it cannot reach this slab -- a
 // Mur plane at x=0 is only ever in the first tile, a port only in its own --
 // and two consecutive hooks that both only read the fields (SlabHookWrites-
 // Fields() false) run without a barrier between them, since neither can
 // change what the other reads. The barrier after the last hook stays: the
 // update or the next pass writes the fields. Every thread evaluates the same
-// masks and the same slab, so they cannot disagree on how many barriers this
-// pass has.
+// masks for the same slab and timestep, so they cannot disagree on how many
+// barriers this pass has.
 #define SLAB_DISPATCH_HOOK(HOOK, BIT)                                          \
 	{                                                                          \
 		Engine_Extension* ext = m_Eng_exts.at(n);                              \
 		if (!(ext->SlabHookMask() & Engine_Extension::BIT))                    \
 			continue;                                                          \
-		if (m_blk_elide && !ext->SlabTouches(Engine_Extension::BIT, startX, stopX)) \
+		if (m_blk_elide && !ext->SlabTouchesAt(Engine_Extension::BIT, startX, stopX, numTS)) \
 			continue;                                                          \
 		if (prev && (!m_blk_elide ||                                           \
 		             prev->SlabHookWritesFields(Engine_Extension::BIT) ||      \

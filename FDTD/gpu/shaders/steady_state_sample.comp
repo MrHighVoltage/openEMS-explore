@@ -1,4 +1,8 @@
-/* Sparse steady-state probe history sampling. */
+/* Sparse steady-state probe history sampling.
+ *
+ * Only the probes on x-lines in [xLo, xHi): the blocked schedule samples each
+ * slab when it reaches the timestep, the flat one the whole grid at once.
+ */
 #version 450
 
 layout(local_size_x = 256) in;
@@ -11,11 +15,17 @@ layout(push_constant) uniform PC {
     uint count;
     uint ringSize;
     uint timestep;
+    uint xLo, xHi;      // x-lines to sample
+    uint fieldN;        // cells per component
+    uint strideYZ;      // cells per x-plane
 };
 
 void main()
 {
     uint probe = gl_GlobalInvocationID.x;
     if (probe >= count) return;
-    history[probe * ringSize + timestep % ringSize] = volt[probeIdx[probe]];
+    uint idx = probeIdx[probe];
+    uint x = (idx % fieldN) / strideYZ;
+    if (x < xLo || x >= xHi) return;
+    history[probe * ringSize + timestep % ringSize] = volt[idx];
 }

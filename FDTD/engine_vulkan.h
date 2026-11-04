@@ -376,7 +376,8 @@ private:
 	void UploadCoefficients();
 	void SetupGPUExcitation();
 	void SetupGPU_SteadyState();
-	void RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) const;
+	//! Sample the steady-state probes on the x-lines [xLo,xHi) at timestep \a ts; false if there are none.
+	bool RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo = 0, uint32_t xHi = UINT32_MAX) const;
 	void UpdateSteadyStateResult();
 	void SetupGPU_LocalABC();
 	void RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) const;
@@ -511,7 +512,7 @@ private:
 	struct RlcPC    { uint32_t count; uint32_t entryBase = 0; uint32_t entryEnd = 0xFFFFFFFFu; };
 	//! Push constant struct for probe gather shader.
 	struct ProbePC  { uint32_t count; };
-	struct SteadyPC { uint32_t count, ringSize, timestep; };
+	struct SteadyPC { uint32_t count, ringSize, timestep, xLo, xHi, fieldN, strideYZ; };
 	struct LocalAbcPC {
 		uint32_t Nx, Ny, Nz, ny, nyP, nyPP;
 		uint32_t startX, startY, startZ;
@@ -665,6 +666,7 @@ private:
 	uint32_t m_steadyPeriod = 0;
 	uint32_t m_steadyRingSize = 0;
 	uint32_t m_steadyLastCompletedPeriods = 0;
+	std::vector<uint32_t> m_steadyProbeX;  //!< x-line of every steady-state probe, sorted
 	VkDescriptorSetLayout m_steadyDescLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_steadyPipeLayout = VK_NULL_HANDLE;
 	VkPipeline m_steadyPipeline = VK_NULL_HANDLE;

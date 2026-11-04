@@ -149,6 +149,17 @@ public:
 	virtual bool SlabTouches(SlabHook hook, unsigned int startX, unsigned int stopX) const
 	{(void)hook; (void)startX; (void)stopX; return true;}
 
+	//! SlabTouches() for the slab [startX,stopX) at the timestep \a numTS.
+	/*!
+	  The engine asks this one. It is for an extension whose reach changes
+	  with the timestep: the steady-state detection reads a few probe lines at
+	  every timestep, but every slab at the end of a period. All threads ask
+	  with the same slab and timestep, so the answer may depend on both, but
+	  not on the thread. The default is SlabTouches().
+	*/
+	virtual bool SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const
+	{(void)numTS; return SlabTouches(hook, startX, stopX);}
+
 	//! Does \a hook write the engine's fields?
 	/*!
 	  A hook that only reads the fields, and writes nothing but this

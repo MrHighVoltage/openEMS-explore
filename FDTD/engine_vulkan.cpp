@@ -3225,13 +3225,16 @@ void Engine_Vulkan::SetupGPU_SteadyState()
 		throw std::runtime_error("Vulkan steady-state history exceeds 32-bit shader indexing");
 
 	std::vector<uint32_t> indices(m_steadyProbeCount);
+	m_steadyProbeX.resize(m_steadyProbeCount);
 	for (uint32_t i = 0; i < m_steadyProbeCount; ++i)
 	{
 		indices[i] = opSteady->m_E_probe_dir[i] * m_fieldN +
 		             opSteady->m_E_probe_pos[0][i] * m_strideYZ +
 		             opSteady->m_E_probe_pos[1][i] * numLines[2] +
 		             opSteady->m_E_probe_pos[2][i];
+		m_steadyProbeX[i] = opSteady->m_E_probe_pos[0][i];
 	}
+	std::sort(m_steadyProbeX.begin(), m_steadyProbeX.end());
 
 	const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 	const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -3460,10 +3463,13 @@ void Engine_Vulkan::RecordLocalABCPhase(VkCommandBuffer cmd, uint32_t phase) con
 	}
 }
 
-void Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) const
+bool Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo, uint32_t xHi) const
 {
-	if (!m_steadyPipeline) return;
-	const SteadyPC pc = {m_steadyProbeCount, m_steadyRingSize, ts};
+	if (!m_steadyPipeline) return false;
+	// A slab without a probe line records nothing, and needs no dispatch.
+	const auto first = std::lower_bound(m_steadyProbeX.begin(), m_steadyProbeX.end(), xLo);
+	if (first == m_steadyProbeX.end() || *first >= xHi) return false;
+	const SteadyPC pc = {m_steadyProbeCount, m_steadyRingSize, ts, xLo, xHi, m_fieldN, m_strideYZ};
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_steadyPipeline);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 	                        m_steadyPipeLayout, 0, 1, &m_steadyDescSet, 0, nullptr);
@@ -3476,6 +3482,7 @@ void Engine_Vulkan::RecordSteadyStateSample(VkCommandBuffer cmd, uint32_t ts) co
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	CmdComputeBarrier(cmd, barrier);
+	return true;
 }
 
 void Engine_Vulkan::UpdateSteadyStateResult()
@@ -5237,6 +5244,10 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 			}
 		}
 
+		// --- Steady-state probes on these x-lines, where the flat path samples them ---
+		if (eHi > eLo)
+			RecordSteadyStateSample(cmd, ts, (uint32_t)eLo, (uint32_t)eHi);
+
 		// --- Current update on [An, min(Bn, NX-1)) ---
 		// The Yee current update never touches the last x-line (it reads volt
 		// at x+1), but the flat path's UPML and excitation dispatches both run
@@ -6306,6 +6317,7 @@ void Engine_Vulkan::CleanupExtensions()
 	m_steadyDescSet = VK_NULL_HANDLE;
 	m_gpuSteadyStateExt = nullptr;
 	m_steadyProbeCount = m_steadyPeriod = m_steadyRingSize = 0;
+	m_steadyProbeX.clear();
 	m_steadyLastCompletedPeriods = 0;
 
 	destroyPipeline(m_localAbcPipeline);

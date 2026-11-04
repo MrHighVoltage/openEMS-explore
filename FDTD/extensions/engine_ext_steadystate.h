@@ -23,6 +23,7 @@
 #include "FDTD/operator.h"
 
 #include <functional>
+#include <vector>
 
 class Operator_Ext_SteadyState;
 class Engine_Interface_FDTD;
@@ -36,35 +37,51 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
-	// SupportsSlabApply() stays false, and this is the one extension where that
-	// is a conclusion rather than an omission. The per-probe sampling would slab
-	// fine, but every period this extension also calls CalcFastEnergy() over the
-	// *whole* grid and compares it with the previous period's. A blocked
-	// schedule has no moment mid-block at which the whole grid is at one
-	// timestep, so there is nothing correct to integrate. Steady-state
-	// detection therefore runs on the flat sweep, and the engine says so at
-	// startup instead of silently falling back.
+	// The blocked schedule. The probes are recorded per slab, from the first
+	// Apply2Voltages hook, where every slab sees the values the flat sweep
+	// records; each probe line lies in exactly one slab per timestep. The
+	// records go into a ring of three periods indexed by the absolute
+	// timestep, so that the check of a period can wait for the end of the
+	// block while the block records on. The energy of the check, over the
+	// whole grid, is not there yet, so SupportsSlabApply() stays false.
+	virtual unsigned int SlabHookMask() const {return SLAB_APPLY_VOLT;}
+	virtual bool SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const;
+	virtual bool SlabHookWritesFields(SlabHook hook) const {(void)hook; return false;}
+	virtual void Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID);
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff();
-
-	//! Compare the last two periods of the records, at a timestep \a rel_pos within the 2 periods of the records
-	/*!
-	  \a record(n, t) returns the voltage of probe \a n at the record position \a t (0 <= t < 2 periods).
-	  */
-	void CheckPeriod(unsigned int rel_pos, const std::function<double(size_t, unsigned int)>& record);
 	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}
 	void UpdateGpuSamples(const float* samples, unsigned int ringPeriods,
 	                      unsigned int completedTS, double totalEnergy);
 
+	//! Is \a TS a timestep the last two periods are compared at?
+	bool IsCheckTimestep(unsigned int TS) const;
+
+	//! Compare the last two periods of the records at the check timestep \a TS, whose field energy is \a energy
+	/*!
+	  \a record(n, t) returns the voltage of probe \a n at the position \a t
+	  (0 <= t < 2 periods) of a ring of two periods, which holds timestep TS
+	  at TS % (2 periods): the pairing of the samples, and which of the two
+	  periods normalises the difference, are those of that ring.
+	  */
+	void CheckPeriod(unsigned int TS, double energy, const std::function<double(size_t, unsigned int)>& record);
+
 protected:
+	//! Record the probes on x-lines in [startX,stopX) at timestep \a TS.
+	void RecordProbes(unsigned int TS, unsigned int startX, unsigned int stopX);
+	//! The records of the check at \a TS, as CheckPeriod() reads them.
+	double RingRecord(unsigned int TS, size_t n, unsigned int t) const;
+
 	//! With OPENEMS_STEADYSTATE_TRACE=1, print the check of timestep \a TS: the energy and the verdict.
 	void TraceCheck(unsigned int TS, double energy) const;
 
 	Operator_Ext_SteadyState* m_Op_SS;
+	unsigned int m_period;        //!< timesteps per period
+	unsigned int m_ringSize;      //!< 3 periods
 	double m_last_max_diff;
-	std::vector<double*> m_E_records;
-	std::vector<double*> m_H_records;
+	//! [probe][TS % m_ringSize]: the probe voltages of the last three periods
+	std::vector<double> m_records;
 
 	double last_total_energy;
 	Engine_Interface_FDTD* m_Eng_Interface;

@@ -15,6 +15,7 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -30,11 +31,9 @@ Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext)
 	m_Op_SS = op_ext;
 	m_Priority = ENG_EXT_PRIO_STEADYSTATE;
 
-	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
-	{
-		double* rec = new double[m_Op_SS->m_TS_period*2];
-		m_E_records.push_back(rec);
-	}
+	m_period = m_Op_SS->m_TS_period;
+	m_ringSize = 3*m_period;
+	m_records.assign(m_Op_SS->m_E_probe_dir.size()*(size_t)m_ringSize, 0.0);
 	m_last_max_diff = 1;
 	last_total_energy = 0;
 	m_Eng_Interface = NULL;
@@ -44,14 +43,36 @@ Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext)
 
 Engine_Ext_SteadyState::~Engine_Ext_SteadyState()
 {
-	for (size_t n=0;n<m_E_records.size();++n)
-	{
-		delete[] m_E_records.at(n);
-		m_E_records.at(n) = NULL;
-	}
-	m_E_records.clear();
 	delete m_Eng_Interface;
 	m_Eng_Interface = NULL;
+}
+
+bool Engine_Ext_SteadyState::IsCheckTimestep(unsigned int TS) const
+{
+	return (m_period>0) && (TS%m_period==0) && (TS>=2*m_period);
+}
+
+void Engine_Ext_SteadyState::RecordProbes(unsigned int TS, unsigned int startX, unsigned int stopX)
+{
+	if (m_ringSize==0)
+		return;
+	const unsigned int slot = TS%m_ringSize;
+	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
+	{
+		const unsigned int x = m_Op_SS->m_E_probe_pos[0].at(n);
+		if ((x<startX) || (x>=stopX))
+			continue;
+		m_records[n*m_ringSize + slot] = m_Eng->GetVolt(m_Op_SS->m_E_probe_dir.at(n), x, m_Op_SS->m_E_probe_pos[1].at(n), m_Op_SS->m_E_probe_pos[2].at(n));
+	}
+}
+
+double Engine_Ext_SteadyState::RingRecord(unsigned int TS, size_t n, unsigned int t) const
+{
+	// t is a position in a ring of two periods, which holds TS at TS%(2p) and
+	// everything before it back to TS-2p+1: that is timestep TS-((TS-t)%(2p)).
+	const unsigned int p2 = 2*m_period;
+	const unsigned int ts = TS - ((TS%p2 + p2 - t)%p2);
+	return m_records[n*m_ringSize + ts%m_ringSize];
 }
 
 double Engine_Ext_SteadyState::GetLastDiff()
@@ -81,10 +102,11 @@ void Engine_Ext_SteadyState::UpdateGpuSamples(const float* samples, unsigned int
 	const unsigned int ringSize = ringPeriods * p;
 	const unsigned int oldPeriod = completedPeriods - 2;
 	const unsigned int newPeriod = completedPeriods - 1;
-	std::vector<double> currPow(m_E_records.size(), 0.0);
-	std::vector<double> diffPow(m_E_records.size(), 0.0);
+	const size_t count = m_Op_SS->m_E_probe_dir.size();
+	std::vector<double> currPow(count, 0.0);
+	std::vector<double> diffPow(count, 0.0);
 	double maxPow = 0;
-	for (size_t probe = 0; probe < m_E_records.size(); ++probe)
+	for (size_t probe = 0; probe < count; ++probe)
 	{
 		const float* history = samples + probe * ringSize;
 		for (unsigned int nt = 0; nt < p; ++nt)
@@ -98,7 +120,7 @@ void Engine_Ext_SteadyState::UpdateGpuSamples(const float* samples, unsigned int
 		maxPow = std::max(maxPow, currPow[probe]);
 	}
 
-	for (size_t probe = 0; probe < m_E_records.size(); ++probe)
+	for (size_t probe = 0; probe < count; ++probe)
 	{
 		if (currPow[probe] > maxPow * 1e-2)
 		{
@@ -124,22 +146,40 @@ void Engine_Ext_SteadyState::TraceCheck(unsigned int TS, double energy) const
 
 void Engine_Ext_SteadyState::Apply2Voltages()
 {
-	unsigned int p = m_Op_SS->m_TS_period;
-	unsigned int TS = m_Eng->GetNumberOfTimesteps();
-	unsigned int rel_pos = m_Eng->GetNumberOfTimesteps()%(2*p);
-	for (size_t n=0;n<m_E_records.size();++n)
-		m_E_records.at(n)[rel_pos] = m_Eng->GetVolt(m_Op_SS->m_E_probe_dir.at(n), m_Op_SS->m_E_probe_pos[0].at(n), m_Op_SS->m_E_probe_pos[1].at(n), m_Op_SS->m_E_probe_pos[2].at(n));
-	if ((TS%(m_Op_SS->m_TS_period)==0) && (TS>=2*p))
-		CheckPeriod(rel_pos, [this](size_t n, unsigned int t) {return m_E_records[n][t];});
+	const unsigned int TS = m_Eng->GetNumberOfTimesteps();
+	RecordProbes(TS, 0, UINT_MAX);
+	if (IsCheckTimestep(TS))
+		CheckPeriod(TS, m_Eng_Interface->CalcFastEnergy(), [this, TS](size_t n, unsigned int t) {return RingRecord(TS, n, t);});
 }
 
-void Engine_Ext_SteadyState::CheckPeriod(unsigned int rel_pos, const std::function<double(size_t, unsigned int)>& record)
+bool Engine_Ext_SteadyState::SlabTouchesAt(SlabHook hook, unsigned int startX, unsigned int stopX, int numTS) const
 {
-	const unsigned int p = m_Op_SS->m_TS_period;
+	(void)hook;
+	(void)numTS;
+	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
+	{
+		const unsigned int x = m_Op_SS->m_E_probe_pos[0].at(n);
+		if ((x>=startX) && (x<stopX))
+			return true;
+	}
+	return false;
+}
+
+void Engine_Ext_SteadyState::Apply2VoltagesSlab(unsigned int startX, unsigned int stopX, int numTS, int threadID)
+{
+	// a handful of values: not worth splitting across threads
+	if (threadID==0)
+		RecordProbes((unsigned int)numTS, startX, stopX);
+}
+
+void Engine_Ext_SteadyState::CheckPeriod(unsigned int TS, double energy, const std::function<double(size_t, unsigned int)>& record)
+{
+	const unsigned int p = m_period;
+	const unsigned int rel_pos = TS%(2*p);
 	const size_t count = m_Op_SS->m_E_probe_dir.size();
 	bool no_valid = true;
 	m_last_max_diff = 0;
-	double curr_total_energy = m_Eng_Interface->CalcFastEnergy();
+	const double curr_total_energy = energy;
 	if (last_total_energy>0)
 	{
 		m_last_max_diff = std::fabs(curr_total_energy-last_total_energy)/last_total_energy;
@@ -176,7 +216,7 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int rel_pos, const std::functi
 	}
 	if ((no_valid) || (m_last_max_diff>1))
 		m_last_max_diff = 1;
-	TraceCheck(m_Eng->GetNumberOfTimesteps(), curr_total_energy);
+	TraceCheck(TS, curr_total_energy);
 }
 
 void Engine_Ext_SteadyState::Apply2Current()
