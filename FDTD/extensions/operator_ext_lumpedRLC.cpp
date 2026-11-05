@@ -102,9 +102,12 @@ bool Operator_Ext_LumpedRLC::BuildExtension()
 {
 	double 	dT = m_Op->GetTimestep();
 
-	double	fMax = 	m_Op->GetExcitationSignal()->GetCenterFreq()
-					+
-					m_Op->GetExcitationSignal()->GetCutOffFreq();
+	// CalcECOperator() has Reset() the excitation before it builds the
+	// extensions, so this is 0, as in upstream, and the two capacitance
+	// adjustments below never fire. With f0+fc they lowered the cells' own
+	// capacitance far below what the timestep was chosen for (75-fold for a
+	// series RLC spread over 85 cells), and the run diverged.
+	double	fMax = 	m_Op->GetExcitationSignal()->GetMaxFreq();
 
 	unsigned int 	pos[] = {0,0,0};
 
