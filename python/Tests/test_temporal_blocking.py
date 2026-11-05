@@ -235,6 +235,16 @@ class TemporalBlockingCaseMixin:
             "the control run (no OPENEMS_AVX2_TEMPORAL_BLOCK set) engaged "
             "blocking anyway -- the env var is not gating it",
         )
+        # A run that diverged is no reference either: flat and blocked diverge
+        # alike, and RunFDTD cancels at its next energy check (exit code 0),
+        # often before the dumps hold anything non-finite.
+        self.assertTrue(
+            "cancelling simulation" not in flat_out
+            and np.all(np.isfinite(flat_E)) and np.all(np.isfinite(flat_H)),
+            "flat run diverged: %s"
+            % ("; ".join(l for l in flat_out.splitlines() if "cancelling simulation" in l)
+               or "non-finite fields in the dump"),
+        )
         self.assertGreater(
             np.max(np.abs(flat_E)), 0.0,
             "flat run produced an all-zero field -- excitation never reached the dump",
@@ -341,9 +351,17 @@ class Test4_DispersiveDrude(TemporalBlockingCaseMixin, unittest.TestCase):
 
 
 class Test5_LumpedRLC(TemporalBlockingCaseMixin, unittest.TestCase):
-    """A single parallel-RLC lumped element (see LumpedRLC.py for the full
+    """A single lumped element per case (see LumpedRLC.py for the full
     port-based validation of this extension; here it is only load-bearing
-    geometry, not something whose impedance is checked)."""
+    geometry, not something whose impedance is checked).
+
+    A parallel RLC with its C leaves the cells' own capacitance alone. A
+    series RLC and a parallel RL without C used to lower it, from the
+    excitation's f0+fc, to a 22nd here, far below what the timestep was chosen
+    for: the runs diverged and RunFDTD cancelled them at timestep 50 and 75.
+    As in upstream since d686f1d they leave it alone now; _compare() checks
+    that the flat run did not diverge.
+    """
 
     def test_lumped_rlc(self):
         self._compare(
@@ -351,6 +369,28 @@ class Test5_LumpedRLC(TemporalBlockingCaseMixin, unittest.TestCase):
             [0, 0, 0, 0, 0, 0],
             """
             lrc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=0)
+            lrc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
+            """ % (LUMPED_X_LO, LUMPED_X_HI),
+        )
+
+    def test_series_rlc(self):
+        """The series ADE, which carries J and Vd history across timesteps."""
+        self._compare(
+            "lumped_series",
+            [0, 0, 0, 0, 0, 0],
+            """
+            lrc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=1)
+            lrc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
+            """ % (LUMPED_X_LO, LUMPED_X_HI),
+        )
+
+    def test_parallel_rl(self):
+        """A parallel RL without C, which keeps the cells' own capacitance."""
+        self._compare(
+            "lumped_par_rl",
+            [0, 0, 0, 0, 0, 0],
+            """
+            lrc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, LEtype=0)
             lrc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
             """ % (LUMPED_X_LO, LUMPED_X_HI),
         )

@@ -278,7 +278,15 @@ class GPUTemporalBlockingTest(unittest.TestCase):
     def _compare(self, tag, boundary, extra_setup, runs=1, extra_env=None):
         """Run flat vs blocked with the same geometry and compare, the
         blocked side `runs` times.  Returns the last blocked run's output."""
-        _, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_env, extra_setup=extra_setup)
+        flat_out, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_env, extra_setup=extra_setup)
+        # Flat and blocked diverge alike, and RunFDTD cancels a diverging run
+        # at its next energy check, often before the dumps hold a NaN.
+        self.assertTrue(
+            "cancelling simulation" not in flat_out
+            and np.all(np.isfinite(flat_E)) and np.all(np.isfinite(flat_H)),
+            "flat run for %s diverged: %s"
+            % (tag, "; ".join(l for l in flat_out.splitlines() if "cancelling simulation" in l)
+               or "non-finite fields in the dump"))
         self.assertGreater(float(np.max(np.abs(flat_E))), 0.0,
                            "flat run for %s produced an all-zero field" % tag)
         for r in range(runs):
@@ -465,8 +473,9 @@ class GPUTemporalBlockingTest(unittest.TestCase):
 
     def test_steady_state_with_extensions(self):
         """Mur, a lumped port and an RLC element, which write the fields in
-        the voltage phase the detection reads, and UPML. (A parallel RLC: the
-        series one of test_lumped_rlc_and_port goes NaN when read from XML.)"""
+        the voltage phase the detection reads, and UPML. (A parallel RLC: with
+        the series one of test_lumped_rlc_and_port the model settles after
+        three checks, in upstream too, which is too few to compare.)"""
         setup = """
             rlc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=0)
             rlc.AddBox([xl[%d], yl[14], zl[10]], [xl[%d], yl[18], zl[14]], priority=10)
