@@ -5245,24 +5245,27 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 
 		const uint32_t ts = t0 + (uint32_t)t;
 
-		// --- Pre-voltage: UPML (unfused), then dispersive ADE, Mur, lumped RLC ---
+		// --- Pre-voltage: dispersive ADE, Mur, lumped RLC, then UPML (unfused) ---
 		// Ordered exactly as the flat path has it: the pre passes run before
 		// the update, the apply passes after it and before the excitation.
-		// UPML goes first and alone, because it swaps field and flux in cells
-		// the others may read; the other three write disjoint state, so they
-		// share one barrier, as they do in the flat path.
+		// The first four write disjoint state, so they share one barrier, as
+		// they do in the flat path.  UPML goes last and alone, as on the CPU
+		// (reverse priority order): it swaps field and flux in its cells, and a
+		// dispersive material or a Mur face reaching into a PML reads the field.
 		const bool unfusedUPML = !m_hasFusedUPML && !m_gpuUPML.empty();
-		if (unfusedUPML && eHi > eLo)
-		{
-			RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
-			CmdComputeBarrier(cmd, barrier);
-		}
 		bool preVolt = RecordDispersiveSlabPhase(cmd, 0, eLo, eHi);
 		if (!preMerged)
 		{
 			preVolt = RecordMurSlabPhase(cmd, 0, eLo, eHi, ts) || preVolt;
 			preVolt = RecordRLCSlabPhase(cmd, 0, eLo, eHi) || preVolt;
 			preVolt = RecordLocalABCSlabPhase(cmd, 0, eLo, eHi) || preVolt;
+		}
+		if (unfusedUPML && eHi > eLo)
+		{
+			if (preVolt)
+				CmdComputeBarrier(cmd, barrier);
+			RecordUPMLSlabPhase(cmd, 0, eLo, eHi);
+			preVolt = true;
 		}
 		if (preVolt)
 			CmdComputeBarrier(cmd, barrier);
@@ -5388,13 +5391,15 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		const int hHi  = (Bn < NXH) ? Bn : NXH;
 		const int hExc = (Bn >= NX) ? NX : hHi;
 
-		if (unfusedUPML && hExc > An)
-		{
-			RecordUPMLSlabPhase(cmd, 2, An, hExc);
-			CmdComputeBarrier(cmd, barrier);
-		}
 		bool preCurr = RecordDispersiveSlabPhase(cmd, 2, An, hExc);
 		preCurr = RecordLocalABCSlabPhase(cmd, 3, An, hExc) || preCurr;
+		if (unfusedUPML && hExc > An)
+		{
+			if (preCurr)
+				CmdComputeBarrier(cmd, barrier);
+			RecordUPMLSlabPhase(cmd, 2, An, hExc);
+			preCurr = true;
+		}
 		if (preCurr)
 			CmdComputeBarrier(cmd, barrier);
 
@@ -5404,11 +5409,11 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 		// touches.  So they share the current update's barrier instead of
 		// paying for one of their own at the top of the next step -- on the
 		// RX 7900 XTX a barrier costs ~1.8 us, and the blocked schedule records
-		// one per slab per phase.  Not with unfused UPML, whose pre pass has to
-		// run between the field and them.
+		// one per slab per phase.  Unfused UPML's pre pass comes after them in
+		// the next step either way.
 		bool nextPre = false;
 		preMerged = false;
-		if (!unfusedUPML && t + 1 < k)
+		if (t + 1 < k)
 		{
 			int An2, Bn2, eLo2, eHi2;
 			step(An, Bn, An2, Bn2, eLo2, eHi2);
