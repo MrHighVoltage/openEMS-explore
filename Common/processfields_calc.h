@@ -39,10 +39,13 @@
 #include "tools/constants.h"
 #include "tools/arraylib/array_nijk.h"
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
-#include <functional>
 
 namespace FieldCalc {
 
@@ -209,40 +212,128 @@ static RawFieldFunc<EngT> GetDualFieldFunc(ProcessFields::DumpType type)
 
 //--- Interpolated field extraction ------------------------------------------
 
-//! The interpolated field (\a Dual: H or B, else E, J, D or rotH) at the dump positions of lines [startI, endI) in x
+//! The interpolated field (\a Dual: H or B, else E, J, D or rotH) at the dump
+//! positions of the (x,y) lines [startL, endL), line l = i*numLines[1] + j
 template<typename EngT, bool Dual>
 static void ExtractFieldSlice(
 	const EngT* eng, const Engine_Interface_FDTD* fdtd_if, const MaterialContext& mat,
 	RawFieldFunc<EngT> rawFunc,
 	unsigned int numLines[3], unsigned int* posLines[3],
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> &field,
-	unsigned int startI, unsigned int endI)
+	size_t startL, size_t endL)
 {
 	const Operator* op = fdtd_if->GetFDTDOperator();
 	auto raw = [eng, op, &mat, rawFunc](unsigned int n, const unsigned int* p) {return rawFunc(eng, op, mat, n, p);};
 	unsigned int pos[3];
 	double out[3];
 
-	for (unsigned int i = startI; i < endI; ++i)
+	for (size_t l = startL; l < endL; ++l)
 	{
+		const unsigned int i = l / numLines[1];
+		const unsigned int j = l % numLines[1];
 		pos[0] = posLines[0][i];
-		for (unsigned int j = 0; j < numLines[1]; ++j)
+		pos[1] = posLines[1][j];
+		for (unsigned int k = 0; k < numLines[2]; ++k)
 		{
-			pos[1] = posLines[1][j];
-			for (unsigned int k = 0; k < numLines[2]; ++k)
-			{
-				pos[2] = posLines[2][k];
-				if (Dual)
-					fdtd_if->InterpolateDualField(pos, out, raw);
-				else
-					fdtd_if->InterpolateField(pos, out, raw);
-				field(0, i, j, k) = out[0];
-				field(1, i, j, k) = out[1];
-				field(2, i, j, k) = out[2];
-			}
+			pos[2] = posLines[2][k];
+			if (Dual)
+				fdtd_if->InterpolateDualField(pos, out, raw);
+			else
+				fdtd_if->InterpolateField(pos, out, raw);
+			field(0, i, j, k) = out[0];
+			field(1, i, j, k) = out[1];
+			field(2, i, j, k) = out[2];
 		}
 	}
 }
+
+//--- Worker threads -----------------------------------------------------------
+
+/*
+ * The threads of the field extraction, started once and kept: a dump every
+ * few timesteps (the faces of an NF2FF box) would otherwise start and join
+ * them every time, which costs more than the extraction itself.  Several
+ * threads may call at once, the main thread and the threads of the dumps the
+ * GPU gathers (see ProcessFieldsTD); the workers take the parts of all calls.
+ */
+class ThreadPool
+{
+public:
+	static ThreadPool& Get()
+	{
+		static ThreadPool* pool = new ThreadPool();  // never deleted: no joining at exit
+		return *pool;
+	}
+
+	//! Call fn(t) for t in [0, n) on the workers and the calling thread, and wait for all.
+	void Run(unsigned int n, const std::function<void(unsigned int)>& fn)
+	{
+		Call call;
+		call.fn = &fn;
+		call.n = n;
+		std::unique_lock<std::mutex> lock(m_mutex);
+		while (m_workers + 1 < n)
+		{
+			std::thread(&ThreadPool::Work, this).detach();
+			++m_workers;
+		}
+		m_calls.push_back(&call);
+		for (unsigned int i = 1; i < n; ++i)
+			m_work.notify_one();
+		Take(call, lock);
+		m_done.wait(lock, [&] { return (call.done == n) && (call.takers == 0); });
+		m_calls.erase(std::find(m_calls.begin(), m_calls.end(), &call));
+	}
+
+private:
+	struct Call
+	{
+		const std::function<void(unsigned int)>* fn = nullptr;
+		unsigned int n = 0;
+		std::atomic<unsigned int> next{0};  //!< the next part to take
+		unsigned int done = 0;              //!< the parts finished
+		unsigned int takers = 0;            //!< the threads taking parts, which keep the call alive
+	};
+
+	//! Run parts of \a call until none are left; \a lock is held on entry and exit.
+	void Take(Call& call, std::unique_lock<std::mutex>& lock)
+	{
+		++call.takers;
+		lock.unlock();
+		unsigned int ran = 0;
+		for (unsigned int t; (t = call.next++) < call.n; ++ran)
+			(*call.fn)(t);
+		lock.lock();
+		call.done += ran;
+		if ((--call.takers == 0) && (call.done == call.n))
+			m_done.notify_all();
+	}
+
+	void Work()
+	{
+		std::unique_lock<std::mutex> lock(m_mutex);
+		for (;;)
+		{
+			Call* call = nullptr;
+			m_work.wait(lock, [&]
+			{
+				for (Call* c : m_calls)
+					if (c->next < c->n)
+					{
+						call = c;
+						return true;
+					}
+				return false;
+			});
+			Take(*call, lock);
+		}
+	}
+
+	std::mutex m_mutex;
+	std::condition_variable m_work, m_done;
+	std::vector<Call*> m_calls;
+	unsigned int m_workers = 0;
+};
 
 //--- Top-level templated CalcField for a specific engine type ----------------
 
@@ -261,51 +352,23 @@ static bool CalcFieldForEngine(
 	if (!primaryFunc && !dualFunc)
 		return false; // unsupported dump type, fall back to legacy
 
-	// Clamp thread count to available work
-	if (numThreads < 1) numThreads = 1;
-	if (numThreads > numLines[0]) numThreads = numLines[0];
-
-	if (numThreads <= 1)
+	auto slice = [&](size_t startL, size_t endL)
 	{
-		// Single-threaded path
 		if (primaryFunc)
-			ExtractFieldSlice<EngT, false>(eng, fdtd_if, mat, primaryFunc, numLines, posLines, field, 0, numLines[0]);
+			ExtractFieldSlice<EngT, false>(eng, fdtd_if, mat, primaryFunc, numLines, posLines, field, startL, endL);
 		else
-			ExtractFieldSlice<EngT, true>(eng, fdtd_if, mat, dualFunc, numLines, posLines, field, 0, numLines[0]);
-	}
+			ExtractFieldSlice<EngT, true>(eng, fdtd_if, mat, dualFunc, numLines, posLines, field, startL, endL);
+	};
+
+	// A thread per thousand nodes or more, split over the (x,y) lines, so
+	// that a dump one line thick in x (a face of an NF2FF box) splits too.
+	const size_t lines = (size_t)numLines[0] * numLines[1];
+	const size_t nodes = lines * numLines[2];
+	const size_t n = std::min<size_t>(std::min<size_t>(numThreads, nodes / 1024), lines);
+	if (n <= 1)
+		slice(0, lines);
 	else
-	{
-		// Multi-threaded path: split i-dimension across threads
-		std::vector<std::thread> threads;
-		threads.reserve(numThreads);
-
-		unsigned int linesPerThread = numLines[0] / numThreads;
-		unsigned int remainder = numLines[0] % numThreads;
-		unsigned int startI = 0;
-
-		for (unsigned int t = 0; t < numThreads; ++t)
-		{
-			unsigned int count = linesPerThread + (t < remainder ? 1 : 0);
-			unsigned int endI = startI + count;
-
-			if (primaryFunc)
-			{
-				threads.emplace_back(
-					ExtractFieldSlice<EngT, false>,
-					eng, fdtd_if, std::cref(mat), primaryFunc, numLines, posLines, std::ref(field), startI, endI);
-			}
-			else
-			{
-				threads.emplace_back(
-					ExtractFieldSlice<EngT, true>,
-					eng, fdtd_if, std::cref(mat), dualFunc, numLines, posLines, std::ref(field), startI, endI);
-			}
-			startI = endI;
-		}
-
-		for (auto& t : threads)
-			t.join();
-	}
+		ThreadPool::Get().Run((unsigned int)n, [&](unsigned int t) {slice(lines * t / n, lines * (t + 1) / n);});
 
 	return true;
 }
