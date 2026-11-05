@@ -160,11 +160,17 @@ measured optimum sits. A run oversampled far past Nyquist will not reach the
 numbers above. GPU probes are gathered inside the batch, so they need slab
 ranges before `m_hasGPU_Probes` can stop being a refusal.
 
-### 5. Steady-state detection — cannot be blocked
+### 5. Steady-state detection — ~~cannot be blocked~~ done 2026-11-04
 
 Every period it integrates energy over the whole grid, and a blocked schedule
-has no moment mid-block at which the whole grid is at one timestep. It stays a
-refusal, as on the CPU. This is a property of the method, not a gap.
+has no moment mid-block at which the whole grid is at one timestep. That was
+read as a property of the method; it is not. `RecordSlabSweep()` samples the
+probes of each slab and, at a check timestep, sums the energy of its x-planes
+(`reduce_energy_planes.comp`) where the flat recorder does, and the host
+evaluates the check once the batch is done. Flat and blocked give the same
+verdicts and stop timesteps, and the old way of reading the energy, at
+whichever batch boundary the verdict was asked for, had a phase error.
+`plans/STEADY_STATE_TEMPORAL_BLOCKING.md`.
 
 ## Two things found while porting
 

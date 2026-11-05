@@ -24,7 +24,7 @@ the six hooks they actually use.
 | Mur ABC | DoPreV, DoPostV, Apply2V | 1, at a held edge | B or C |
 | Absorbing BC | all six | 2, at a held edge | B or C |
 | TF/SF | DoPostV, DoPostC | 0 (pure source) | C + scratch-buffer fix |
-| SteadyState | Apply2V, Apply2C | global energy | **cannot slab** — stays false |
+| SteadyState | Apply2V, Apply2C | global energy | ~~**cannot slab** — stays false~~ slab since 2026-11-04, see below |
 | Cylinder, CylinderMultiGrid | — | — | unreachable from this engine |
 
 Three slab patterns fall out, and every extension is one of them:
@@ -103,7 +103,10 @@ is real and must be documented rather than discovered.
 11. **SteadyState** — stays `false`, with a comment saying why (it needs total
     energy over a globally coherent grid, which a blocked schedule does not
     have mid-block) and a startup message naming it as the reason blocking is
-    off, rather than a silent fallback.
+    off, rather than a silent fallback. *Superseded 2026-11-04: each slab sums
+    its rows of that energy as it passes the check's timestep, and
+    `SlabBlockEnd()` runs the check at the end of the block
+    (`plans/STEADY_STATE_TEMPORAL_BLOCKING.md`).*
 
 ### Phase 3 — Engine wiring
 12. Replace the "the excitation and nothing else" comments with what is
@@ -173,8 +176,9 @@ with blocking confirmed active. `test_upml_engines.py` 7/7 and `LumpedRLC.py`
 
 ### Left undone, deliberately
 
-- Steady-state detection — integrates total energy over a globally coherent
-  grid, which no blocked schedule has mid-block.
+- ~~Steady-state detection — integrates total energy over a globally coherent
+  grid, which no blocked schedule has mid-block.~~ Done 2026-11-04, bit-identical
+  verdicts and stop timesteps: `plans/STEADY_STATE_TEMPORAL_BLOCKING.md`.
 - An absorbing sheet in the interior normal to x — the core/wedge partition
   boundary sweeps one x-line per timestep and eventually falls between the line
   written and the line read. Domain-face sheets work.

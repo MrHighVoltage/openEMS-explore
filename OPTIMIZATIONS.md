@@ -85,6 +85,7 @@ gather and energy reduction (`FDTD/gpu/shaders/`).
 |---|---|---|
 | `fb2049c` | **Local absorbing sheets on the GPU.** All localized first-order Mur phases as sparse surface dispatches with device-resident coefficients and E/H history, covering both the voltage-only `MUR_1ST` form and the current-side super-absorption of `MUR_1ST_SA`, including on the fused UPML path. `OPENEMS_GPU_CPU_LOCAL_ABC` keeps the CPU path for native-vs-hybrid validation | **7165 MC/s native vs 0.34 MC/s hybrid** — see below |
 | `ed6f590` | **Steady-state detection as a GPU observer** rather than a CPU extension — electric probes sampled into a three-period coherent history ring after each voltage phase, convergence evaluated only when the control path asks for it | Enablement: as a CPU extension it defeats GPU batching entirely |
+| `50c6817` | **The steady-state check with the energy of its own timestep**, summed by x-plane inside the batch, flat or blocked, and evaluated once the batch is done | Fixes a phase error that kept GPU sine runs from stopping; lifts the refusal of temporal blocking (§4.12) |
 
 **What a missing shader costs** (the i9-13900K, RX 6800, 2026-09-08).
 `python/Tests/benchmark_gpu_engine.py --local-abc mur`, A/B through
@@ -282,7 +283,7 @@ Two structural results worth carrying forward:
 | `574f714` | Document the MT bandwidth ceiling (comment only) | — |
 | `08fa968` | Vectorize the UPML passes | See below |
 | `fd555ee` | Calibrate the thread count on real timesteps instead of on 4 s `NextInterval` callbacks | **+50%** on a 400-timestep run (507 → 759 MC/s), **+6.4%** at 20000 timesteps. The i9-13900K only; the i7-6700K was never hurt by the old search |
-| *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Carries every engine extension except steady-state detection: **3.13×** PEC, **2.96×** UPML, **2.60×** Mur at 224³ — see §4.7/C2 |
+| *(prototype, opt-in)* | Trapezoidal temporal blocking of the update sweep, `OPENEMS_AVX2_TEMPORAL_BLOCK=<k>` | **3.2×–3.6×** on grids that exceed L3 (873 → 2805, 613 → 2171, 610 → 2194 MC/s). Bit-identical to the flat sweep. Carries every engine extension, since 2026-11-04 steady-state detection too (§4.12): **3.13×** PEC, **2.96×** UPML, **2.60×** Mur at 224³ — see §4.7/C2 |
 | `b39bd36` | Cheaper synchronisation in the blocked schedule (barrier elision, y-row split, optional spinning barrier, sync statistics), and a tile that leaves room for the coefficient tables | **1.6×–2.0×** over the previous blocked default on a 5 M-cell TL model, bit-identical — see §4.9 |
 
 **The multithreaded AVX2 engine is memory-bound and already at the host
@@ -796,7 +797,7 @@ enumeration, and the startup line names every extension that refused rather than
 just the first. It also declines when the grid already fits cache (measured a
 32% loss there) or when there are too few x-lines to tile. Verified: a 96³ run
 reports *"disabled, grid fits cache (20.25 MB of field state)"*, and a run with
-steady-state detection names that extension.
+steady-state detection named that extension (until 2026-11-04, §4.12).
 
 The paragraphs above describe the prototype as first landed, when the excitation
 was the only slab-capable extension. That is no longer the state; see below.
@@ -876,11 +877,13 @@ extension does not implement: a no-op call is free, the barrier after it is not.
 skips call and barrier together, cutting 42 to about 20 — worth **+14% on Mur,
 +7% on UPML**, and the numbers in the table above.
 
-**Steady-state detection is the one extension that genuinely cannot be
-blocked**, and it now says so rather than falling back silently. Its per-probe
-sampling would slab fine, but every period it integrates total energy over the
-whole grid, and a blocked schedule has no moment mid-block at which the whole
-grid is at one timestep.
+**Steady-state detection was taken to be the one extension that cannot be
+blocked**, and said so rather than falling back silently: every period it
+integrates total energy over the whole grid, and a blocked schedule has no
+moment mid-block at which the whole grid is at one timestep. That was too
+strong. Each slab can sum its share of that energy as it passes the timestep,
+and the check can wait for the end of the block; it does since 2026-11-04
+(§4.12).
 
 **The block depth is capped by the probe interval.** `openems.cpp` calls
 `IterateTS(step)` with the number of timesteps until the next probe or dump, and
@@ -902,7 +905,8 @@ lifts the two performance guards so this runs on a CI-sized grid.
 
 **What is still not blocked**, and why:
 
-- **Steady-state detection**, as above — a property of the method, not a gap.
+- ~~**Steady-state detection**, as above — a property of the method, not a
+  gap.~~ It was a gap, closed in §4.12.
 - **An absorbing sheet in the interior, normal to x.** The partition boundary
   between a core and its wedge sweeps one x-line per timestep, so it eventually
   falls between the line the sheet writes and the line it reads. No tile sizing
@@ -1319,6 +1323,55 @@ Details in PERFORMANCE.md §5.10; raw output in
   - D3: the barrier spin. It decides whether SMT pays off.
   - A set per L3 instance, e.g. for a 7950X3D's V-cache CCD.
   - macOS: a build and a run on a real Mac.
+
+### 4.12 Steady-state detection inside the blocked schedules (2026-11-04)
+
+C2 and C5 left one extension out, steady-state detection, and with it every
+model driven by a sine: the whole benchmark ran flat. Details and the
+analysis in `plans/STEADY_STATE_TEMPORAL_BLOCKING.md`, numbers in
+PERFORMANCE.md §5.11.
+
+- **The energy of a check is summed per slab.** Each slab passes the
+  timestep of a check once, holding there the flat sweep's values, and the
+  slabs of a timestep partition the grid. The AVX2 slab hook sums its rows
+  (x,y), the Vulkan slab sweep its x-planes, and the check runs at the end of
+  the block (AVX2, `Engine_Extension::SlabBlockEnd()`) or of the batch
+  (Vulkan). The flat paths sum the same rows and planes in the same order:
+  identical verdicts and stop timesteps, flat or blocked, any (k, W) and
+  thread count (`test_temporal_blocking.py`, `test_gpu_temporal_blocking.py`).
+- **The probes are recorded per slab**, into a ring of three periods indexed
+  by the absolute timestep, so the check can wait while the block records on.
+- **Cost**: one barrier per period on the AVX2 engine, and a hook with its
+  barrier in the three slabs per timestep that hold a probe line; on the GPU
+  one plane-sum dispatch and a barrier per slab at a check timestep.
+- **Measured** against `4b88dc7`, which ran these flat (PERFORMANCE.md
+  §5.11): AVX2 at k=13 antenna M 163 → 739, inhomogeneous M 228 → 882,
+  ideal L 598 → 1727 MC/s; Vulkan by default 4110 → 7944, 4425 → 9457,
+  5633 → 11392 MC/s.
+- **On the way:**
+  - the verdict is read after every batch instead of every 4 s (upstream
+    `277ade0`/`eb1c5ee`, with `--exact-endcriteria`);
+  - the probe positions are fixed (upstream `01efbdc`);
+  - the excitation and the detection use one rounded period; with a period
+    of 0.2 ns they disagree for 449 of the periods below 10000 timesteps, the
+    benchmark's cylindrical case among them;
+  - the GPU's energy of a check is that of its own timestep, which fixes a
+    phase error that kept GPU sine runs from stopping;
+  - the AVX2 fast energy sums rows in double (its single float accumulator
+    was 2e-5 off on a 40³ grid);
+  - a call of one timestep (Dirac, step) runs flat on both engines.
+- **Found, not fixed:**
+  - The Vulkan blocked schedule is not deterministic with conducting sheets:
+    on the benchmark's antenna case two blocked runs differ by 7e-4 and
+    blocked from flat by 3e-3, also on `4b88dc7` with a Gaussian pulse. With
+    the sheets as metal it is bit-identical. Before, sine runs were spared
+    by the refusal; now the antenna case blocks by default at M and L.
+  - The fork goes NaN on a series lumped RLC read from XML (`4b88dc7` too;
+    upstream's binary runs the file), so `test_lumped_rlc_and_port` fails
+    under the XML harness the tests use now.
+  - The benchmark's cylindrical case grows without bound over a long run
+    (energy ×10³⁵ in 120 000 timesteps); `4b88dc7`'s verdict stays at 0 dB
+    there too.
 
 ---
 

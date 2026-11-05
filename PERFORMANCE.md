@@ -74,6 +74,11 @@ This is the one-page answer. §2 onward is the detail and the method.
   kind of core as well as the schedule, on Linux, Windows and macOS without a
   library. On the TL model its pick runs **4.1×** faster than a run with no
   options on the i9-13900K: 8 P-cores, blocked (§5.10).
+- **Periodic excitations block too** (2026-11-04). A sine adds steady-state
+  detection, which both blocked schedules used to refuse, so every case of
+  the benchmark ran flat. Now blocking carries it with identical verdicts and
+  stop timesteps: antenna M on the CPU 163 → 739 MC/s, ideal L on the RX 6800
+  5633 → 11392 MC/s (§5.11).
 - **Thread auto-tune on many-core machines.** Upstream's search leaves
   **15–53%** on the table on the 32-thread host; the fork's default lands within
   3–5% of its own pinned optimum there, and 99–100% on the four-core host (§3.3).
@@ -726,10 +731,11 @@ Three properties make this usable rather than merely fast:
   startup line names every extension that declined.
 - **It carries the extensions**, not just the bare PEC kernel: UPML, Mur and
   local absorbing BCs, dispersive materials, lumped RLC and TF/SF plane-wave
-  sources all have slab paths. Steady-state detection is the one extension that
-  genuinely cannot be blocked — it integrates energy over the whole grid every
-  period, and a blocked schedule has no moment at which the whole grid is at one
-  timestep.
+  sources all have slab paths. So, since 2026-11-04, has the steady-state
+  detection a periodic excitation switches on, which was long taken to be
+  impossible because it integrates energy over the whole grid every period
+  (§5.11): each slab sums its share of that energy as it passes the timestep,
+  and the check waits for the end of the block.
 
 ### 5.2 CPU results
 
@@ -1339,8 +1345,8 @@ reports one third of that, because it counts only the fields.
 - **On by default.** Unless `OPENEMS_GPU_TEMPORAL_BLOCK` is set, a discrete
   GPU blocks when the grid's fields and coefficients exceed twice the tile
   target, with the deepest block the tile allows (k = W/2, up to 32).
-  `OPENEMS_GPU_TEMPORAL_BLOCK=0` turns it off. Only steady-state detection and
-  extensions that run on the CPU still refuse.
+  `OPENEMS_GPU_TEMPORAL_BLOCK=0` turns it off. Only extensions that run on the
+  CPU still refuse; steady-state detection did until 2026-11-04 (§5.11).
 
 Four races in the *flat* path turned up on the way, and are fixed:
 
@@ -1844,6 +1850,65 @@ Limits:
 Raw output: `python/Tests/results/cpu_threads_cores_2026-10-20.txt`. The test
 programs are in `tests/topology` and `tests/gpuprof` (`identity_threads.py`,
 `verify_cpu_settings.sh`).
+
+### 5.11 Steady-state detection inside the blocked schedules (2026-11-04)
+
+Every case of the benchmark uses a sine excitation, and a sine switches on
+steady-state detection, which both blocked schedules refused. So in the
+full fork-against-upstream benchmark of 2026-11-04 temporal blocking was off
+in every run, and on memory-bound grids the AVX2 engine ran at 0.83–1.0× of
+upstream's, Vulkan at 0.81–1.16× of HIP.
+
+The detection compares the probe records of the last two periods, and the
+field energy at the end of each period with that of the previous one. The
+energy was the obstacle: it is a sum over the whole grid at one timestep, and
+a blocked schedule never has the whole grid at one timestep. It does not need
+to. The slabs of one timestep partition the grid, and each slab passes the
+timestep of a check exactly once, holding there the values the flat sweep
+reads: its voltages after the update, its currents of the timestep before.
+So each slab sums its share as it passes, and the check waits for the end of
+the block. The sums are by row (x,y) on the CPU and by x-plane on the GPU,
+added in order, so blocked and flat runs reach the same verdicts in the same
+bits and stop at the same timestep
+(`plans/STEADY_STATE_TEMPORAL_BLOCKING.md`).
+
+Two fixes came with it. The verdict is read after every batch of timesteps,
+not with the status line every 4 s, so the stop timestep no longer depends on
+the machine (upstream `277ade0`). And on the GPU the energy of a check was
+taken at whichever batch boundary the verdict was asked for, not at the end
+of the period. In a driven steady state the energy ripples at twice the
+frequency, so the energy term floored at that ripple: on a lossy 200³ cavity
+the Vulkan verdict jumped between -55 and 0 dB and the run stopped at 22503
+timesteps, only once the 4 s status had locked onto 27 periods, where the
+CPU stopped at 10478. Now both stop at 10413, with blocking on: the GPU by
+default at 11350 MC/s (5615 flat before), the CPU at k=13 at 2450 MC/s (660
+flat before).
+
+Measured 2026-11-04 on the i9-13900K with the RX 6800, `bench.py run`,
+`4b88dc7` against this work interleaved, 8 threads, median of 3 runs of 3 s
+(spread at most 5.7 %), MC/s. Both binaries got the same options; `4b88dc7`
+refused blocking in every row (the steady-state detection), the new build
+blocked in every row. The processing interval of these cases caps k at 13
+(on the GPU the default asks for up to 32).
+
+| case | engine | `4b88dc7` | new | | schedule (new) | probes |
+|---|---|---|---|---|---|---|
+| antenna M | AVX2, `--avx2-temporal-block=13` | 163.0 | **739.3** | 4.54× | k=13, W=26 | identical |
+| antenna M | Vulkan, default | 4109.9 | **7943.5** | 1.93× | k=13, W=81 | 2.8e-3 (see below) |
+| inhomogeneous M | AVX2, `--avx2-temporal-block=13` | 227.9 | **882.0** | 3.87× | k=13, W=26 | identical |
+| inhomogeneous M | Vulkan, default | 4424.7 | **9456.6** | 2.14× | k=13, W=64 | identical |
+| ideal L | AVX2, `--avx2-temporal-block=13` | 597.7 | **1727.3** | 2.89× | k=8, W=16 | identical |
+| ideal L | Vulkan, default | 5632.9 | **11391.8** | 2.02× | k=13, W=27 | identical |
+
+The A column is the fork's flat speed of the baseline, which was 0.83–1.0×
+of upstream on the CPU and 0.81–1.16× of HIP on the GPU for these rows.
+Upstream was not rerun here.
+
+The antenna row's probe mismatch on the GPU is not the steady-state work: the
+Vulkan blocked schedule is not deterministic with conducting sheets (two
+blocked runs of the antenna case differ by 7e-4, also on `4b88dc7` with a
+Gaussian pulse; drawn as metal it is bit-identical). The refusal used to keep
+sine runs away from it; now the antenna case blocks by default at M and L.
 
 ---
 
