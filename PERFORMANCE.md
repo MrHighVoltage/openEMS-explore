@@ -1371,7 +1371,9 @@ run bit for bit. The cases:
 
 - Mur with lumped ports and RLC elements;
 - a TF/SF box;
-- PML with Mur and a Lorentz material, fused and unfused;
+- PML with Mur and a Lorentz material, fused and unfused (the unfused one
+  failed from 029a629, which put UPML's pre pass last on the flat separate
+  path only, until `9e22444` did the same in the slab sweep);
 - absorbing sheets: first-order normal to y, and super-absorbing, one of them
   normal to x on the tile edges;
 - the TL model itself, with Mur on six faces, two lumped ports and four probes.
@@ -1909,6 +1911,11 @@ Vulkan blocked schedule is not deterministic with conducting sheets (two
 blocked runs of the antenna case differ by 7e-4, also on `4b88dc7` with a
 Gaussian pulse; drawn as metal it is bit-identical). The refusal used to keep
 sine runs away from it; now the antenna case blocks by default at M and L.
+Fixed in `89f500d`: the dispersive apply dispatches of a slab ran without the
+barriers between them that the flat path has, and the two orders of a sheet
+hold the same cells. The antenna XS case is now bit-identical, blocked
+against flat and between blocked runs, sine and Gaussian, fused and separate
+UPML. Its speed was not measured again.
 
 ---
 

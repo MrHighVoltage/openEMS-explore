@@ -138,6 +138,11 @@ Two cautions carried from the CPU port:
   of its two orders, so an index-space split puts two subtractions on one cell
   in an unpredictable order. Split by x and derive each order's range from
   that.
+- The same holds across dispatches: two dispersive entries may hold one cell
+  (a sheet's orders, a multi-pole material's, a Lorentz and a Debye material
+  on their common face), and an apply pass rewrites all three components of
+  each of its cells. Their apply dispatches need a barrier between them in
+  every slab, as in the flat path; `88032e4` left it out, `89f500d` added it.
 - TF/SF adds into cells where two box faces meet. `b87a1f7` already gave each
   field index to one thread; the slab ranges must preserve that, not reopen it.
 

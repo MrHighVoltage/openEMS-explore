@@ -1361,11 +1361,17 @@ PERFORMANCE.md §5.11.
     was 2e-5 off on a 40³ grid);
   - a call of one timestep (Dirac, step) runs flat on both engines.
 - **Found, not fixed:**
-  - The Vulkan blocked schedule is not deterministic with conducting sheets:
+  - ~~The Vulkan blocked schedule is not deterministic with conducting sheets:
     on the benchmark's antenna case two blocked runs differ by 7e-4 and
     blocked from flat by 3e-3, also on `4b88dc7` with a Gaussian pulse. With
     the sheets as metal it is bit-identical. Before, sine runs were spared
-    by the refusal; now the antenna case blocks by default at M and L.
+    by the refusal; now the antenna case blocks by default at M and L.~~
+    Fixed in `89f500d`: the slab path recorded the dispersive apply
+    dispatches without the barriers the flat path has between them, and a
+    sheet's two orders hold the same cells (so do a multi-pole material's,
+    and a Lorentz and a Debye material's on their common face). Found with
+    it, `9e22444`: the blocked separate UPML path still ran UPML's pre pass
+    first, which 029a629 had moved last on the flat one only.
   - The fork goes NaN on a series lumped RLC read from XML (`4b88dc7` too;
     upstream's binary runs the file), so `test_lumped_rlc_and_port` fails
     under the XML harness the tests use now.

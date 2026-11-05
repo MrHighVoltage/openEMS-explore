@@ -173,21 +173,26 @@ both, the GPU its default. Probes are compared over the timesteps both did.
 | ideal L | AVX2, `--avx2-temporal-block=13` | 597.7 | **1727.3** | 2.89× | k=8, W=16 | identical |
 | ideal L | Vulkan, default | 5632.9 | **11391.8** | 2.02× | k=13, W=27 | identical |
 
-The antenna row's GPU mismatch is the conducting-sheet race below, not the
+The antenna row's GPU mismatch is the conducting-sheet race below (since
+fixed), not the
 steady-state work. A Dirac excitation with blocking asked for (`iterTS = 1`)
 runs flat, bit-identical to the flat run, at the flat speed (CPU 265 against
 252 MC/s, GPU 682 against 655 on a 64×32×32 grid).
 
 ### Open
 
-- **The Vulkan blocked schedule is not deterministic with conducting
+- ~~**The Vulkan blocked schedule is not deterministic with conducting
   sheets.** On the benchmark's antenna case (XS, 4:12), two blocked runs
   differ by 7e-4 and blocked from flat by 3e-3, also on `4b88dc7` with a
   Gaussian pulse; the flat path is reproducible, and with the sheets drawn as
   metal blocked is bit-identical to flat. `test_conducting_sheet` passes on its
   smaller model. Not caused by this work, but exposed by it: sine runs used to
   be refused, and the antenna case at M and L now blocks by default. Look at
-  the two-order dispersive slab dispatches (`RecordDispersiveSlabPhase()`).
+  the two-order dispersive slab dispatches (`RecordDispersiveSlabPhase()`).~~
+  Fixed in `89f500d`: that function recorded the apply dispatches of all
+  dispersive entries without a barrier between them, and the two orders of a
+  sheet hold the same cells. `test_conducting_sheet` passed because it drew
+  the sheet as a box, which the operator turns into PEC.
 - The fork goes NaN on a series lumped RLC read from XML (see Tests).
 - The cylindrical benchmark case grows without bound in a long run (see
   E3); `4b88dc7` behaves the same as far as its verdict shows. Not looked
