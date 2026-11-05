@@ -4164,12 +4164,30 @@ Engine_Vulkan::DumpSlot* Engine_Vulkan::TakeDumpSlot(unsigned int ts, unsigned i
 		if (s.ts == ts)
 			return &s;
 
-	// The emptiest, then oldest, slot nobody will read again.
+	// The emptiest, then oldest, slot nobody will read again: neither one the
+	// processing may still read (from keepFrom on) nor one a dump's thread
+	// holds (HoldDumpGather()).  With every slot made and none free, wait for
+	// those threads to let one go.  Only this thread adds holds, so none
+	// appear while it waits.
 	auto age = [](const DumpSlot& s) { return s.ts == UINT_MAX ? 0ull : (unsigned long long)s.ts + 1; };
 	DumpSlot* pick = nullptr;
-	for (DumpSlot& s : m_dumpSlots)
-		if ((s.ts == UINT_MAX || s.ts < keepFrom) && (!pick || age(s) < age(*pick)))
-			pick = &s;
+	{
+		std::unique_lock<std::mutex> lock(m_dumpHoldMutex);
+		for (;;)
+		{
+			bool anyHeld = false;
+			for (DumpSlot& s : m_dumpSlots)
+			{
+				const bool held = m_dumpHolds[&s - m_dumpSlots.data()] > 0;
+				anyHeld |= held;
+				if ((s.ts == UINT_MAX || s.ts < keepFrom) && !held && (!pick || age(s) < age(*pick)))
+					pick = &s;
+			}
+			if (pick || m_dumpSlots.size() < MAX_DUMP_SLOTS || !anyHeld)
+				break;
+			m_dumpHoldFreed.wait(lock);
+		}
+	}
 	if (!pick && m_dumpSlots.size() < MAX_DUMP_SLOTS)
 	{
 		DumpSlot s;
@@ -4351,6 +4369,26 @@ const float* Engine_Vulkan::AcquireDumpGather(int id, unsigned int ts)
 	});
 	slot->has[id] = 1;
 	return slot->mapped + d.slotOff;
+}
+
+std::shared_ptr<const float> Engine_Vulkan::HoldDumpGather(int id, unsigned int ts)
+{
+	const float* data = AcquireDumpGather(id, ts);
+	if (!data)
+		return nullptr;
+	for (size_t i = 0; i < m_dumpSlots.size(); ++i)
+		if (m_dumpSlots[i].ts == ts)
+		{
+			std::lock_guard<std::mutex> lock(m_dumpHoldMutex);
+			++m_dumpHolds[i];
+			return std::shared_ptr<const float>(data, [this, i](const float*)
+			{
+				std::lock_guard<std::mutex> lock(m_dumpHoldMutex);
+				if (--m_dumpHolds[i] == 0)
+					m_dumpHoldFreed.notify_all();
+			});
+		}
+	return nullptr;
 }
 
 bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)

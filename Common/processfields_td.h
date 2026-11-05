@@ -45,7 +45,11 @@ public:
 protected:
 	int pad_length;
 	unsigned int m_asyncBuffers;
-	AsyncFieldWriter* m_AsyncWriter;
+	//! With the GPU gathering this dump's cells: the thread that interpolates
+	//! them, so that the main thread can drive the GPU on.
+	AsyncFieldWriter* m_GatherCalc;
+	//! The slots this dump added to the writer of the files.
+	int m_fileWriterSlots;
 };
 
 #endif // PROCESSFIELDS_TD_H

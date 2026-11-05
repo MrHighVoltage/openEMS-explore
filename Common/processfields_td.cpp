@@ -28,6 +28,17 @@
 
 using namespace std;
 
+// The one thread that writes the files of all time-domain dumps, with
+// m_asyncBuffers slots from each.  The dumps' own threads (m_GatherCalc)
+// would otherwise take turns on HDF5, which serializes every call
+// (HDF5_GlobalMutex()): every turn wakes a sleeping thread, and that takes
+// longer than a small write.
+static AsyncFieldWriter& FileWriter()
+{
+	static AsyncFieldWriter* writer = new AsyncFieldWriter(0);  // never deleted: no joining at exit
+	return *writer;
+}
+
 ProcessFieldsTD::ProcessFieldsTD(Engine_Interface_Base* eng_if) : ProcessFields(eng_if)
 {
 	pad_length = 8;
@@ -35,13 +46,20 @@ ProcessFieldsTD::ProcessFieldsTD(Engine_Interface_Base* eng_if) : ProcessFields(
 	// A/B gate: OPENEMS_ASYNC_DUMP_BUFFERS=0 falls back to synchronous writes.
 	if (const char* env = std::getenv("OPENEMS_ASYNC_DUMP_BUFFERS"))
 		m_asyncBuffers = (unsigned int)std::max(0, atoi(env));
-	m_AsyncWriter = NULL;
+	m_GatherCalc = NULL;
+	m_fileWriterSlots = 0;
 }
 
 ProcessFieldsTD::~ProcessFieldsTD()
 {
-	delete m_AsyncWriter;
-	m_AsyncWriter = NULL;
+	// the queued writes use the file writers, which ProcessFields deletes
+	delete m_GatherCalc;
+	m_GatherCalc = NULL;
+	if (m_fileWriterSlots > 0)
+	{
+		FileWriter().Flush();
+		FileWriter().AddCapacity(-m_fileWriterSlots);
+	}
 }
 
 void ProcessFieldsTD::InitProcess()
@@ -59,19 +77,22 @@ void ProcessFieldsTD::InitProcess()
 		m_HDF5_Dump_File->OpenFile();
 	}
 
-	if (m_asyncBuffers > 0)
-	{
-		delete m_AsyncWriter;
-		m_AsyncWriter = new AsyncFieldWriter(m_asyncBuffers);
-	}
-
 	RegisterGPUGather(m_DumpType);
+
+	delete m_GatherCalc;
+	m_GatherCalc = NULL;
+	if ((m_asyncBuffers > 0) && (m_gpuGather >= 0))
+		m_GatherCalc = new AsyncFieldWriter(m_asyncBuffers);
+	FileWriter().AddCapacity((int)m_asyncBuffers - m_fileWriterSlots);
+	m_fileWriterSlots = (int)m_asyncBuffers;
 }
 
 void ProcessFieldsTD::FlushData()
 {
-	if (m_AsyncWriter)
-		m_AsyncWriter->Flush();
+	if (m_GatherCalc)
+		m_GatherCalc->Flush();
+	if (m_asyncBuffers > 0)
+		FileWriter().Flush();
 	if (m_HDF5_Dump_File)
 		m_HDF5_Dump_File->FlushFile();
 }
@@ -83,25 +104,27 @@ int ProcessFieldsTD::Process()
 
 	string filename = m_filename;
 
-	std::shared_ptr<AsyncFieldWriter::FieldArray> field =
-		std::make_shared<AsyncFieldWriter::FieldArray>("TD_field", numLines);
-	bool success = CalcField(*field);
+	std::shared_ptr<AsyncFieldWriter::FieldArray> field = std::make_shared<AsyncFieldWriter::FieldArray>();
+	// The cells the GPU gathered for this timestep, held: m_GatherCalc
+	// interpolates them, while this thread drives the GPU on.
+	std::shared_ptr<const float> gathered = m_GatherCalc ? HoldGPUFootprint() : nullptr;
+	bool success = gathered || CalcField(*field);
 
-	if (m_AsyncWriter)
+	if (m_asyncBuffers > 0)
 	{
+		AsyncFieldWriter::WriteFunc write;
 		if (m_fileType==VTK_FILETYPE)
 		{
 			unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
 			std::string fieldName = GetFieldNameByType(m_DumpType);
 			VTK_File_Writer* vtkWriter = m_Vtk_Dump_File;
-			m_AsyncWriter->Submit(field,
-				[vtkWriter, ts, fieldName](AsyncFieldWriter::FieldArray &data) -> bool
+			write = [vtkWriter, ts, fieldName](AsyncFieldWriter::FieldArray &data) -> bool
 				{
 					vtkWriter->SetTimestep(ts);
 					vtkWriter->ClearAllFields();
 					vtkWriter->AddVectorField(fieldName, data);
 					return vtkWriter->Write();
-				});
+				};
 		}
 		else if (m_fileType==HDF5_FILETYPE)
 		{
@@ -109,21 +132,34 @@ int ProcessFieldsTD::Process()
 			unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
 			float time = (float)m_Eng_Interface->GetTime(m_dualTime);
 			HDF5_File_Writer* hdf5Writer = m_HDF5_Dump_File;
-			m_AsyncWriter->Submit(field,
-				[hdf5Writer, padLength, ts, time](AsyncFieldWriter::FieldArray &data) -> bool
+			write = [hdf5Writer, padLength, ts, time](AsyncFieldWriter::FieldArray &data) -> bool
 				{
 					stringstream ss;
 					ss << std::setw(padLength) << std::setfill('0') << ts;
 					bool ok = hdf5Writer->WriteVectorField<float>(ss.str(), data, g_settings.GetLegacyHDF5Dumps());
 					ok &= hdf5Writer->WriteAttribute("/FieldData/TD/"+ss.str(), "time", time);
 					return ok;
-				});
+				};
 		}
 		else
 		{
 			success = false;
 			cerr << "ProcessFieldsTD::Process: unknown File-Type" << endl;
 		}
+		if (write && gathered)
+		{
+			const DumpType type = m_DumpType;
+			m_GatherCalc->Submit(field, [this, type, gathered, field, write](AsyncFieldWriter::FieldArray &data) mutable -> bool
+				{
+					const bool ok = CalcFieldFromFootprint(data, type, gathered.get(), 1);
+					gathered.reset();  // the GPU may reuse the ring slot
+					if (ok)
+						FileWriter().Submit(field, write);
+					return ok;
+				});
+		}
+		else if (write)
+			FileWriter().Submit(field, write);
 	}
 	else if (m_fileType==VTK_FILETYPE)
 	{

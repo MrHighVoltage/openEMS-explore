@@ -22,6 +22,9 @@
 #include <algorithm>
 #include <string>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 
 class Operator_Ext_Excitation;
 class Operator_Ext_UPML;
@@ -201,6 +204,10 @@ public:
 	//! The footprint of dump `id` at timestep ts, as [n][a][b][c] floats, or
 	//! nullptr if the GPU no longer holds that timestep.
 	const float* AcquireDumpGather(int id, unsigned int ts);
+	//! As AcquireDumpGather(), but the ring slot is not reused until the last
+	//! copy of the handle is gone, so another thread may read it meanwhile.
+	//! A batch that needs the slot waits for that.
+	std::shared_ptr<const float> HoldDumpGather(int id, unsigned int ts);
 	//! Account for timestep ts in the DFT of dump `id`: the batch ending there
 	//! normally added it already, otherwise it is added now.  False if the GPU
 	//! no longer holds that timestep.
@@ -879,6 +886,11 @@ private:
 		std::vector<char> has;      //!< per dump: gathered into this slot
 	};
 	static constexpr size_t MAX_DUMP_SLOTS = 8;
+	//! Per ring slot (index into m_dumpSlots): the handles HoldDumpGather()
+	//! gave out and other threads may still read; guarded by m_dumpHoldMutex.
+	unsigned int m_dumpHolds[MAX_DUMP_SLOTS] = {};
+	std::mutex m_dumpHoldMutex;
+	std::condition_variable m_dumpHoldFreed;
 	std::vector<DumpReg>  m_dumps;
 	std::vector<DumpSlot> m_dumpSlots;
 	bool         m_dumpReady = false;    //!< buffers, pipelines and sets exist; registration closed
@@ -905,7 +917,8 @@ private:
 	void EnsureDumpResources();
 	VkDescriptorSet AllocDumpSet(VkBuffer out, VkDeviceSize outBytes);
 	//! The ring slot for timestep ts: the one holding it already, else an
-	//! empty one or one older than keepFrom.  Null if no slot can be made.
+	//! empty one or one older than keepFrom that nobody holds, waiting for a
+	//! held one if need be.  Null if no slot can be made.
 	DumpSlot* TakeDumpSlot(unsigned int ts, unsigned int keepFrom);
 	void WaitDumpSlot(DumpSlot& slot) const;
 	DumpPC DumpPushConstants(const DumpReg& d) const;

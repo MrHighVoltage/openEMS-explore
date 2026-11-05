@@ -435,6 +435,17 @@ bool ProcessFields::CalcFieldFromFootprint(ArrayLib::ArrayNIJK<FDTD_FLOAT> &fiel
 	return true;
 }
 
+std::shared_ptr<const float> ProcessFields::HoldGPUFootprint()
+{
+#ifdef WITH_GPU
+	Engine_Vulkan* vk = GetVulkanEngine();
+	const unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+	if (vk && (m_gpuGather>=0) && !vk->HostFieldsAt(ts))
+		return vk->HoldDumpGather(m_gpuGather, ts);
+#endif
+	return nullptr;
+}
+
 bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field)
 {
 	field.Init("Field", numLines);

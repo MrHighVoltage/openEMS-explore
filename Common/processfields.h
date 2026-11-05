@@ -21,6 +21,7 @@
 #include "processing.h"
 #include "tools/array_ops.h"
 #include "tools/arraylib/array_nijk.h"
+#include <memory>
 
 
 class VTK_File_Writer;
@@ -128,6 +129,10 @@ protected:
 	//! CalcField() for \a type from a gathered footprint.  A \a stride of 2
 	//! reads one part of interleaved complex values.
 	bool CalcFieldFromFootprint(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field, DumpType type, const float* data, unsigned int stride);
+	//! The footprint the GPU gathered at the current timestep, held for
+	//! CalcFieldFromFootprint() on another thread (see
+	//! Engine_Vulkan::HoldDumpGather()); null if CalcField() has to do.
+	std::shared_ptr<const float> HoldGPUFootprint();
 };
 
 #endif // PROCESSFIELDS_H

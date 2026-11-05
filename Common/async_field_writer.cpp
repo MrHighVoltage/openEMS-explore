@@ -16,20 +16,17 @@
 */
 
 #include "async_field_writer.h"
+#include <algorithm>
 #include <iostream>
 
 using std::cerr;
 using std::endl;
 
 AsyncFieldWriter::AsyncFieldWriter(unsigned int numBuffers)
-	: m_capacity(numBuffers < 1 ? 1 : numBuffers)
-	, m_head(0)
-	, m_tail(0)
-	, m_count(0)
+	: m_capacity((int)numBuffers)
 	, m_inFlight(0)
 	, m_stop(false)
 {
-	m_ring.resize(m_capacity);
 	m_thread = std::thread(&AsyncFieldWriter::WriterLoop, this);
 }
 
@@ -50,29 +47,33 @@ void AsyncFieldWriter::Submit(std::shared_ptr<FieldArray> field, WriteFunc write
 	std::unique_lock<std::mutex> lock(m_mutex);
 
 	// Block until a slot is available (back-pressure)
-	m_notFull.wait(lock, [this]() { return m_count < m_capacity; });
+	m_notFull.wait(lock, [this]() { return (int)m_jobs.size() < std::max(1, m_capacity); });
 
-	Job& job = m_ring[m_head];
-	job.field = std::move(field);
-	job.writeFunc = std::move(writeFunc);
-
-	m_head = (m_head + 1) % m_capacity;
-	++m_count;
+	m_jobs.push_back(Job{std::move(field), std::move(writeFunc)});
 
 	lock.unlock();
 	m_notEmpty.notify_one();
 }
 
+void AsyncFieldWriter::AddCapacity(int delta)
+{
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_capacity += delta;
+	}
+	m_notFull.notify_all();
+}
+
 void AsyncFieldWriter::Flush()
 {
 	std::unique_lock<std::mutex> lock(m_mutex);
-	m_flushed.wait(lock, [this]() { return m_count == 0 && m_inFlight == 0; });
+	m_flushed.wait(lock, [this]() { return m_jobs.empty() && m_inFlight == 0; });
 }
 
 unsigned int AsyncFieldWriter::PendingCount() const
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	return m_count;
+	return (unsigned int)m_jobs.size();
 }
 
 void AsyncFieldWriter::WriterLoop()
@@ -84,14 +85,13 @@ void AsyncFieldWriter::WriterLoop()
 		// Wait for a job
 		{
 			std::unique_lock<std::mutex> lock(m_mutex);
-			m_notEmpty.wait(lock, [this]() { return m_count > 0 || m_stop; });
+			m_notEmpty.wait(lock, [this]() { return !m_jobs.empty() || m_stop; });
 
-			if (m_count == 0 && m_stop)
+			if (m_jobs.empty() && m_stop)
 				return; // No more work, thread exits
 
-			job = std::move(m_ring[m_tail]);
-			m_tail = (m_tail + 1) % m_capacity;
-			--m_count;
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
 			++m_inFlight;
 		}
 
@@ -116,7 +116,7 @@ void AsyncFieldWriter::WriterLoop()
 		{
 			std::lock_guard<std::mutex> lock(m_mutex);
 			--m_inFlight;
-			if (m_count == 0 && m_inFlight == 0)
+			if (m_jobs.empty() && m_inFlight == 0)
 				m_flushed.notify_all();
 		}
 	}
