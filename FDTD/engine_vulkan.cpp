@@ -2362,10 +2362,11 @@ void Engine_Vulkan::SetupGPU_Dispersive()
 			// Safe across the two orders of a conducting sheet even though both
 			// carry the *identical* position list and both subtract from the
 			// same engine cell: each order is its own dispatch, the two run in
-			// sequence separated by a barrier, and sorting identical lists by
-			// the same key gives both the same permutation. So a cell still
-			// sees order 0 then order 1, which is what the flat path does and
-			// what makes the result independent of the reordering.
+			// sequence separated by a barrier (RecordDispersiveSlabPhase()
+			// records it between the apply dispatches of a slab), and sorting
+			// identical lists by the same key gives both the same permutation.
+			// So a cell still sees order 0 then order 1, which is what the flat
+			// path does and what makes the result independent of the reordering.
 			std::vector<uint32_t> perm(cnt);
 			for (uint32_t i = 0; i < cnt; i++)
 				perm[i] = i;
@@ -4943,6 +4944,20 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 	                          : (isVolt ? m_dispPreVoltPipeline   : m_dispPreCurrPipeline);
 	VkPipelineLayout layout = isApply ? m_dispApplyPipeLayout : m_dispPrePipeLayout;
 
+	// Two entries may hold the same cell: the orders of a conducting sheet or
+	// of a multi-pole material carry the same position list, and a cell on
+	// the face between two dispersive materials is in both lists when its
+	// components lie in different ones.  An apply pass rewrites all three
+	// components of each of its cells (field -= ADE, also where its ADE is
+	// zero), so two of them in flight at once lose one update or apply the
+	// two in either order.  They run one after the other, as in the flat
+	// path and in its order: the Lorentz entries, then Debye.  The pre passes
+	// only read the field and each writes its own state, so they need none.
+	VkMemoryBarrier barrier{};
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
 	bool any = false;
 	for (const auto& d : m_gpuDisp)
 	{
@@ -4951,6 +4966,8 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 		const uint32_t b = d.xStart[x0], e = d.xStart[x1];
 		if (e <= b)
 			continue;
+		if (isApply && any)
+			CmdComputeBarrier(cmd, barrier);
 
 		// The apply pass takes hasLorADE = 0 in the flat path, so keep that.
 		DispPC pc = isApply ? DispPC{d.count, numLines[0], numLines[1], numLines[2], 0}
@@ -4967,13 +4984,13 @@ bool Engine_Vulkan::RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, in
 		vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
 		any = true;
 	}
-	// Debye cells are not Lorentz cells, so the two need no barrier between them
 	if (isVolt)
-		any = RecordDebyeVoltPhase(cmd, isApply, x0, x1, false) || any;
+		any = RecordDebyeVoltPhase(cmd, isApply, x0, x1, false, isApply && any) || any;
 	return any;
 }
 
-bool Engine_Vulkan::RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach) const
+bool Engine_Vulkan::RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach,
+                                         bool barrierBefore) const
 {
 	VkMemoryBarrier barrier{};
 	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -4993,6 +5010,8 @@ bool Engine_Vulkan::RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0
 				continue;
 		}
 		const uint32_t n = (x0 >= 0) ? pc.entryEnd - pc.entryBase : d.count;
+		if (barrierBefore)
+			CmdComputeBarrier(cmd, barrier);
 		if (!any)
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 			                  apply ? m_debyeApplyVoltPipeline : m_debyePreVoltPipeline);

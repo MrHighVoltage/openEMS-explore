@@ -487,13 +487,18 @@ private:
 
 	//! Record the dispersive dispatches of one phase over [x0,x1).
 	//! `phase` is 0=pre-volt, 1=apply-volt, 2=pre-curr, 3=apply-curr.
-	//! Returns true if anything was dispatched, so the caller can skip a
-	//! barrier it does not need.
+	//! The apply dispatches are separated by barriers, as in the flat path,
+	//! since two entries may hold the same cell; the barrier after the last
+	//! is the caller's.  Returns true if anything was dispatched, so the
+	//! caller can skip a barrier it does not need.
 	bool RecordDispersiveSlabPhase(VkCommandBuffer cmd, int phase, int x0, int x1) const;
 	//! The Debye entries of m_gpuDisp: the pre pass (\a apply false) or the post+apply
 	//! pass, all entries (x0 < 0) or those of the slab [x0,x1); returns whether it dispatched.
-	//! With \a barrierEach, a barrier follows every dispatch, as in the flat apply loops.
-	bool RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach) const;
+	//! With \a barrierEach, a barrier follows every dispatch, as in the flat apply loops;
+	//! with \a barrierBefore, one precedes every dispatch, as the slab apply pass needs
+	//! after Lorentz dispatches that may share its cells.
+	bool RecordDebyeVoltPhase(VkCommandBuffer cmd, bool apply, int x0, int x1, bool barrierEach,
+	                          bool barrierBefore = false) const;
 
 	//! Push constant struct for UPML shaders.  The trailing slab range
 	//! defaults to "everything", so the flat path is unaffected.
