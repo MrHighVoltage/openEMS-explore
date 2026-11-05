@@ -209,8 +209,8 @@ runs flat, bit-identical to the flat run, at the flat speed (CPU 265 against
 
 ## The analysis, before the work
 
-Read-only analysis by a research subagent, 2026-11-04. Fork `/home/georg/workspaces_git/openEMS`
-at `4b88dc7`; upstream = `openEMS-pr` `upstream/master` = `5fecbb5`. Nothing was built or run, and
+Read-only analysis by a research subagent, 2026-11-04. Fork at `4b88dc7`; upstream at
+`5fecbb5`. Nothing was built or run, and
 the GPU was not used. All line numbers are in the fork unless marked `upstream:`. Three claims
 were checked afterwards against the code: FTZ/DAZ, the probe positions, and the 4 s verdict read.
 
