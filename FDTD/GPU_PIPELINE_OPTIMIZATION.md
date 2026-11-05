@@ -117,6 +117,21 @@ timestep is older than the one the outermost `IterateTS()` started from.
 At timestep 0, where no batch ends on the dump, it gathers on the spot
 (`AcquireDumpGather()`) while the GPU still holds the timestep.
 
+**Off the main thread.**  The main thread drives the GPU, so whatever it
+spends on a dump the GPU waits for once its batch is done.  A time-domain
+dump therefore only takes a handle on its ring slot (`HoldDumpGather()`)
+and leaves the interpolation to a thread of its own (`m_GatherCalc` in
+`processfields_td.cpp`), which releases the slot when it is done; a batch
+that needs a held slot waits for that.  The interpolation splits over the
+(x,y) lines on persistent worker threads that several callers share
+(`FieldCalc::ThreadPool`), at least 1024 nodes a part, and one thread
+writes the files of all dumps, so that the dumps never take turns on HDF5.
+`DrainGPU()` polls the fence for up to 2 ms before it blocks: a sleeping
+thread takes longer to wake up than a small grid's batch.  On the RX 6800,
+the benchmark's NF2FF box (12 faces every 13 timesteps) went from 2530 to
+13300 MCells/s on 100³ (ideal case, 14500 without dumps) and from 372 to
+2190 on 37³; the dumps are bit-identical.
+
 Frequency-domain dumps (FD, NF2FF boxes, SAR) go further: `dump_dft.comp`
 adds the footprint times the sample's DFT weight (computed on the host by
 the same `ProcessFieldsFD::DFTWeight()` as on the CPU) to running sums kept
