@@ -275,19 +275,23 @@ class GPUTemporalBlockingTest(unittest.TestCase):
                         "fused and unfused blocked PML disagree: max |delta| = %g"
                         % float(np.max(np.abs(fused_E - unfused_E))))
 
-    def _compare(self, tag, boundary, extra_setup):
-        """Run flat vs blocked with the same geometry and compare."""
-        _, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_setup=extra_setup)
+    def _compare(self, tag, boundary, extra_setup, runs=1, extra_env=None):
+        """Run flat vs blocked with the same geometry and compare, the
+        blocked side `runs` times.  Returns the last blocked run's output."""
+        _, flat_E, flat_H = _run(tag + "_flat", boundary, None, extra_env, extra_setup=extra_setup)
         self.assertGreater(float(np.max(np.abs(flat_E))), 0.0,
                            "flat run for %s produced an all-zero field" % tag)
-        out, E, H = _run(tag + "_blocked", boundary, BLOCK_ENV, extra_setup=extra_setup)
-        self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
-        self.assertTrue(np.array_equal(flat_E, E),
-                        "%s: blocked E differs from flat, max |delta| = %g"
-                        % (tag, float(np.max(np.abs(flat_E - E)))))
-        self.assertTrue(np.array_equal(flat_H, H),
-                        "%s: blocked H differs from flat, max |delta| = %g"
-                        % (tag, float(np.max(np.abs(flat_H - H)))))
+        for r in range(runs):
+            out, E, H = _run("%s_blocked%d" % (tag, r), boundary, BLOCK_ENV, extra_env,
+                             extra_setup=extra_setup)
+            self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+            self.assertTrue(np.array_equal(flat_E, E),
+                            "%s: blocked E differs from flat, max |delta| = %g"
+                            % (tag, float(np.max(np.abs(flat_E - E)))))
+            self.assertTrue(np.array_equal(flat_H, H),
+                            "%s: blocked H differs from flat, max |delta| = %g"
+                            % (tag, float(np.max(np.abs(flat_H - H)))))
+        return out
 
     def test_drude(self):
         """A dispersive (Drude) block straddling a tile boundary."""
@@ -301,17 +305,57 @@ class GPUTemporalBlockingTest(unittest.TestCase):
             """ % (OBJ_X_LO, OBJ_X_HI))
 
     def test_conducting_sheet(self):
-        """The two-order case.
+        """The two-order case: a sheet normal to z, across every tile edge.
 
         Operator_Ext_ConductingSheet pushes the *identical* position list into
         both of its orders, so one engine cell is written once per order. The
-        x-sort has to give both orders the same permutation, or a cell sees the
-        two subtractions in the wrong order and the result drifts.
+        x-sort has to give both orders the same permutation, and the two apply
+        dispatches of a slab need a barrier between them, or a cell sees the
+        two subtractions in either order, or only one. Without the barrier two
+        blocked runs differed from each other and from the flat sweep by up to
+        2e-3 of the peak field. (The sheet has to be 2D: a box is turned into PEC, which is what
+        this test used to draw.) Run twice, since a race can come out right.
         """
-        self._compare("sheet", ["PEC"] * 6, """
+        setup = """
             sheet = CSX.AddConductingSheet("sheet", conductivity=5.8e7, thickness=1e-6)
-            sheet.AddBox([xl[%d], yl[10], zl[10]], [xl[%d], yl[22], zl[22]], priority=5)
-            """ % (OBJ_X_LO, OBJ_X_HI))
+            sheet.AddBox([xl[4], yl[4], zl[26]], [xl[59], yl[27], zl[26]], priority=5)
+            """
+        out = self._compare("sheet", ["PEC"] * 6, setup, runs=2)
+        self.assertNotIn("fallback to PEC", out, "the sheet is not a sheet")
+
+    def test_lorentz_two_poles(self):
+        """A two-pole Lorentz block: both orders list the same cells, as a
+        sheet's do, so its apply dispatches race the same way without the
+        barrier, and lost updates there grow to the size of the field."""
+        self._compare("lor2", ["PEC"] * 6, """
+            from CSXCAD.CSProperties import CSPropLorentzMaterial
+            mat = CSPropLorentzMaterial(CSX.GetParameterSet(), epsilon=2.0, order=2)
+            CSX.AddProperty(mat)
+            mat.SetName("lor2")
+            mat.SetDispersiveMaterialProperty(0, eps_plasma=5e9, eps_pole_freq=3e9, eps_relax=1e-9)
+            mat.SetDispersiveMaterialProperty(1, eps_plasma=4e9, eps_relax=2e-10)
+            mat.AddBox([xl[10], yl[6], zl[6]], [xl[54], yl[26], zl[26]], priority=5)
+            """, runs=2)
+
+    def test_lorentz_debye_interface(self):
+        """One-cell layers of a Lorentz (priority 6) and a Debye material
+        alternating in z: on every interface plane a cell has Ex and Ey in the
+        Lorentz layer and Ez in the Debye one, so both extensions list it and
+        both apply passes rewrite all three of its components."""
+        self._compare("lordeb", ["PEC"] * 6, """
+            from CSXCAD.CSProperties import CSPropLorentzMaterial, CSPropDebyeMaterial
+            lor = CSPropLorentzMaterial(CSX.GetParameterSet(), epsilon=2.0, order=1)
+            CSX.AddProperty(lor)
+            lor.SetName("lor")
+            lor.SetDispersiveMaterialProperty(0, eps_plasma=5e9, eps_pole_freq=3e9, eps_relax=1e-9)
+            deb = CSPropDebyeMaterial(CSX.GetParameterSet(), order=1, epsilon=4)
+            CSX.AddProperty(deb)
+            deb.SetName("debye")
+            deb.SetDispersiveMaterialProperty(0, eps_delta=1, eps_relax=1 / (2 * np.pi * 4e9))
+            for z in range(4, 28, 2):
+                lor.AddBox([xl[6], yl[4], zl[z]], [xl[58], yl[27], zl[z + 1]], priority=6)
+                deb.AddBox([xl[6], yl[4], zl[z + 1]], [xl[58], yl[27], zl[z + 2]], priority=5)
+            """, runs=2)
 
     def test_drude_with_pml(self):
         """Dispersive material and UPML together, since they share the sweep."""
@@ -337,6 +381,21 @@ class GPUTemporalBlockingTest(unittest.TestCase):
         """Mur on the x faces, UPML on the others: the Mur faces reach into
         the PML regions, where the order of the two extensions matters."""
         self._compare("mur_pml", ["MUR", "MUR", "PML_8", "PML_8", "PML_8", "PML_8"], "")
+
+    def test_unfused_pml_order(self):
+        """Mur on the x faces and a two-pole Lorentz block reaching into the
+        PML of the others, through the separate UPML dispatches: both read
+        the field in the PML cells before UPML's pre pass swaps it for its
+        flux, in the blocked schedule as in the flat one."""
+        self._compare("pmlorder", ["MUR", "MUR", "PML_8", "PML_8", "PML_8", "PML_8"], """
+            from CSXCAD.CSProperties import CSPropLorentzMaterial
+            mat = CSPropLorentzMaterial(CSX.GetParameterSet(), epsilon=2.0, order=2)
+            CSX.AddProperty(mat)
+            mat.SetName("lor2")
+            mat.SetDispersiveMaterialProperty(0, eps_plasma=5e9, eps_pole_freq=3e9, eps_relax=1e-9)
+            mat.SetDispersiveMaterialProperty(1, eps_plasma=4e9, eps_relax=2e-10)
+            mat.AddBox([xl[%d], yl[2], zl[2]], [xl[%d], yl[29], zl[29]], priority=5)
+            """ % (OBJ_X_LO, OBJ_X_HI), extra_env={"OPENEMS_GPU_DISABLE_FUSED_UPML": "1"})
 
     def test_lumped_rlc_and_port(self):
         """A series RLC straddling a tile boundary, and a resistor on the
