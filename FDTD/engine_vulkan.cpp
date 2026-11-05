@@ -3899,6 +3899,16 @@ void Engine_Vulkan::RecordCurrentExtensions(VkCommandBuffer cmd, uint32_t ts) co
 	}
 }
 
+// A blocking wait sleeps, and waking up takes longer than a small grid's
+// batch: poll the fence first, for up to 2 ms (2x the speed at 37^3).
+static void WaitFence(VkDevice device, VkFence fence)
+{
+	const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+	while ((vkGetFenceStatus(device, fence) == VK_NOT_READY) && (std::chrono::steady_clock::now() < end))
+		;
+	vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+}
+
 void Engine_Vulkan::DrainGPU() const
 {
 	if (m_gpuDrained) return;  // Already drained — skip redundant fence syscalls
@@ -3907,7 +3917,7 @@ void Engine_Vulkan::DrainGPU() const
 		if (m_gpuInFlight[i])
 		{
 			auto t0 = std::chrono::steady_clock::now();
-			vkWaitForFences(m_device, 1, &m_fences[i], VK_TRUE, UINT64_MAX);
+			WaitFence(m_device, m_fences[i]);
 			auto t1 = std::chrono::steady_clock::now();
 			if (m_profileEnabled)
 			{
