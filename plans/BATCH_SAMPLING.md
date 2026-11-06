@@ -413,9 +413,10 @@ fields.
 The default `IterateSampledTS()` does item 4 with `IterateTS()` up to each
 sample timestep, `SampleFootprint()` (the engine's own `GetVolt()`/`GetCurr()`)
 and `CalcBatchEnergy()`. An engine that samples inside its blocks overrides it
-and returns true from `SamplesInsideBlocks()`; the benchmark then takes the
-batch length, not the longest gap between samples, as the depth the probes
-allow.
+and returns true from `SamplesInsideBlocks()`; `RunFDTD()` then starts every
+batch at `max(bsMinLen, GetPreferredBatchLength())` (`bsMaxLen` in openems.cpp),
+so the gaps between samples no longer cap the batch depth anywhere — not only
+in `--benchmark`.
 
 ### 4.3 What a sample is
 
@@ -714,34 +715,56 @@ Also identical with `OPENEMS_BATCH_SAMPLING_RING` 1 and 2, on `--engine=avx2`,
 and against the `1922d00` binary (old loop and in-batch sampling, default
 precision). The blocked runs block exactly as deep as before (e.g. 341 of 350
 timesteps for the old loop, 365 of 375 for the new one, which ran on to its
-batch end). `test_temporal_blocking.py` passes (15). `--benchmark` runs and
-reports "probes every 3 timesteps cap the block depth at 3" on the first case,
-as before.
+batch end). `test_temporal_blocking.py` passes (17), `test_gpu_temporal_blocking.py`
+passes (23). `--benchmark` runs and reports "probes sampled inside the blocks"
+where the engine has an in-block sampler, "probes every 3 timesteps cap the
+block depth at 3" where it has not.
 
-The independent suite (`python/Tests/test_batch_sampling.py`, branch
-`tb-all-exc/tests`), AVX2 classes: 60 tests, 33 pass, 10 skip (GPU), 17 fail,
-every one of them "no timestep ran blocked" in the four cases whose probes are
-due every timestep (Dirac, step, and the Dirac-driven dump-window and objects
-cases): the generic implementation cannot block there (§1). No identity
-assertion fails.
+Current numbers on `tb-all-exc/integration` (incl. the review fixes, 6e3f90f),
+binary of `6e3f90f`:
+
+- `python/Tests/test_batch_sampling.py`: 120 tests, OK, engines avx2 and gpu
+  (the Dirac/step cases that failed on the core with "no timestep ran blocked"
+  pass now: the in-block samplers run them blocked, §4.4/§4.5).
+- `batch_sampling_identity.py`: 0 failures on `--engine avx2-multithreaded`
+  (all rows, flat and blocked, all thread counts and rings) and on
+  `--engine gpu` (144 runs: flat and blocked, pipelined and standard, rings
+  0/1/5, RX 6800).
+- The two independent reviews (2026-11-06, /dev/shm/tball/review2 and
+  review3): no correctness bug found. AVX2: 247 further old-loop vs in-batch
+  comparisons, 0 failures. Vulkan: 144/144 stock identity on the RX 6800,
+  24/24 on the UHD 770 iGPU, 100/100 custom odd shapes (W=2k, NX not divisible
+  by W, probes at x=0 and x=NX-1, ring 1), extension-heavy models (fused and
+  unfused UPML, TF/SF, sheets, Lorentz, Debye, RLC, TD+FD dumps) all identical,
+  5× repeats of the barrier-stressful variants bit-identical. Their low
+  findings were fixed in `6e3f90f` (a guard against NY==1 in
+  `FastEnergyFieldRows()`, and a comment that the ring memory must stay
+  HOST_COHERENT).
 
 ## 7. Open
 
-- The in-block samplers are done (§4.4, §4.5). An engine computes up to one
-  batch past a stop found in the replay; on the GPU that is a pipelined batch
-  too (e.g. `custom` at 4:16: 1500 timesteps for a stop at 612).
-- GPU: time-domain dumps the GPU gathers still end a batch (§4.5); the
-  pipelined loop waits at a frequency-domain dump that could not be stashed.
-- A replayed probe read is an index lookup (`Engine::FootprintSlot()`, built
-  once by `StopFootprintRecording()`: a dense box per field component where
-  its cells fill at least 1/16 of their bounding box, a hash table for the
-  rest), and `Engine_AVX2::SampleFootprint()` reads precomputed offsets. Until
-  the review fix a read was a binary search behind an `std::ostringstream`,
-  3.4 to 5.2 times slower than the old loop on mode-matching probes over whole
-  planes; now 1.08 (50×50×200, 1000 timesteps) and 1.16 (120×120×40, 600
-  timesteps) of the old loop's time, paired A/B of 3 runs each, 4 threads,
-  medians, on the busy workstation. The rest is the sampling and the lookups.
-- The ring holds `ring × footprint` floats; a footprint of millions of cells
-  takes its 16 slots regardless of the 64 MB target.
+Known limitations (documented, not bugs):
+
+- A run computes up to one batch (~0.5 s) past the stop the replay finds; on
+  the GPU that is a pipelined batch too (e.g. `custom` at 4:16: 1500 timesteps
+  computed for a stop at 612).
+- Computing the energy every timestep costs an extra pass while it is in cache:
+  Dirac/step runs in the first 60 s, or any run with `--exact-endcriteria`.
+- Time-domain dumps still end a batch on the GPU, and on the CPU so do FD
+  dumps; the pipelined loop waits at a frequency-domain dump that could not
+  be stashed. With steady-state detection, a pipelined GPU batch is one
+  period long.
+- No identity run covers the relaxed end-criterion paths after 60 s.
+- Memory: the AVX2 energy-row buffer is sized for `k` slots per block whatever
+  the ring or the actual number of energy samples (worst case with a forced
+  `k:W` about 8·k·(NX-1)(NY-1) bytes); the GPU ring holds
+  `2·(ring+1)·(footprint+energy)` floats within its 64 MB budget, and a
+  footprint of millions of cells takes ring=1 (16 B/cell, which may exceed the
+  budget) — allocation failure falls back to host sampling.
+- Cross-version behaviour changes vs master `1922d00`, all intended: the GPU
+  per-x-plane energy sum changes the last digits of every GPU energy in both
+  loops; `08b444e` changes the CPU energy-check timesteps in the step-list edge
+  case; the old pipelined GPU loop checks the end criterion after its first
+  batch.
 - The intermediate flushes of the `*_FD` files and the 4 s status come at
   batch ends, i.e. less often than the old loop's ends could give them.
