@@ -2095,18 +2095,25 @@ void openEMS::RunFDTD()
 		std::vector<unsigned int> probeTS;  // the ends at which a probe reads: footprint samples
 		std::vector<unsigned int> energyTS; // the ends at which the end criterion reads the energy
 		unsigned int longestRun = 0;        // the most timesteps between two samples, or a sample and an end of the batch
+		// After the last end, as the old loop leaves them there: the step
+		// (capped by NrTS, not by the benchmark), and the processings' step
+		// positions. Where a batch may be planned before the one before it
+		// is replayed (the pipelined loop), planBatch() continues from these.
+		int nextStep = 0;
+		std::vector<size_t> nextPositions;
 	};
 	// The batch from startTS, whose first old-loop batch is step timesteps
 	// long: what PA->Process() and checkEndCriteria() would do at each end,
-	// looked ahead without doing it (Processing::ProcessAt()). It ends at the
+	// looked ahead without doing it (Processing::ProcessAt()), from the
+	// processings' step positions now or from \a positions. It ends at the
 	// first end at which a processing not served reads the fields, at the
 	// ring's capacity, NrTS, the benchmark's boundary, or past bsMaxLen
 	// timesteps. Every end costs a few operations per processing; the old
 	// loop called PA->Process() at each of them.
-	auto planBatch = [&](unsigned int startTS, int step) -> SampledBatch
+	auto planBatch = [&](unsigned int startTS, int step, const std::vector<size_t>* positions = nullptr) -> SampledBatch
 	{
 		SampledBatch b;
-		std::vector<size_t> psPos = PA->GetStepPositions();
+		std::vector<size_t> psPos = positions ? *positions : PA->GetStepPositions();
 		std::vector<char> reads;
 		const bool energyChecks = !bench && (Eng_Ext_SSD==NULL); // as checkEndCriteria()
 		unsigned int ts = startTS, lastSample = startTS, sampled = 0;
@@ -2116,7 +2123,7 @@ void openEMS::RunFDTD()
 				throw std::logic_error("in-batch sampling: a batch of no timesteps");
 			ts += (unsigned int)step;
 			b.ends.push_back(ts);
-			if ((ts >= NrTS) || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen))
+			if (ts >= NrTS)
 				break;
 			int next = PA->ProcessAt(ts, psPos, reads);
 			bool probe = false, other = false;
@@ -2130,8 +2137,12 @@ void openEMS::RunFDTD()
 					other = true;
 			}
 			const bool energy = energyChecks && ProcField->CheckTimestepAt(ts, psPos.at(bsProcField));
-			if (other || ((probe || energy) && (sampled >= bsRing)))
-				break;  // the processings read the live fields here
+			// as the old loop after PA->Process()
+			if ((next<0) || (next>(int)(NrTS - ts))) next=NrTS - ts;
+			b.nextStep = next;
+			if (other || ((probe || energy) && (sampled >= bsRing))
+			    || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen))
+				break;  // the last end: the processings read the live fields here
 			if (probe)
 				b.probeTS.push_back(ts);
 			if (energy)
@@ -2142,13 +2153,10 @@ void openEMS::RunFDTD()
 				b.longestRun = std::max(b.longestRun, ts - lastSample);
 				lastSample = ts;
 			}
-			// as the old loop after PA->Process()
-			if ((next<0) || (next>(int)(NrTS - ts))) next=NrTS - ts;
-			if (bench)
-				next = bench->Clamp(next, ts);
-			step = next;
+			step = bench ? bench->Clamp(next, ts) : next;
 		}
 		b.longestRun = std::max(b.longestRun, b.ends.back() - lastSample);
+		b.nextPositions = psPos;
 		return b;
 	};
 	// Replay a batch the engine has run: at each end in order, what the old
@@ -2176,16 +2184,16 @@ void openEMS::RunFDTD()
 				return;
 			}
 			if ((step<0) || (step>(int)(NrTS - ts))) step=NrTS - ts;
-			if (!last)
+			// The processings must have done what the plan looked ahead to.
+			const int next = (bench && !last) ? bench->Clamp(step, ts) : step;
+			const bool asPlanned = last ? ((ts >= NrTS) || ((step == b.nextStep) && (PA->GetStepPositions() == b.nextPositions)))
+			                            : ((next > 0) && (ts + (unsigned int)next == b.ends[i+1]));
+			if (!asPlanned)
 			{
-				const int next = bench ? bench->Clamp(step, ts) : step;
-				if ((next <= 0) || (ts + (unsigned int)next != b.ends[i+1]))
-				{
-					std::ostringstream err;
-					err << "in-batch sampling: the replay of timestep " << ts << " continues to timestep "
-					    << ts + next << ", the plan to " << b.ends[i+1];
-					throw std::logic_error(err.str());
-				}
+				std::ostringstream err;
+				err << "in-batch sampling: the replay of timestep " << ts << " continues to timestep "
+				    << ts + next << ", the plan to " << (last ? ts + b.nextStep : b.ends[i+1]);
+				throw std::logic_error(err.str());
 			}
 		}
 	};
