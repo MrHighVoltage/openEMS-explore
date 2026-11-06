@@ -216,31 +216,99 @@ inline float HorizontalSum(__m256 v)
 	return _mm_cvtss_f32(s);
 }
 
+// Row (x,y) of one field: sum |F|^2 over its three components and every
+// z-vector, in one 8-lane float accumulator, then the lanes in a fixed order.
+// This is the definition of a row's value; everything below computes it with
+// exactly this sequence of operations per row.
+inline float FastEnergyRowField(const f8vector* fld, unsigned int base, unsigned int nZv)
+{
+	__m256 acc = _mm256_setzero_ps();
+	for (unsigned int z = 0; z < nZv; ++z, base += 3)
+	{
+		const __m256 fx = _mm256_load_ps(fld[base].f);
+		const __m256 fy = _mm256_load_ps(fld[base + 1].f);
+		const __m256 fz = _mm256_load_ps(fld[base + 2].f);
+		acc = _mm256_fmadd_ps(fx, fx, acc);
+		acc = _mm256_fmadd_ps(fy, fy, acc);
+		acc = _mm256_fmadd_ps(fz, fz, acc);
+	}
+	return HorizontalSum(acc);
+}
+
+// Four rows of one field at once, each with its own accumulator: the same
+// operations per row as FastEnergyRowField(), four independent chains instead
+// of one, so the FMA latency does not bound it.
+inline void FastEnergyRowField4(const f8vector* fld, unsigned int b0, unsigned int b1, unsigned int b2,
+                                unsigned int b3, unsigned int nZv, float* out)
+{
+	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+	for (unsigned int z = 0; z < nZv; ++z, b0 += 3, b1 += 3, b2 += 3, b3 += 3)
+	{
+		for (unsigned int n = 0; n < 3; ++n)
+		{
+			const __m256 f0 = _mm256_load_ps(fld[b0 + n].f);
+			const __m256 f1 = _mm256_load_ps(fld[b1 + n].f);
+			const __m256 f2 = _mm256_load_ps(fld[b2 + n].f);
+			const __m256 f3 = _mm256_load_ps(fld[b3 + n].f);
+			a0 = _mm256_fmadd_ps(f0, f0, a0);
+			a1 = _mm256_fmadd_ps(f1, f1, a1);
+			a2 = _mm256_fmadd_ps(f2, f2, a2);
+			a3 = _mm256_fmadd_ps(f3, f3, a3);
+		}
+	}
+	out[0] = HorizontalSum(a0);
+	out[1] = HorizontalSum(a1);
+	out[2] = HorizontalSum(a2);
+	out[3] = HorizontalSum(a3);
+}
+
 // Row (x,y) of the estimate: sum |V|^2 and sum |I|^2 over every z-vector.
 inline void FastEnergyRow(const f8vector* volt, const f8vector* curr, unsigned int base,
                           unsigned int nZv, double& e, double& h)
 {
-	__m256 accE = _mm256_setzero_ps();
-	__m256 accH = _mm256_setzero_ps();
-	for (unsigned int z = 0; z < nZv; ++z, base += 3)
-	{
-		const __m256 vx = _mm256_load_ps(volt[base].f);
-		const __m256 vy = _mm256_load_ps(volt[base + 1].f);
-		const __m256 vz = _mm256_load_ps(volt[base + 2].f);
-		accE = _mm256_fmadd_ps(vx, vx, accE);
-		accE = _mm256_fmadd_ps(vy, vy, accE);
-		accE = _mm256_fmadd_ps(vz, vz, accE);
-
-		const __m256 ix = _mm256_load_ps(curr[base].f);
-		const __m256 iy = _mm256_load_ps(curr[base + 1].f);
-		const __m256 iz = _mm256_load_ps(curr[base + 2].f);
-		accH = _mm256_fmadd_ps(ix, ix, accH);
-		accH = _mm256_fmadd_ps(iy, iy, accH);
-		accH = _mm256_fmadd_ps(iz, iz, accH);
-	}
-	e = (double)HorizontalSum(accE);
-	h = (double)HorizontalSum(accH);
+	e = (double)FastEnergyRowField(volt, base, nZv);
+	h = (double)FastEnergyRowField(curr, base, nZv);
 }
+}
+
+void Engine_AVX2::FastEnergyFieldRows(bool currents, unsigned int first, unsigned int last, float* out) const
+{
+	const f8vector* fld = currents ? m_curr : m_volt;
+	const unsigned int ny = numLines[1] - 1;
+	unsigned int r = first;
+	unsigned int x = r / ny, y = r % ny;
+	// the base of row (x,y), advanced row by row without a division
+	auto next = [&]() -> unsigned int
+	{
+		const unsigned int b = x * m_vs_x + y * m_vs_y;
+		if (++y == ny)
+		{
+			y = 0;
+			++x;
+		}
+		return b;
+	};
+	for (; r + 4 <= last; r += 4)
+	{
+		const unsigned int b0 = next(), b1 = next(), b2 = next(), b3 = next();
+		FastEnergyRowField4(fld, b0, b1, b2, b3, numVectors, out + r);
+	}
+	for (; r < last; ++r)
+		out[r] = FastEnergyRowField(fld, next(), numVectors);
+}
+
+double Engine_AVX2::FastEnergy(const float* eRows, const float* hRows) const
+{
+	// as FastEnergy(const double*): each field's rows in row order, in double
+	const unsigned int count = FastEnergyRowCount();
+	double E = 0, H = 0;
+	for (unsigned int r = 0; r < count; ++r)
+	{
+		E += (double)eRows[r];
+		H += (double)hRows[r];
+	}
+	return EPS0 * E + MUE0 * H;
 }
 
 void Engine_AVX2::FastEnergyRows(unsigned int first, unsigned int last, double* rows) const

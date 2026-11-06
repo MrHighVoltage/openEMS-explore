@@ -118,6 +118,16 @@ public: // public access for efficient extension/interface access
 	double FastEnergy(const double* rows) const;
 	//! The same, the rows summed on the fly.
 	double FastEnergy() const;
+	//! One field's share of the rows [first,last): out[r] = the row's float sum of |V|^2 (or |I|^2 if \a currents).
+	/*!
+	  The value FastEnergyRows() converts to double, bit for bit: a row's
+	  |V|^2 and |I|^2 have separate accumulators, so they can be summed at
+	  different times, e.g. each when its field has completed a timestep
+	  (Engine_AVX2_Multithread's in-batch sampling, plans/BATCH_SAMPLING.md §4.4).
+	*/
+	void FastEnergyFieldRows(bool currents, unsigned int first, unsigned int last, float* out) const;
+	//! The estimate from all rows of the two fields (FastEnergyFieldRows()), as FastEnergy(const double*).
+	double FastEnergy(const float* eRows, const float* hRows) const;
 
 	//! Flat field arrays with interleaved polarisations.
 	//! Layout: m_volt[n + z_vec * m_vs_z + y * m_vs_y + x * m_vs_x]
