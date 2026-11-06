@@ -34,6 +34,10 @@ Engine_Interface_SSE_FDTD::~Engine_Interface_SSE_FDTD()
 
 double Engine_Interface_SSE_FDTD::CalcFastEnergy() const
 {
+	// in a replay of in-batch sampling, the estimate the batch took at that timestep
+	if (m_Eng->InBatchReplay())
+		return m_Eng->GetBatchReplayEnergy();
+
 	f4vector E_energy;
 	E_energy.f[0]=0;
 	E_energy.f[1]=0;

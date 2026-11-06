@@ -18,7 +18,9 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <vector>
 #include "operator.h"
@@ -55,7 +57,8 @@ public:
 	//!Iterate a number of timesteps
 	virtual bool IterateTS(unsigned int iterTS);
 
-	virtual unsigned int GetNumberOfTimesteps() {return numTS;}
+	//! The timesteps done; in a replay (BeginBatchReplay()) the replayed one.
+	virtual unsigned int GetNumberOfTimesteps() {return (m_bsMode==BS_REPLAY) ? m_bsReplayTS : numTS;}
 
 	virtual void NextInterval(float curr_speed) {UNUSED(curr_speed);};
 
@@ -75,6 +78,101 @@ public:
 	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const {UNUSED(maxDepth); return {};}
 	//! True while the engine still tunes itself on the timesteps it runs.
 	virtual bool IsCalibrating() const {return false;}
+	//! The timesteps run so far inside blocks at least two timesteps deep; -1 if the engine does not count them.
+	virtual long long GetBlockedTimesteps() const {return -1;}
+	//@}
+
+	//! \name In-batch sampling (plans/BATCH_SAMPLING.md)
+	/*!
+	  The main loop (openEMS::RunFDTD()) used to end every IterateTS() at the
+	  next timestep a probe or dump was due at, which capped a blocked
+	  schedule's depth at the probe interval. With in-batch sampling it runs
+	  one batch past the timesteps at which only probes and the energy end
+	  criterion are due, and afterwards replays the batch: for each of those
+	  timesteps t in order it calls the processings with the engine in
+	  replay(t), where GetNumberOfTimesteps() is t and GetVolt()/GetCurr()
+	  return what they would have returned at t. The probes run unchanged on
+	  the same floats, so their files are bit-identical to the old loop's.
+
+	  The cells the probes read, the footprint, are recorded once before the
+	  run (StartFootprintRecording()): the main loop calls every probe once
+	  while GetVolt()/GetCurr() record the cells they are asked for.
+
+	  Contract for an engine that returns true from SupportsBatchSampling():
+	  - Its GetVolt(), both overloads, begin with
+	    \code
+	    if (m_bsMode != BS_OFF) { FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v; }
+	    \endcode
+	    and its GetCurr() the same with field 1; its GetNumberOfTimesteps()
+	    is this one.
+	  - IterateSampledTS(iterTS) runs iterTS timesteps like IterateTS(), and
+	    for every timestep t of the schedule (ScheduleBatchSamples()) stores
+	    - in BatchProbeSample(i), i the index of t in the probe list, for
+	      each cell c of GetFootprint(): the value GetVolt()/GetCurr() of
+	      that cell returns after IterateTS() has brought the engine to
+	      numTS == t, i.e. the value between the last write of timestep t-1
+	      (Apply2Current() and anything after it) and the first write of
+	      timestep t (DoPreVoltageUpdates() of t);
+	    - with SetBatchEnergySample(j, e), j the index of t in the energy
+	      list, the energy estimate the engine interface's CalcFastEnergy()
+	      would return at numTS == t, computed the same way bit for bit
+	      (CalcBatchEnergy() calls exactly that).
+	    The default implementation runs IterateTS() up to each sample
+	    timestep and reads the cells and the energy from the coherent grid,
+	    so its blocks never cross a sample. An engine that samples inside its
+	    blocks overrides IterateSampledTS() and SamplesInsideBlocks().
+	  - The fields the batch leaves behind are those of IterateTS(iterTS).
+
+	  The main loop never schedules a sample at the batch's last timestep:
+	  the processings read the live fields there, as before. Nothing outside
+	  the footprint may be read in a replay of an earlier timestep, and
+	  BatchRead() throws std::logic_error if anything is, as it does for a
+	  timestep without a sample: a replay never reads live fields silently.
+	*/
+	//@{
+	enum BatchSamplingMode {BS_OFF = 0, BS_RECORD = 1, BS_REPLAY = 2};
+	//! Whether IterateSampledTS() and the replay work on this engine. Default: false.
+	virtual bool SupportsBatchSampling() const {return false;}
+	//! True if IterateSampledTS() samples inside blocks, so that its depth is not capped by the gaps between samples.
+	virtual bool SamplesInsideBlocks() const {return false;}
+
+	//! From now on GetVolt()/GetCurr() record the cells they read (and return the live values).
+	void StartFootprintRecording();
+	//! Stop recording; the cells recorded since StartFootprintRecording() are the footprint.
+	void StopFootprintRecording();
+	//! The footprint, sorted by key (FootprintKey()); a cell's position is its index in every probe sample.
+	const std::vector<uint64_t>& GetFootprint() const {return m_bsFootprint;}
+	//! A cell of the footprint as a key: field (0 voltages, 1 currents), component n, position; sorted by field, n, x, y, z.
+	static uint64_t FootprintKey(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z)
+	{
+		return ((uint64_t)field<<62) | ((uint64_t)n<<60) | ((uint64_t)x<<40) | ((uint64_t)y<<20) | (uint64_t)z;
+	}
+	static void DecodeFootprintKey(uint64_t key, unsigned int& field, unsigned int& n, unsigned int& x, unsigned int& y, unsigned int& z)
+	{
+		field = (unsigned int)(key>>62);
+		n = (unsigned int)((key>>60)&3);
+		x = (unsigned int)((key>>40)&0xFFFFF);
+		y = (unsigned int)((key>>20)&0xFFFFF);
+		z = (unsigned int)(key&0xFFFFF);
+	}
+
+	//! The energy estimate of the main loop's end criterion, as its engine interface computes it.
+	void SetBatchEnergyFunction(std::function<double()> fn) {m_bsEnergyFn = std::move(fn);}
+
+	//! The samples the next IterateSampledTS() takes: absolute timesteps, ascending, each after the current timestep and before the batch's last.
+	virtual void ScheduleBatchSamples(const std::vector<unsigned int>& probeTS, const std::vector<unsigned int>& energyTS);
+	//! Run \a iterTS timesteps, taking the samples ScheduleBatchSamples() asked for.
+	virtual bool IterateSampledTS(unsigned int iterTS);
+	const std::vector<unsigned int>& GetBatchProbeTimesteps() const {return m_bsProbeTS;}
+	const std::vector<unsigned int>& GetBatchEnergyTimesteps() const {return m_bsEnergyTS;}
+
+	//! Replay timestep \a ts of the batch just run, up to and including the current timestep. At the current one, a no-op.
+	void BeginBatchReplay(unsigned int ts);
+	void EndBatchReplay();
+	//! In a replay of a timestep before the current one.
+	bool InBatchReplay() const {return m_bsMode==BS_REPLAY;}
+	//! In a replay: the energy sample of the replayed timestep; throws std::logic_error if there is none.
+	double GetBatchReplayEnergy() const;
 	//@}
 
 	//! \name Worker threads
@@ -187,6 +285,32 @@ protected:
 	virtual void InitExtensions();
 	virtual void ClearExtensions();
 	std::vector<Engine_Extension*> m_Eng_exts;
+
+	//! \name In-batch sampling, for the engines (see the contract above)
+	//@{
+	//! Recording: record the cell, false. Replay: the cell's sample in \a value, true; std::logic_error if there is none.
+	bool BatchRead(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const;
+	//! The footprint values of the \a i-th probe sample timestep, in footprint order.
+	FDTD_FLOAT* BatchProbeSample(size_t i) {return m_bsValues.data() + i*m_bsFootprint.size();}
+	//! Store the energy sample of the \a j-th energy sample timestep.
+	void SetBatchEnergySample(size_t j, double e) {m_bsEnergy.at(j) = e;}
+	//! The end criterion's energy estimate of the live fields (SetBatchEnergyFunction()).
+	double CalcBatchEnergy() const;
+	//! Read the footprint from the live fields into BatchProbeSample(\a i) with GetVolt()/GetCurr().
+	void SampleFootprint(size_t i);
+
+	BatchSamplingMode m_bsMode;
+	unsigned int m_bsReplayTS;    //!< BS_REPLAY: the replayed timestep
+	int m_bsReplaySlot;           //!< BS_REPLAY: its probe sample, -1 = none
+	int m_bsReplayEnergySlot;     //!< BS_REPLAY: its energy sample, -1 = none
+	unsigned int m_bsBatchStart;  //!< numTS when the last IterateSampledTS() started
+	std::vector<uint64_t> m_bsFootprint;
+	mutable std::vector<uint64_t> m_bsRecorded;
+	std::vector<unsigned int> m_bsProbeTS, m_bsEnergyTS;
+	std::vector<FDTD_FLOAT> m_bsValues;  //!< [probe sample][footprint cell]
+	std::vector<double> m_bsEnergy;      //!< [energy sample]
+	std::function<double()> m_bsEnergyFn;
+	//@}
 
 	friend class NS_Engine_Multithread::thread; // evil hack to access numTS from multithreading context
 };

@@ -193,6 +193,9 @@ double Engine_Interface_FDTD::GetRawField(unsigned int n, const unsigned int* po
 
 double Engine_Interface_FDTD::CalcFastEnergy() const
 {
+	// in a replay of in-batch sampling, the estimate the batch took at that timestep
+	if (m_Eng->InBatchReplay())
+		return m_Eng->GetBatchReplayEnergy();
 #ifdef WITH_GPU
 	if (m_Eng->GetType() == Engine::GPU)
 	{

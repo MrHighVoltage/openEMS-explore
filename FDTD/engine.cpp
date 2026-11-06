@@ -19,8 +19,11 @@
 #include "extensions/engine_extension.h"
 #include "extensions/operator_extension.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <sstream>
+#include <stdexcept>
 
 using std::cout;
 using std::endl;
@@ -44,6 +47,11 @@ Engine::Engine(const Operator* op)
 		numLines[n] = Op->GetNumberOfLines(n, true);
 	volt_ptr = NULL;
 	curr_ptr = NULL;
+	m_bsMode = BS_OFF;
+	m_bsReplayTS = 0;
+	m_bsReplaySlot = -1;
+	m_bsReplayEnergySlot = -1;
+	m_bsBatchStart = 0;
 	m_traceFieldEnabled = false;
 	m_traceFieldCell[0] = m_traceFieldCell[1] = m_traceFieldCell[2] = 0;
 	if (const char* env = std::getenv("OPENEMS_CPU_TRACE_CELL"))
@@ -329,4 +337,156 @@ bool Engine::IterateTS(unsigned int iterTS)
 		++numTS;
 	}
 	return true;
+}
+
+// ----------------------------------------------------------------------------
+// In-batch sampling (plans/BATCH_SAMPLING.md)
+// ----------------------------------------------------------------------------
+
+void Engine::StartFootprintRecording()
+{
+	m_bsRecorded.clear();
+	m_bsMode = BS_RECORD;
+}
+
+void Engine::StopFootprintRecording()
+{
+	if (m_bsMode != BS_RECORD)
+		return;
+	m_bsMode = BS_OFF;
+	std::sort(m_bsRecorded.begin(), m_bsRecorded.end());
+	m_bsRecorded.erase(std::unique(m_bsRecorded.begin(), m_bsRecorded.end()), m_bsRecorded.end());
+	m_bsFootprint.swap(m_bsRecorded);
+	m_bsRecorded.clear();
+	m_bsRecorded.shrink_to_fit();
+}
+
+bool Engine::BatchRead(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const
+{
+	const uint64_t key = FootprintKey(field, n, x, y, z);
+	if (m_bsMode == BS_RECORD)
+	{
+		if ((x > 0xFFFFF) || (y > 0xFFFFF) || (z > 0xFFFFF) || (n > 2))
+			throw std::logic_error("in-batch sampling: a probe reads a cell beyond the footprint's key range");
+		m_bsRecorded.push_back(key);
+		return false;
+	}
+	if (m_bsMode != BS_REPLAY)
+		return false;
+	std::ostringstream err;
+	if (m_bsReplaySlot < 0)
+		err << "in-batch sampling: replaying timestep " << m_bsReplayTS << " (engine at " << numTS
+		    << "), which has no probe sample, a processing reads ";
+	else
+	{
+		const std::vector<uint64_t>::const_iterator it = std::lower_bound(m_bsFootprint.begin(), m_bsFootprint.end(), key);
+		if ((it != m_bsFootprint.end()) && (*it == key))
+		{
+			value = m_bsValues[(size_t)m_bsReplaySlot*m_bsFootprint.size() + (size_t)(it - m_bsFootprint.begin())];
+			return true;
+		}
+		err << "in-batch sampling: replaying timestep " << m_bsReplayTS << " (engine at " << numTS
+		    << "), a processing reads outside the probe footprint: ";
+	}
+	err << (field ? "current" : "voltage") << " " << n << " at (" << x << "," << y << "," << z << ")";
+	throw std::logic_error(err.str());
+}
+
+double Engine::CalcBatchEnergy() const
+{
+	if (!m_bsEnergyFn)
+		throw std::logic_error("in-batch sampling: an energy sample is scheduled, but no energy function is set");
+	return m_bsEnergyFn();
+}
+
+void Engine::SampleFootprint(size_t i)
+{
+	FDTD_FLOAT* out = BatchProbeSample(i);
+	unsigned int field, n, x, y, z;
+	for (size_t c = 0; c < m_bsFootprint.size(); ++c)
+	{
+		DecodeFootprintKey(m_bsFootprint[c], field, n, x, y, z);
+		out[c] = field ? GetCurr(n, x, y, z) : GetVolt(n, x, y, z);
+	}
+}
+
+void Engine::ScheduleBatchSamples(const std::vector<unsigned int>& probeTS, const std::vector<unsigned int>& energyTS)
+{
+	if (m_bsMode != BS_OFF)
+		throw std::logic_error("in-batch sampling: a batch scheduled during a replay or the footprint recording");
+	m_bsProbeTS = probeTS;
+	m_bsEnergyTS = energyTS;
+	m_bsValues.assign(m_bsProbeTS.size()*m_bsFootprint.size(), 0);
+	m_bsEnergy.assign(m_bsEnergyTS.size(), 0);
+}
+
+bool Engine::IterateSampledTS(unsigned int iterTS)
+{
+	// IterateTS() up to each sample timestep, which may block within the gap;
+	// the grid is coherent at its end.
+	m_bsBatchStart = GetNumberOfTimesteps();
+	const unsigned int end = m_bsBatchStart + iterTS;
+	size_t p = 0, e = 0;
+	for (;;)
+	{
+		unsigned int next = end;
+		if (p < m_bsProbeTS.size())
+			next = std::min(next, m_bsProbeTS[p]);
+		if (e < m_bsEnergyTS.size())
+			next = std::min(next, m_bsEnergyTS[e]);
+		const unsigned int now = GetNumberOfTimesteps();
+		if ((next <= now) && (next < end))
+			throw std::logic_error("in-batch sampling: a sample timestep at or before the batch start, or not ascending");
+		if ((next > now) && !IterateTS(next - now))
+			return false;
+		if (next >= end)
+			break;
+		if ((p < m_bsProbeTS.size()) && (m_bsProbeTS[p] == next))
+			SampleFootprint(p++);
+		if ((e < m_bsEnergyTS.size()) && (m_bsEnergyTS[e] == next))
+			SetBatchEnergySample(e++, CalcBatchEnergy());
+	}
+	if ((p < m_bsProbeTS.size()) || (e < m_bsEnergyTS.size()))
+		throw std::logic_error("in-batch sampling: a sample timestep at or after the batch's last timestep");
+	return true;
+}
+
+void Engine::BeginBatchReplay(unsigned int ts)
+{
+	if (m_bsMode != BS_OFF)
+		throw std::logic_error("in-batch sampling: a replay begun inside another one, or while recording");
+	if (ts == numTS)
+		return; // the live fields
+	if ((ts > numTS) || (ts < m_bsBatchStart))
+	{
+		std::ostringstream err;
+		err << "in-batch sampling: replay of timestep " << ts << " outside the batch " << m_bsBatchStart << ".." << numTS;
+		throw std::logic_error(err.str());
+	}
+	const std::vector<unsigned int>::const_iterator p = std::lower_bound(m_bsProbeTS.begin(), m_bsProbeTS.end(), ts);
+	m_bsReplaySlot = ((p != m_bsProbeTS.end()) && (*p == ts)) ? (int)(p - m_bsProbeTS.begin()) : -1;
+	const std::vector<unsigned int>::const_iterator q = std::lower_bound(m_bsEnergyTS.begin(), m_bsEnergyTS.end(), ts);
+	m_bsReplayEnergySlot = ((q != m_bsEnergyTS.end()) && (*q == ts)) ? (int)(q - m_bsEnergyTS.begin()) : -1;
+	m_bsReplayTS = ts;
+	m_bsMode = BS_REPLAY;
+}
+
+void Engine::EndBatchReplay()
+{
+	if (m_bsMode == BS_REPLAY)
+		m_bsMode = BS_OFF;
+	m_bsReplaySlot = -1;
+	m_bsReplayEnergySlot = -1;
+}
+
+double Engine::GetBatchReplayEnergy() const
+{
+	if ((m_bsMode != BS_REPLAY) || (m_bsReplayEnergySlot < 0))
+	{
+		std::ostringstream err;
+		err << "in-batch sampling: replaying timestep " << m_bsReplayTS << " (engine at " << numTS
+		    << "), which has no energy sample, the energy is read";
+		throw std::logic_error(err.str());
+	}
+	return m_bsEnergy[(size_t)m_bsReplayEnergySlot];
 }

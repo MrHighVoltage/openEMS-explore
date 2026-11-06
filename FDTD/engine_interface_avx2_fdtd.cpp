@@ -41,6 +41,9 @@ Engine_Interface_AVX2_FDTD::~Engine_Interface_AVX2_FDTD()
 
 double Engine_Interface_AVX2_FDTD::CalcFastEnergy() const
 {
+	// in a replay of in-batch sampling, the estimate the batch took at that timestep
+	if (m_Eng->InBatchReplay())
+		return m_Eng->GetBatchReplayEnergy();
 	if (m_Eng_AVX2->GetType() != Engine::AVX2)
 		return Engine_Interface_FDTD::CalcFastEnergy();
 	// by rows, see Engine_AVX2::FastEnergy()
