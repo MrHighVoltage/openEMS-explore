@@ -4206,22 +4206,23 @@ void Engine_Vulkan::CollectSampledBatch()
 bool Engine_Vulkan::ReadEndSample(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z,
                                   FDTD_FLOAT& v) const
 {
-	const uint64_t key = FootprintKey(field, n, x, y, z);
-	const auto it = std::lower_bound(m_bsFootprint.begin(), m_bsFootprint.end(), key);
-	if ((it == m_bsFootprint.end()) || (*it != key))
+	const int64_t slot = FootprintSlot(field, n, x, y, z);
+	if (slot < 0)
 	{
 		m_probeCacheMisses++;
 		return false;
 	}
 	if (m_bsEndProbeTS != numTS)
 	{
+		if (m_speculativeTS == 0)
+			return false;  // the GPU holds numTS: read it
 		std::ostringstream err;
 		err << "in-batch sampling: a probe reads timestep " << numTS << " while the GPU computes ahead, "
 		    << "and its batch did not sample the footprint there";
 		throw std::logic_error(err.str());
 	}
 	m_probeCacheHits++;
-	v = m_probeCacheCPU[(size_t)(it - m_bsFootprint.begin())];
+	v = m_probeCacheCPU[(size_t)slot];
 	return true;
 }
 

@@ -29,6 +29,13 @@
 
 #include "tools/arraylib/array_nijk.h"
 
+//! The test of GetVolt()/GetCurr() for in-batch sampling, off the hot path (dumps and extensions read through them too).
+#if defined(__GNUC__)
+#define OPENEMS_BS_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define OPENEMS_BS_UNLIKELY(x) (x)
+#endif
+
 namespace NS_Engine_Multithread
 {
 class thread; // evil hack to access numTS from multithreading context
@@ -290,14 +297,48 @@ protected:
 	//@{
 	//! Recording: record the cell, false. Replay: the cell's sample in \a value, true; std::logic_error if there is none.
 	bool BatchRead(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const;
+	//! BatchRead() of a cell the replay has no sample of, and of the recording.
+	bool BatchReadSlow(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const;
+	//! The position of a cell in the footprint, or -1 (built by StopFootprintRecording()).
+	/*!
+	  A component whose cells fill a box well (a mode-matching probe over a
+	  plane) has a dense index of that box, which keeps neighbouring cells
+	  together in the cache; the others are in a hash table.
+	  */
+	int64_t FootprintSlot(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		if ((field > 1) || (n > 2))
+			return -1;
+		const FootprintBox& b = m_bsBoxes[field*3+n];
+		if (!b.slot.empty())
+		{
+			const unsigned int i = x-b.lo[0], j = y-b.lo[1], k = z-b.lo[2];
+			if ((i < b.len[0]) && (j < b.len[1]) && (k < b.len[2]))
+				return b.slot[((size_t)i*b.len[1] + j)*b.len[2] + k];
+			return -1;
+		}
+		if (m_bsHashKeys.empty())
+			return -1;
+		const uint64_t key = FootprintKey(field, n, x, y, z);
+		size_t h = (size_t)((key*0x9E3779B97F4A7C15ull) >> m_bsHashShift);
+		for (;;)
+		{
+			const uint64_t k = m_bsHashKeys[h];
+			if (k == key)
+				return m_bsHashSlots[h];
+			if (k == ~0ull)
+				return -1;
+			h = (h+1) & (m_bsHashKeys.size()-1);
+		}
+	}
 	//! The footprint values of the \a i-th probe sample timestep, in footprint order.
 	FDTD_FLOAT* BatchProbeSample(size_t i) {return m_bsValues.data() + i*m_bsFootprint.size();}
 	//! Store the energy sample of the \a j-th energy sample timestep.
 	void SetBatchEnergySample(size_t j, double e) {m_bsEnergy.at(j) = e;}
 	//! The end criterion's energy estimate of the live fields (SetBatchEnergyFunction()).
 	double CalcBatchEnergy() const;
-	//! Read the footprint from the live fields into BatchProbeSample(\a i) with GetVolt()/GetCurr().
-	void SampleFootprint(size_t i);
+	//! Read the footprint from the live fields into BatchProbeSample(\a i) with GetVolt()/GetCurr(); an engine may do it faster.
+	virtual void SampleFootprint(size_t i);
 
 	BatchSamplingMode m_bsMode;
 	unsigned int m_bsReplayTS;    //!< BS_REPLAY: the replayed timestep
@@ -305,6 +346,13 @@ protected:
 	int m_bsReplayEnergySlot;     //!< BS_REPLAY: its energy sample, -1 = none
 	unsigned int m_bsBatchStart;  //!< numTS when the last IterateSampledTS() started
 	std::vector<uint64_t> m_bsFootprint;
+	std::vector<uint64_t> m_bsHashKeys;   //!< open addressing, ~0 = empty, a power of two of at least twice the footprint
+	std::vector<int64_t> m_bsHashSlots;   //!< the footprint position of each key
+	unsigned int m_bsHashShift;
+	//! The dense index of one component's cells: footprint positions over [lo, lo+len), -1 = not in it
+	struct FootprintBox {unsigned int lo[3] = {0, 0, 0}, len[3] = {0, 0, 0}; std::vector<int32_t> slot;};
+	FootprintBox m_bsBoxes[6];            //!< [field*3+n]; empty slot: the hash table
+	const FDTD_FLOAT* m_bsReplayValues;   //!< BS_REPLAY: the probe sample of the replayed timestep, or nullptr
 	mutable std::vector<uint64_t> m_bsRecorded;
 	std::vector<unsigned int> m_bsProbeTS, m_bsEnergyTS;
 	std::vector<FDTD_FLOAT> m_bsValues;  //!< [probe sample][footprint cell]

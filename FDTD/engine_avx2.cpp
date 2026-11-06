@@ -111,6 +111,31 @@ void Engine_AVX2::Init()
 	m_curr = Alloc_f8_flat(totalElems);
 }
 
+void Engine_AVX2::SampleFootprint(size_t i)
+{
+	// GetVolt() divides by numVectors for every cell; the offsets do it once
+	const std::vector<uint64_t>& fp = GetFootprint();
+	if (m_bsOffsets.size() != fp.size())
+	{
+		m_bsOffsets.resize(fp.size());
+		unsigned int field, n, x, y, z;
+		for (size_t c = 0; c < fp.size(); ++c)
+		{
+			DecodeFootprintKey(fp[c], field, n, x, y, z);
+			const uint64_t vec = n + (z % numVectors) * m_vs_z + y * m_vs_y + (uint64_t)x * m_vs_x;
+			m_bsOffsets[c] = ((uint64_t)field<<63) | (vec*8 + z / numVectors);
+		}
+	}
+	const float* volt = m_volt[0].f;
+	const float* curr = m_curr[0].f;
+	FDTD_FLOAT* out = BatchProbeSample(i);
+	for (size_t c = 0; c < m_bsOffsets.size(); ++c)
+	{
+		const uint64_t off = m_bsOffsets[c];
+		out[c] = ((off>>63) ? curr : volt)[off & ~(1ull<<63)];
+	}
+}
+
 void Engine_AVX2::Reset()
 {
 	free(m_volt);

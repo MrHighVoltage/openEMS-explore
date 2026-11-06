@@ -150,7 +150,74 @@ CASES = {
 	"sine_ssd": dict(exc="sine", nrts=20000, endcrit=1e-3, lossy=True, bc=["PEC"] * 6),
 	# a sine to NrTS with the dumps
 	"sine_dumps": dict(exc="sine", nrts=900, endcrit=1e-9, lossy=True, dumps=True),
+	# a sine with a period of 11 timesteps in a 12^3 box, no probes, until
+	# steady state at about 167000 timesteps: batches of more periods than
+	# the steady-state extension queues verdicts for
+	"sine_long": dict(model="small_sine"),
+	# a time-domain dump that fails to write (FileType 2) and disables itself
+	# at its first timestep, in a window: it changes its own schedule while
+	# the batch's last end is processed
+	"dump_fails": dict(model="failing_dump"),
+	# four mode-matching probes over whole x-y planes
+	"modematch": dict(model="mode_match", n=30, nz=60, nrts=400),
 }
+
+
+def write_special_model(path, case):
+	"""The cases on a grid of their own."""
+	from CSXCAD import ContinuousStructure
+	from openEMS import openEMS
+
+	CSX = ContinuousStructure()
+	mesh = CSX.GetGrid()
+	mesh.SetDeltaUnit(1e-3)
+	xml = os.path.join(path, "model.xml")
+	if case["model"] == "small_sine":
+		FDTD = openEMS(NrTS=400000, EndCriteria=1e-10)
+		FDTD.SetSinusExcite(50e9)
+		FDTD.SetBoundaryCond(["PEC"] * 6)
+		for d in "xyz":
+			mesh.SetLines(d, np.arange(12, dtype=float))
+		m = CSX.AddMaterial("lossy", epsilon=1.0, kappa=1e-3)
+		m.AddBox([0, 0, 0], [11, 11, 11], priority=1)
+		e = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+		e.AddBox([4, 5, 3], [4, 5, 7])
+	elif case["model"] == "failing_dump":
+		FDTD = openEMS(NrTS=600, EndCriteria=1e-5)
+		FDTD.SetGaussExcite(6e9, 4e9)
+		FDTD.SetBoundaryCond(["MUR"] * 6)
+		mesh.SetLines("x", np.arange(32, dtype=float))
+		mesh.SetLines("y", np.arange(16, dtype=float))
+		mesh.SetLines("z", np.arange(16, dtype=float))
+		e = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+		e.AddBox([10, 6, 6], [11, 10, 10])
+		td = CSX.AddDump("Et", dump_type=0, dump_mode=0, file_type=2)
+		td.AddBox([0, 0, 0], [31, 15, 15])
+	elif case["model"] == "mode_match":
+		N, NZ = case["n"], case["nz"]
+		FDTD = openEMS(NrTS=case["nrts"], EndCriteria=0)
+		FDTD.SetGaussExcite(6e9, 4e9)
+		FDTD.SetBoundaryCond(["PEC", "PEC", "PEC", "PEC", "MUR", "MUR"])
+		mesh.SetLines("x", np.arange(N, dtype=float))
+		mesh.SetLines("y", np.arange(N, dtype=float))
+		mesh.SetLines("z", np.arange(NZ, dtype=float))
+		e = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 1, 0])
+		e.AddBox([0, 0, 5], [N - 1, N - 1, 5])
+		for i, z in enumerate((NZ // 2, NZ // 2 + 3)):
+			mm = CSX.AddProbe("mmE%d" % i, p_type=10, mode_function=["0", "sin(pi*x/%d)" % (N - 1), "0"])
+			mm.AddBox([0, 0, z], [N - 1, N - 1, z])
+			mh = CSX.AddProbe("mmH%d" % i, p_type=11, mode_function=["sin(pi*x/%d)" % (N - 1), "0", "0"])
+			mh.AddBox([0, 0, z], [N - 1, N - 1, z])
+	else:
+		raise ValueError(case["model"])
+	FDTD.SetCSX(CSX)
+	FDTD.Write2XML(xml)
+	if case["model"] == "failing_dump":
+		tree = ET.parse(xml)
+		for db in tree.iter("DumpBox"):
+			db.set("StartTime", repr(0.1e-9))
+		tree.write(xml)
+	return xml
 
 
 def header_free(path):
@@ -196,7 +263,7 @@ def run(args, case_name, case, schedule, threads, batch, loop="", ring=0):
 	sim = os.path.join(args.work, tag)
 	shutil.rmtree(sim, ignore_errors=True)
 	os.makedirs(sim)
-	xml = write_model(sim, case)
+	xml = write_special_model(sim, case) if "model" in case else write_model(sim, case)
 	env = dict(os.environ)
 	for k in ("OPENEMS_AVX2_TEMPORAL_BLOCK", "OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", "OPENEMS_GPU_TEMPORAL_BLOCK",
 	          "OPENEMS_GPU_TEMPORAL_BLOCK_MB", "OPENEMS_GPU_PIPELINE",
