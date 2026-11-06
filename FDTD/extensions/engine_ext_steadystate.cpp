@@ -40,6 +40,7 @@ Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext)
 	m_ringSize = 3*m_period;
 	m_records.assign(m_Op_SS->m_E_probe_dir.size()*(size_t)m_ringSize, 0.0);
 	m_last_max_diff = 1;
+	m_verdictPassed = m_last_max_diff;
 	last_total_energy = 0;
 	m_Eng_Interface = NULL;
 	const char* trace = std::getenv("OPENEMS_STEADYSTATE_TRACE");
@@ -80,17 +81,32 @@ double Engine_Ext_SteadyState::GetLastDiff()
 {
 	if (m_gpuUpdater)
 		m_gpuUpdater();
-	return m_last_max_diff;
+	// The check of timestep TS runs while the engine advances from TS to
+	// TS+1, so a run that has done ts timesteps has passed those of TS < ts.
+	// Outside a replay that is every check made.
+	const unsigned int ts = m_Eng->InBatchReplay() ? m_Eng->GetNumberOfTimesteps() : UINT_MAX;
+	while (!m_verdicts.empty() && (m_verdicts.front().TS < ts))
+	{
+		PassVerdict(m_verdicts.front());
+		m_verdicts.pop_front();
+	}
+	return m_verdictPassed;
 }
 
-void Engine_Ext_SteadyState::TraceCheck(unsigned int TS, double energy) const
+void Engine_Ext_SteadyState::PassVerdict(const Verdict& v)
+{
+	m_verdictPassed = v.diff;
+	TraceCheck(v.TS, v.energy, v.diff);
+}
+
+void Engine_Ext_SteadyState::TraceCheck(unsigned int TS, double energy, double diff) const
 {
 	if (!m_trace)
 		return;
 	// all digits: the traces of two schedules are compared as text
 	std::ostringstream os;
 	os.precision(17);
-	os << "SteadyState check: TS=" << TS << " energy=" << energy << " diff=" << m_last_max_diff << "\n";
+	os << "SteadyState check: TS=" << TS << " energy=" << energy << " diff=" << diff << "\n";
 	std::cout << os.str() << std::flush;
 }
 
@@ -229,7 +245,17 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int TS, double energy, const s
 	}
 	if ((no_valid) || (m_last_max_diff>1))
 		m_last_max_diff = 1;
-	TraceCheck(TS, curr_total_energy);
+	// GetLastDiff() hands it on, and the trace prints it, once the run has
+	// passed it: an engine may run ahead of the timestep the main loop
+	// processes (in-batch sampling), and a run stopping in between never
+	// sees the checks it ran ahead to. A run that never asks (--benchmark)
+	// keeps a few.
+	m_verdicts.push_back(Verdict{TS, curr_total_energy, m_last_max_diff});
+	while (m_verdicts.size() > 4096)
+	{
+		PassVerdict(m_verdicts.front());
+		m_verdicts.pop_front();
+	}
 }
 
 void Engine_Ext_SteadyState::Apply2Current()

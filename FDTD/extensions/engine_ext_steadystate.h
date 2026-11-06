@@ -22,6 +22,7 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 
+#include <deque>
 #include <functional>
 #include <vector>
 
@@ -69,6 +70,9 @@ public:
 	virtual void SetEngine(Engine* eng);
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
+	//! The verdict of the last check: in a replay of in-batch sampling, of
+	//! the last check the replayed timestep has passed (one of a timestep
+	//! before it, as the run's verdict would have been at its end).
 	double GetLastDiff();
 	//! Called by GetLastDiff(): the GPU engine evaluates the checks it has computed (Engine_Vulkan::UpdateSteadyStateResult()).
 	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}
@@ -100,7 +104,7 @@ protected:
 	double RingRecord(unsigned int TS, size_t n, unsigned int t) const;
 
 	//! With OPENEMS_STEADYSTATE_TRACE=1, print the check of timestep \a TS: the energy and the verdict.
-	void TraceCheck(unsigned int TS, double energy) const;
+	void TraceCheck(unsigned int TS, double energy, double diff) const;
 
 	Operator_Ext_SteadyState* m_Op_SS;
 	unsigned int m_period;        //!< timesteps per period
@@ -110,6 +114,15 @@ protected:
 	std::vector<double> m_records;
 	//! The rows of the energy estimate of the check timestep in the blocked schedule, see Engine_AVX2::FastEnergyRows()
 	std::vector<double> m_rows;
+
+	//! A check GetLastDiff() has not passed yet
+	struct Verdict {unsigned int TS; double energy, diff;};
+	//! Those checks, oldest first
+	std::deque<Verdict> m_verdicts;
+	//! The verdict of the last check passed
+	double m_verdictPassed;
+	//! The check \a v is passed: its verdict counts, and the trace prints it.
+	void PassVerdict(const Verdict& v);
 
 	double last_total_energy;
 	Engine_Interface_FDTD* m_Eng_Interface;
