@@ -10,8 +10,8 @@ code runs unchanged on the same floats in the same order, so every output is
 bit-identical to the old loop's.
 
 This document is the design and the engine contract. The core (interface,
-generic implementation, main loop) is done; the AVX2 in-block sampler and the
-Vulkan engine are implemented against §4.
+generic implementation, main loop) and the AVX2 in-block sampler (§4.4) are
+done; the Vulkan engine is implemented against §4.5.
 
 ## 1. Status (2026-11-06)
 
@@ -31,25 +31,66 @@ Branch `tb-all-exc/core`, on top of `1922d00`:
 | `c7a230b` | review: a batch holds at most 4094 steady-state periods (§3.8) |
 | `90849d6` | review: the replay follows processings that change their schedule (§3.10) |
 
-- **Done.** Everything in §3 and the generic implementation of §4, used by
-  `Engine_AVX2` and `Engine_AVX2_Multithread`. Identity holds on every case
-  tried (§6), flat and blocked, 1 to 4 threads, with small rings.
-- **What it gains so far.** The generic implementation runs `IterateTS()`
-  between consecutive sample timesteps, so its blocks still end at every probe
-  timestep: the depth is the same as before. What changes is that only probe
-  and energy timesteps split a batch, not the Nyquist cap or a probe that has
-  not started yet, and that the work between two dumps is one batch. Dirac and
-  step runs still block nowhere (every timestep is a probe timestep).
+Branch `tb-all-exc/avx2`, on top of the core and its tests (`2ad8c61`, the core with its review fixes):
+
+| commit | what |
+|---|---|
+| `d9916ec` | `Engine_AVX2::FastEnergyFieldRows()`, `FastEnergy(eRows, hRows)`: a field's row sums, bit for bit those of `FastEnergy()` |
+| `685951c` | `Engine::GetPreferredBatchLength()`; `RunFDTD()` keeps the batch length at least that |
+| `fad8cb5` | `Engine_AVX2_Multithread`: in-batch sampling inside the blocked and the flat schedule (§4.4) |
+| `2b32cca` | `--benchmark`: no probe cap where the engine samples inside its blocks |
+| `00e148e` | `batch_sampling_identity.py`: `--env`, `--threads 0`, case `dirac_exact` |
+| `e2b20f7` | `test_temporal_blocking.py`: Test13, Dirac and step blocked |
+
+- **Done.** Everything in §3, the generic implementation of §4 (used by
+  `Engine_AVX2`), and the AVX2 in-block sampler (§4.4): `Engine_AVX2_
+  Multithread` samples the probes and the energy inside its blocks, so a
+  batch runs blocked to its end. Dirac and step runs block (498 of 500 and
+  398 of 400 timesteps on the identity models before the preferred batch
+  length, 500 of 500 and 400 of 400 with it; the old loop 0). Identity holds on
+  every case tried (§6 and below).
+- **Shared code** the AVX2 work changed: `engine.h` (`GetPreferredBatchLength()`),
+  `openems.cpp` (`bsMaxLen` at least that, two lines; the sampled loop's
+  `NoteInterval()` call), `engine_benchmark.*`, and the slab contract in
+  `engine_extension.h` (voltages only in voltage hooks, currents only in
+  current hooks). The last sentence of §4.2 is replaced by §4.4's
+  "`--benchmark`" item.
+- **Verified** on the branch merged with the core's review fixes (`2ad8c61`):
+  - `test_batch_sampling.py`, AVX2 classes: 60 tests, 50 pass, 10 skipped
+    (GPU), none fail (on the core: 17 failed, "no timestep ran blocked").
+  - `batch_sampling_identity.py`, every row passes (302): all twelve cases,
+    flat and 4:16 × 1, 3 threads, and 8:16, 12:24, 16:32 × 1, 3, 8; all but
+    `sine_long` with `OPENEMS_AVX2_TBLOCK_SPLIT=lines` (flat, 4:16, 8:16 × 3,
+    8) and with `OPENEMS_BATCH_SAMPLING_RING` 1 and 2 (4:16, 8:16 × 3); all
+    twelve with the thread calibration (`--threads 0`; flat, 4:16, 8:16).
+  - `test_temporal_blocking.py`: 17 of 17, Test13 included.
+
+  On the branch before that merge (same AVX2 code):
+  - `tblock_identity.py` against the `bb3f974` binary: 160×128×192 PEC and
+    PML (8 and 7 threads), 224³ Mur (8): every variant identical.
+  - `--benchmark` on a 4.9 M-cell Dirac model: candidates up to k = 32, the
+    report says the probes cap nothing; it recommended 6 threads, 15:30,
+    2.4× the flat sweep.
+  - Speed, indicative only (i9-13900K, not quiet; 192×160×160, Mur, a lumped
+    port, three probes, 8 threads on the P-cores, `--avx2-temporal-block=12`,
+    600 timesteps, median of 3 alternating rounds, MC/s): Dirac old loop flat
+    395, old loop blocked 394 (runs flat), new loop blocked **1250**;
+    Gaussian with probes every 32 timesteps old flat 560, old blocked 1302,
+    new blocked 1387. The Dirac run evaluates the energy criterion at every
+    timestep (first 60 s), the old loop single-threaded on the main thread.
 - **Not done.**
-  - AVX2 in-block sampling: `Engine_AVX2_Multithread` overrides
-    `IterateSampledTS()` and samples per slab inside the trapezoid schedule
-    (§4.4). That is what lifts the depth cap, Dirac and step included.
   - Vulkan (§4.5): `SupportsBatchSampling()` false, it runs the old loops
     unchanged and prints `In-batch sampling OFF: the gpu engine does not
     support it`. Its blocked-timestep counter is not there either, so it
     prints no `Temporal blocking:` line.
   - The pipelined GPU loop (`openems.cpp`, "Pipelined GPU main loop") is
     unchanged.
+  - §6 and §7 below still describe the state before the AVX2 sampler.
+- **Open (AVX2).** A run still computes up to one batch past the timestep it
+  stops at (a stop found in the replay), as §3.3 says: 775 timesteps for a
+  stop at 425 on `gauss_exact`, about 33 000 past 167 533 on `sine_long` (half
+  a second of a tiny grid). An energy sample at every timestep costs one more
+  pass over each slab's rows from cache.
 
 ## 2. Why blocking stopped at the probe interval
 
@@ -362,31 +403,92 @@ same order, and `CalcFastEnergy()` the same double, as the old loop's live
 reads at that timestep. Fields are unchanged by sampling (the engine only
 reads), so dumps, which always read live, are unchanged too.
 
-### 4.4 For the AVX2 in-block sampler
+### 4.4 The AVX2 in-block sampler
 
-- Override `IterateSampledTS()`: one `m_startBarrier`/`m_stopBarrier` round for
-  the whole batch, the workers sampling inside `TrapezoidSweep()`; return true
-  from `SamplesInsideBlocks()`.
-- Per `ts = t-1` and pass: the voltages of the pass's E range `[eS, eE)` after
-  its `SlabApply2Voltages()`, the currents of its hook range `[hS, hE)` after
-  its `SlabApply2Current()`. The E ranges of one timestep partition `[0, NX)`,
-  the H ranges `[0, NX-1)` (the edge tile's hook range reaches NX), so every
-  footprint cell is sampled once (F2 of `STEADY_STATE_TEMPORAL_BLOCKING.md`).
-  Check per extension whether a current-phase hook writes voltages (`Slab*`
-  hooks, `SlabHookWritesFields()`); if one does, take the voltages after it.
-- The energy at the end of `t`: per row, |V|² after the V phase and |I|²
-  after the I phase of `t-1`, into a rows buffer like the steady-state one
-  (`FastEnergyRows()` sums both at once; it has to be split, or called once the
-  row is complete), the rows added in order by `FastEnergy(rows)` after the
-  block. With `SlabBlockEnd()` this already works for one check per block; a
-  block may now hold several energy timesteps (Dirac: every timestep), so the
-  rows need one buffer per energy timestep of the block, or a block may end at
-  each.
-- The footprint is sorted by (field, n, x, y, z); a per-x index of the
-  footprint lets a slab find its cells. `BatchProbeSample(i)` is plain memory,
-  `numTS` must not be touched by the samplers (the replay reads it).
-- `GetBlockedTimesteps()` already counts in `BlockedWorker()` (thread 0, depth
-  after `SlabBlockDepth()`).
+Built (`Engine_AVX2_Multithread`, `FDTD/engine_avx2_multithread.cpp`, the
+comment block "In-batch sampling inside the schedules"):
+
+- **One round per batch.** `IterateSampledTS()` checks the schedule as the
+  generic one does, builds per-batch tables by offset `o = ts - start` (the
+  probe sample of `ts+1`, and a prefix count of the energy samples), and calls
+  `IterateTS()` once: one `m_startBarrier`/`m_stopBarrier` round, or the
+  calibration's rounds (`CalibrateIterateTS()`), the workers sampling in all of
+  them (`m_sp_on`). `SamplesInsideBlocks()` is true. A batch without samples
+  is a plain `IterateTS()`.
+- **Probe samples, blocked.** In `TrapezoidSweep()`, per pass and timestep
+  `ts`, for the sample `t = ts+1`: the footprint voltages of the pass's E range
+  `[eLo, eHi)` right after its `SlabApply2Voltages()` (`SampleVoltages()`), the
+  currents of its hook range `[hS, hE)` right after its `SlabApply2Current()`
+  (`SampleCurrents()`). No barrier of their own.
+- **The partition.** At one `ts` the E ranges of all passes partition
+  `[0, NX)` (core `[A0+t+1, B0-t)`, wedge `[e-t, e+t+1)`, the edge tiles held at
+  0 and NX); the current updates `[An, hHi)` partition `[0, NX-1)` (core
+  `[A0+t+1, B0-t-1)`, wedge `[e-t-1, e+t+1)`), and the hook ranges equal them
+  except that the edge tile's reaches NX. So every footprint cell, x = NX-1
+  included, is taken once per sample, by the pass that advances it through
+  `ts`.
+- **The level.** Every slab-capable extension (excitation, Mur, absorbing
+  sheet, UPML, dispersive, Lorentz/conducting sheet, lumped RLC, TF/SF, steady
+  state) writes voltages only in its voltage hooks and currents only in its
+  current hooks; `engine_extension.h` now states this as part of the slab
+  contract. So a voltage is final for `ts` after the pass's voltage phase and
+  a current after its current phase, each phase ends at a barrier, and the
+  next write of that field (a voltage hook of `ts+1`, or a later pass's first
+  writes, which are voltages) comes after an update barrier that every thread
+  reaches only after sampling. Reads of the other field meanwhile are reads.
+- **The per-x index.** `IndexFootprint()` sorts the footprint per field by
+  x-line (CSR: `m_fpX`, `m_fpCell` = the cell's index in a sample, `m_fpMem` =
+  f8vector and lane), rebuilt only when the footprint changes. A pass takes
+  the contiguous entries of its x-range, split evenly over the threads.
+- **Energy samples.** A row (x, y) of `FastEnergy()` sums |V|² and |I|² with
+  separate float accumulators, so the two can be summed at different times.
+  `Engine_AVX2::FastEnergyFieldRows()` sums one field's rows exactly as
+  `FastEnergy()` does (four rows interleaved, each with its own accumulator, so
+  the FMA latency does not bound it); `FastEnergy(eRows, hRows)` adds the rows
+  in row order in double as `FastEnergy()` does. After the voltage phase a
+  pass sums |V|² of its E range's rows below NX-1, after the current phase
+  |I|² of the rows of `[An, hHi)`, each thread over the rows it has just
+  updated (`ForUpdateShare()`, the split of `UpdateVoltageShare()`/
+  `UpdateCurrentShare()`, rows or lines). The rows go into one buffer per
+  energy timestep of the block, `[slot][field][row]` floats, k slots, 8 bytes
+  per row and slot (the row values are floats, so this is exact). At the block
+  end `FinishBlockEnergy()` waits at one barrier, then thread `i` reduces the
+  slots `i, i+n, ...` into `SetBatchEnergySample()`. No barrier after: the next
+  block writes rows only past its first update barrier. A sample is therefore
+  `CalcFastEnergy()` of its timestep bit for bit, for every thread count, tile
+  and split. **The flat summation order is unchanged** (`FastEnergyRow()` now
+  calls the one-field helper twice; same operations per accumulator), and
+  steady-state detection, which keeps `FastEnergyRows()`, is untouched.
+- **Flat schedule.** The flat worker samples after `Apply2Current()` of each
+  timestep, every thread the footprint cells and rows of its own x-lines, then
+  one barrier (the next timestep's hooks may write any cell), and thread 0
+  reduces the energy. Only at sample timesteps.
+- **Steady state.** Sine runs have no energy samples (the energy criterion is
+  off next to steady-state detection); `SlabBlockDepth()`, the probe records
+  in `Apply2VoltagesSlab()` and `SlabBlockEnd()` run as before, beside the
+  probe samples.
+- **`numTS`.** The samplers never touch it; the workers compute `ts` from
+  `numTS` read before their first barrier, thread 0 advances it at the end as
+  before. `GetBlockedTimesteps()` counts in `BlockedWorker()` as before, now
+  with long batches.
+- **Batch length.** `Engine::GetPreferredBatchLength()` (new, default 0):
+  this engine asks for `2k` when blocked, and `RunFDTD()` keeps `bsMaxLen` at
+  least that (from the first batch on, and in `adaptBatchLength()`). A batch
+  still ends at a dump, the ring, NrTS or a benchmark boundary. Without it a
+  Dirac run's first batches were 1, 2, 4, ... timesteps, and on a grid where
+  half a second is fewer than `k` timesteps the batch length capped the depth.
+- **`--benchmark`.** The sampled loop calls `NoteInterval(longestRun,
+  SamplesInsideBlocks())`; with in-block sampling the probes cap nothing
+  (`MaxDepth()` unlimited) and the report prints "probes sampled inside the
+  blocks (in-batch sampling): they do not cap the block depth" instead of
+  "probes every N timesteps cap the block depth at N". This replaces the last
+  sentence of §4.2 (the benchmark no longer takes the batch length as a
+  depth). The old loop still notes the processing interval.
+- **Cost.** Per pass and timestep two table lookups; at a probe timestep a
+  gather of the pass's few footprint cells; at an energy timestep one more read
+  of the slab's rows from cache, and one barrier plus a sequential reduction
+  per block. With `--exact-endcriteria` or in the first 60 s a Dirac run has an
+  energy sample at every timestep.
 
 ### 4.5 For Vulkan
 
