@@ -22,6 +22,8 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 
+#include <climits>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <vector>
@@ -74,6 +76,14 @@ public:
 	//! the last check the replayed timestep has passed (one of a timestep
 	//! before it, as the run's verdict would have been at its end).
 	double GetLastDiff();
+	//! The most checks queued for GetLastDiff(); beyond, CheckPeriod() passes the oldest itself (for a run that never asks).
+	static const size_t MAX_QUEUED_VERDICTS = 4096;
+	//! The most timesteps a run may go ahead of its last GetLastDiff() without losing a verdict to that limit.
+	unsigned int GetMaxRunAhead() const
+	{
+		const uint64_t ts = (uint64_t)(MAX_QUEUED_VERDICTS-2)*m_period;
+		return ((m_period==0) || (ts>UINT_MAX)) ? UINT_MAX : (unsigned int)ts;
+	}
 	//! Called by GetLastDiff(): the GPU engine evaluates the checks it has computed (Engine_Vulkan::UpdateSteadyStateResult()).
 	void SetGpuUpdater(std::function<void()> updater) {m_gpuUpdater = std::move(updater);}
 

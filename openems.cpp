@@ -2140,8 +2140,11 @@ void openEMS::RunFDTD()
 			// as the old loop after PA->Process()
 			if ((next<0) || (next>(int)(NrTS - ts))) next=NrTS - ts;
 			b.nextStep = next;
+			// The steady-state checks of a batch wait in a queue of
+			// Engine_Ext_SteadyState::MAX_QUEUED_VERDICTS for the replay.
 			if (other || ((probe || energy) && (sampled >= bsRing))
-			    || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen))
+			    || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen)
+			    || (Eng_Ext_SSD && (ts - startTS >= Eng_Ext_SSD->GetMaxRunAhead())))
 				break;  // the last end: the processings read the live fields here
 			if (probe)
 				b.probeTS.push_back(ts);
