@@ -4,7 +4,8 @@
     batch_sampling_identity.py [--bin build/openEMS] [--engine avx2-multithreaded]
                                [--threads 1,3] [--schedules flat,4:16]
                                [--loops pipelined,standard] [--rings 0,1,5]
-                               [--cases all] [--work DIR] [--keep]
+                               [--cases all] [--env KEY=VALUE ...]
+                               [--work DIR] [--keep]
 
 For every case, engine schedule and thread count (with --engine=gpu: main
 loop), the same model runs on the same binary with OPENEMS_BATCH_SAMPLING=0
@@ -25,11 +26,14 @@ The new run must say "In-batch sampling ON". A schedule other than flat is
 asked for with --avx2-temporal-block (OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE=1 lifts
 the size guards on these small grids) or, with --engine=gpu,
 OPENEMS_GPU_TEMPORAL_BLOCK (OPENEMS_GPU_TEMPORAL_BLOCK_MB=1 lifts them); the
-"Temporal blocking: <b> of <n>" lines of both runs are reported. On the GPU
---loops picks the main loops: "pipelined" (the default one) and "standard"
-(OPENEMS_GPU_PIPELINE=0, for the old run and the new alike); --gpu-index sets
-OPENEMS_GPU_INDEX. The models write their XML with the CSXCAD/openEMS Python
-modules of this interpreter; only the binary under test simulates.
+"Temporal blocking: <b> of <n>" lines of both runs are reported. --threads 0
+leaves the thread count to the engine's calibration, which then runs on the
+sampled batches. On the GPU --loops picks the main loops: "pipelined" (the
+default one) and "standard" (OPENEMS_GPU_PIPELINE=0, for the old run and the
+new alike); --gpu-index sets OPENEMS_GPU_INDEX. --env sets an environment
+variable for both runs (OPENEMS_AVX2_TBLOCK_SPLIT=lines, ...). The models write
+their XML with the CSXCAD/openEMS Python modules of this interpreter; only the
+binary under test simulates.
 
 Every openEMS run is wrapped in `flock <--lock>` when --lock is given.
 """
@@ -143,6 +147,12 @@ CASES = {
 	"gauss_dumps": dict(exc="gauss", nrts=700, endcrit=0, dumps=True, dielectric=True),
 	# Dirac and step: Nyquist interval 1, every timestep a probe timestep
 	"dirac": dict(exc="dirac", nrts=500, endcrit=1e-6),
+	# Dirac with --exact-endcriteria: the energy at every timestep of the run,
+	# so a block holds an energy sample at each of its timesteps. The soft
+	# source leaves a growing static field, so the criterion (energy against
+	# its maximum) falls to 0.137 at timestep 191 and rises after; at 0.15 it
+	# stops the run at timestep 129, which no k above 3 divides
+	"dirac_exact": dict(exc="dirac", nrts=1500, endcrit=0.15, args=["--exact-endcriteria"]),
 	"step": dict(exc="step", nrts=400, endcrit=1e-6),
 	# a custom pulse
 	"custom": dict(exc="custom", nrts=1500, endcrit=5e-3, oversampling=6),
@@ -267,12 +277,15 @@ def run(args, case_name, case, schedule, threads, batch, loop="", ring=0):
 	env = dict(os.environ)
 	for k in ("OPENEMS_AVX2_TEMPORAL_BLOCK", "OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", "OPENEMS_GPU_TEMPORAL_BLOCK",
 	          "OPENEMS_GPU_TEMPORAL_BLOCK_MB", "OPENEMS_GPU_PIPELINE",
-	          "OPENEMS_BATCH_SAMPLING", "OPENEMS_BATCH_SAMPLING_RING"):
+	          "OPENEMS_BATCH_SAMPLING", "OPENEMS_BATCH_SAMPLING_RING", "OPENEMS_AVX2_TBLOCK_SPLIT"):
 		env.pop(k, None)
 	if loop == "standard":
 		env["OPENEMS_GPU_PIPELINE"] = "0"
 	if args.gpu_index is not None:
 		env["OPENEMS_GPU_INDEX"] = args.gpu_index
+	for kv in args.env:
+		k, _, v = kv.partition("=")
+		env[k] = v
 	env["OPENEMS_PROBE_PRECISION"] = "17"
 	env["OPENEMS_ENDCRIT_TRACE"] = "1"
 	env["OPENEMS_STEADYSTATE_TRACE"] = "1"
@@ -354,8 +367,11 @@ def main():
 	ap.add_argument("--schedules", default="flat,4:16", help="flat and/or <k>:<W> schedules")
 	ap.add_argument("--cases", default="all")
 	ap.add_argument("--rings", default="0", help="OPENEMS_BATCH_SAMPLING_RING values for the new runs, 0: the default")
+	ap.add_argument("--ring", type=int, default=0, help="one OPENEMS_BATCH_SAMPLING_RING for the new runs (--rings N)")
 	ap.add_argument("--loops", default="pipelined", help="GPU main loops: pipelined and/or standard")
 	ap.add_argument("--gpu-index", default=None, help="OPENEMS_GPU_INDEX for every run")
+	ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+	                help="an environment variable for both runs (repeatable)")
 	ap.add_argument("--work", default="/dev/shm/openems_batch_sampling_identity")
 	ap.add_argument("--lock", default="", help="flock this file around every run")
 	ap.add_argument("--keep", action="store_true", help="keep the simulation directories")
@@ -366,7 +382,7 @@ def main():
 	threads = [int(t) for t in args.threads.split(",")] if args.engine != "gpu" else [0]
 	schedules = args.schedules.split(",")
 	loops = args.loops.split(",") if args.engine == "gpu" else [""]
-	rings = [int(r) for r in args.rings.split(",")]
+	rings = [args.ring] if args.ring else [int(r) for r in args.rings.split(",")]
 	os.makedirs(args.work, exist_ok=True)
 
 	failures = 0

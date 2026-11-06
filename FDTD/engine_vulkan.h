@@ -119,6 +119,8 @@ public:
 	// the engine falls back to Engine's generic sampler.
 	virtual bool SupportsBatchSampling() const {return true;}
 	virtual bool SamplesInsideBlocks() const {return m_bsGpuOn;}
+	//! Two blocks of the blocked schedule, so that most of a batch runs at full depth.
+	virtual unsigned int GetPreferredBatchLength() const;
 	virtual void ScheduleBatchSamples(const std::vector<unsigned int>& probeTS, const std::vector<unsigned int>& energyTS);
 	virtual bool IterateSampledTS(unsigned int iterTS);
 	//! The sampled timesteps a batch may hold (the ring) for a footprint of

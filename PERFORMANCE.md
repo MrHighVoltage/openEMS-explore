@@ -1043,7 +1043,10 @@ in §5.2 and §5.4:
   both schedules clamp *k* to it — which is what keeps probes and dumps correct
   with no work on their side. That interval is typically 5–25 timesteps, which
   happens to bracket the measured optimum (*k* = 6–24). A run oversampled far
-  past Nyquist will not reach these figures.
+  past Nyquist will not reach these figures. *Since 2026-11-06* the AVX2
+  engine samples the probes and the energy inside its blocks
+  (`plans/BATCH_SAMPLING.md` §4.4), so on it only field dumps cap the depth,
+  and Dirac and step excitations (a probe every timestep) block too.
 - **These models have no probes or dumps at all**, so they see the ceiling of
   what blocking can do. A probe-dense model will land lower.
 
@@ -1612,7 +1615,9 @@ batches. The candidates are:
 - on the AVX2 engine, 25 to 140 % of the L3;
 - the configured schedule.
 
-A probe interval below 32 timesteps caps their depth. A 2 s warm-up on the
+A probe interval below 32 timesteps caps their depth, unless the engine
+samples the probes inside its blocks (the AVX2 engine since 2026-11-06; the
+report then says so instead). A 2 s warm-up on the
 flat sweep, which also covers the AVX2 engine's thread calibration, sets the
 run length: about 3 s of the flat sweep, unless `--benchmark-timesteps` sets
 it. Each candidate runs twice, the second round in reverse order. Nothing is

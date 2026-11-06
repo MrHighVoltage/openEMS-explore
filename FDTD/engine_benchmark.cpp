@@ -75,7 +75,7 @@ EngineBenchmark::EngineBenchmark(Engine* eng, double numCells, unsigned int time
                                  unsigned int configuredThreads)
 	: m_eng(eng), m_cells(numCells), m_runTS(timestepsPerRun), m_threaded(eng->GetNumThreads() > 0),
 	  m_configuredThreads(configuredThreads), m_phase(WARMUP), m_boundary(0), m_startTS(0),
-	  m_warmSeconds(0), m_rate(0), m_warmRate(0), m_maxInterval(0), m_set(0), m_settling(false),
+	  m_warmSeconds(0), m_rate(0), m_warmRate(0), m_maxInterval(0), m_sampledInside(false), m_set(0), m_settling(false),
 	  m_bestRate(0), m_settleNext(false), m_pos(0)
 {
 	m_configured = eng->GetTemporalBlocking();
@@ -107,19 +107,28 @@ int EngineBenchmark::Clamp(int step, unsigned int currTS) const
 	return std::min(step, (int)(m_boundary - currTS));
 }
 
-void EngineBenchmark::NoteInterval(int step)
+void EngineBenchmark::NoteInterval(int step, bool sampledInsideBlocks)
 {
 	// Only the warm-up's intervals shape the candidates. PA->Process() returns
-	// the timesteps to the next probe or dump, and the main loop hands the
+	// the timesteps to the next probe or dump, and the old main loop hands the
 	// engine at most that many at a time -- which is the deepest block it
-	// can run.
-	if (m_phase == WARMUP && step > 0 && (unsigned int)step > m_maxInterval)
+	// can run. With in-batch sampling the loop runs past the probes; an engine
+	// that samples between its blocks is still capped by the longest run
+	// between two samples, one that samples inside them by nothing the probes
+	// do (field dumps, which would still end the batches, are off here).
+	if (m_phase != WARMUP)
+		return;
+	if (sampledInsideBlocks)
+		m_sampledInside = true;
+	else if (step > 0 && (unsigned int)step > m_maxInterval)
 		m_maxInterval = (unsigned int)step;
 }
 
 unsigned int EngineBenchmark::MaxDepth() const
 {
 	// Beyond 32 no engine blocks anyway; a longer interval means "no cap".
+	if (m_sampledInside)
+		return UINT_MAX;
 	return (m_maxInterval > 0 && m_maxInterval < 32) ? m_maxInterval : UINT_MAX;
 }
 
@@ -528,7 +537,10 @@ void EngineBenchmark::Report(std::ostream& os, const std::string& engineName,
 		restore();
 		return;
 	}
-	if (maxDepth != UINT_MAX)
+	if (m_sampledInside)
+		os << "  probes sampled inside the blocks (in-batch sampling): they do not cap the block depth"
+		   << std::endl;
+	else if (maxDepth != UINT_MAX)
 		os << "  probes every " << m_maxInterval << " timesteps cap the block depth at "
 		   << m_maxInterval << std::endl;
 

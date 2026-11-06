@@ -892,7 +892,13 @@ work on their side — the grid is globally coherent whenever one reads it. But
 that ceiling is real: `openems.cpp:639` sets the probe interval to
 `Nyquist/oversampling`, typically 5–25 timesteps. It happens to bracket the
 measured optimum (k=6…24), which is why this is usable at all; a run oversampled
-far past Nyquist will not reach the numbers above.
+far past Nyquist will not reach the numbers above. *Since 2026-11-06* in-batch
+sampling lifts that cap on this engine (`plans/BATCH_SAMPLING.md` §4.4): the
+main loop hands over long batches, each pass copies what the probes and the
+energy end criterion read as its slab completes a timestep, and only field dumps
+still end a batch. Dirac and step excitations, whose probes are due every
+timestep and which therefore never blocked, now block as deep as the others
+(`OPENEMS_BATCH_SAMPLING=0` restores the old loop).
 
 **Verified by `python/Tests/test_temporal_blocking.py`**, which runs each
 configuration twice — flat and blocked — and compares E and H dumps

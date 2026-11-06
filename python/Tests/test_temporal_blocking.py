@@ -44,6 +44,18 @@ until it stops on its own and compare more than the fields: the trace of
 every check (OPENEMS_STEADYSTATE_TRACE=1: timestep, energy, verdict, all
 digits) and the timestep the run stopped at must be identical too.
 
+A Dirac or step excitation has a Nyquist interval of one timestep, so its
+probes and the energy end criterion are due at every timestep. The old main
+loop ran it flat; in-batch sampling (plans/BATCH_SAMPLING.md) lets the blocked
+schedule sample the probes and the energy inside its blocks. The cases of
+Test13 run such a model with probes of every kind and E/H dumps in a window
+near the end (a dump ends a batch, so whole-run dumps would keep it flat)
+and compare, besides the dumps, every probe file (17 digits), the trace of
+the energy criterion (OPENEMS_ENDCRIT_TRACE=1) and the iteration count; they
+also require the "Temporal blocking: <b> of <n> timesteps ran blocked" line
+to report b > 0, since the ACTIVE line alone would pass a run that never
+blocked.
+
 The grid is 64 x-lines split into four 16-line tiles (OPENEMS_AVX2_TEMPORAL_
 BLOCK=4:16, i.e. k=4, W=16, satisfying the engine's hard W>=2k constraint),
 small enough to finish in well under a second. Left alone, the two
@@ -592,6 +604,204 @@ class Test12_SteadyStateExtensions(SteadyStateCaseMixin, unittest.TestCase):
 
     def test_mur(self):
         self._compare_steady("ss_mur", ["MUR"] * 6, self.SETUP, DELTA_P74, [("4:16", 2), ("3:13", 4)])
+
+
+# ---------------------------------------------------------------------------
+# Excitations with every timestep a probe timestep: in-batch sampling
+# ---------------------------------------------------------------------------
+
+SAMPLED_TIMESTEPS = 280
+# E and H dumps over the whole grid between these times only, timesteps 255
+# to 265 at the 1.926 ps timestep of the 1 mm grid: a dump ends a batch, so
+# the batches before the window run long.
+DUMP_WINDOW = (4.9e-10, 5.1e-10)
+
+_SAMPLED_TEMPLATE = """
+import xml.etree.ElementTree as ET
+import numpy as np
+from CSXCAD import ContinuousStructure
+from openEMS import openEMS
+
+FDTD = openEMS(NrTS={nrts}, EndCriteria=1e-9)
+{excitation}
+FDTD.SetBoundaryCond({boundary!r})
+
+CSX = ContinuousStructure()
+FDTD.SetCSX(CSX)
+mesh = CSX.GetGrid()
+mesh.SetDeltaUnit(1e-3)
+mesh.SetLines("x", np.arange({nx}, dtype=float))
+mesh.SetLines("y", np.arange({ny}, dtype=float))
+mesh.SetLines("z", np.arange({nz}, dtype=float))
+xl, yl, zl = mesh.GetLines("x"), mesh.GetLines("y"), mesh.GetLines("z")
+
+metal = CSX.AddMetal("block")
+metal.AddBox([xl[{obj_lo}], yl[6], zl[6]], [xl[{obj_hi}], yl[9], zl[9]], priority=10)
+lrc = CSX.AddLumpedElement("rlc", ny="z", caps=True, R=75.0, L=5e-9, C=2e-12, LEtype=0)
+lrc.AddBox([xl[{lump_lo}], yl[14], zl[10]], [xl[{lump_hi}], yl[18], zl[14]], priority=10)
+
+exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
+exc.AddBox([xl[{exc_x}], yl[10], zl[10]], [xl[{exc_x}] + 1, yl[22], zl[22]])
+
+# probes of every kind; the E and H field probes on both sides of the tile edge at x=48
+ut = CSX.AddProbe("ut", p_type=0, frequency=[3e9, 6e9])
+ut.AddBox([xl[44], yl[16], zl[10]], [xl[44], yl[16], zl[20]])
+it = CSX.AddProbe("it", p_type=1, norm_dir=0)
+it.AddBox([xl[42], yl[12], zl[12]], [xl[42], yl[20], zl[20]])
+et = CSX.AddProbe("et", p_type=2)
+et.AddBox([xl[48], yl[16], zl[12]], [xl[48], yl[16], zl[12]])
+ht = CSX.AddProbe("ht", p_type=3)
+ht.AddBox([xl[47], yl[15], zl[14]], [xl[47], yl[15], zl[14]])
+edge = CSX.AddProbe("et_last", p_type=2)
+edge.AddBox([xl[-1], yl[16], zl[16]], [xl[-1], yl[16], zl[16]])
+
+dumpE = CSX.AddDump("Et", dump_type=0, dump_mode=0, file_type=1)
+dumpE.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
+dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
+dumpH.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
+
+FDTD.Write2XML({xml!r})
+
+# the Python modules cannot set a dump's start and stop time
+tree = ET.parse({xml!r})
+for db in tree.iter("DumpBox"):
+    db.set("StartTime", repr({start!r}))
+    db.set("StopTime", repr({stop!r}))
+tree.write({xml!r})
+"""
+
+
+def _run_sampled(tag, excitation, boundary, schedule=None, threads=THREADS):
+    """Run one Dirac or step model; returns (stdout, E, H, probe files).
+
+    `schedule` is a k:W for OPENEMS_AVX2_TEMPORAL_BLOCK, or None for the flat
+    sweep; in-batch sampling is on in both (the default)."""
+    sim_path = os.path.join(tempfile.gettempdir(), "tblk_%s" % tag)
+    shutil.rmtree(sim_path, ignore_errors=True)
+    os.makedirs(sim_path)
+    xml = os.path.join(sim_path, "model.xml")
+    script = _SAMPLED_TEMPLATE.format(
+        nrts=SAMPLED_TIMESTEPS, excitation=excitation, boundary=boundary,
+        nx=NX, ny=NY, nz=NZ, obj_lo=OBJ_X_LO, obj_hi=OBJ_X_HI,
+        lump_lo=LUMPED_X_LO, lump_hi=LUMPED_X_HI, exc_x=EXC_X, xml=xml,
+        start=DUMP_WINDOW[0], stop=DUMP_WINDOW[1],
+    )
+    script_path = os.path.join(sim_path, "model.py")
+    with open(script_path, "w") as f:
+        f.write(script)
+    proc = subprocess.run([XML_PYTHON, script_path], cwd=sim_path, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not os.path.exists(xml):
+        shutil.rmtree(sim_path, ignore_errors=True)
+        raise RuntimeError("writing the model failed (tag=%s, rc=%s):\n%s\n%s"
+                           % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
+
+    env = dict(os.environ)
+    for k in ("OPENEMS_AVX2_TEMPORAL_BLOCK", "OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", "OPENEMS_BATCH_SAMPLING",
+              "OPENEMS_BATCH_SAMPLING_RING"):
+        env.pop(k, None)
+    env["OPENEMS_PROBE_PRECISION"] = "17"
+    env["OPENEMS_ENDCRIT_TRACE"] = "1"
+    if schedule:
+        env["OPENEMS_AVX2_TEMPORAL_BLOCK"] = schedule
+        env["OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE"] = "1"
+    proc = subprocess.run(
+        [OPENEMS_BIN, xml, "--engine=avx2-multithreaded", "--numThreads=%d" % threads],
+        cwd=sim_path, env=env, capture_output=True, text=True, timeout=180,
+    )
+    try:
+        if proc.returncode != 0:
+            raise RuntimeError("simulation failed (tag=%s, rc=%s):\n%s\n%s"
+                               % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
+
+        def _load(name):
+            with h5py.File(os.path.join(sim_path, name), "r") as f:
+                td = f["FieldData/TD"]
+                return np.array([np.array(td[k]) for k in sorted(td.keys())])
+
+        probes = {}
+        for name in ("ut", "ut_FD", "it", "et", "ht", "et_last"):
+            with open(os.path.join(sim_path, name), "rb") as f:
+                # without the header line, which holds the date
+                probes[name] = [l for l in f.read().split(b"\n") if not l.startswith(b"%")]
+        E, H = _load("Et.h5"), _load("Ht.h5")
+    finally:
+        shutil.rmtree(sim_path, ignore_errors=True)
+    return proc.stdout + proc.stderr, E, H, probes
+
+
+def _endcrit_trace(stdout):
+    return [l for l in stdout.splitlines() if l.startswith("endcrit trace:")]
+
+
+def _iterations(stdout):
+    m = re.findall(r"Time for (\d+) iterations", stdout)
+    return int(m[-1]) if m else None
+
+
+def _blocked_timesteps(stdout):
+    m = re.search(r"^Temporal blocking: (\d+) of (\d+) timesteps ran blocked", stdout, re.M)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+class SampledCaseMixin:
+    """A Dirac or step model, flat and blocked over several (k, W) and thread
+    counts: the dumps, the probe files, the energy trace and the iteration
+    count must be identical, and most timesteps must have run blocked."""
+
+    SCHEDULES = [("4:16", 2), ("3:13", 3), ("6:20", 4), ("8:16", 1), ("8:16", 3)]
+
+    def _compare_sampled(self, tag, excitation, boundary):
+        flat_out, flat_E, flat_H, flat_probes = _run_sampled(tag + "_flat", excitation, boundary)
+        self.assertIn("In-batch sampling ON", flat_out, "in-batch sampling did not engage")
+        self.assertNotIn("AVX2 temporal blocking ACTIVE", flat_out)
+        self.assertNotIn("cancelling simulation", flat_out, "the flat run diverged")
+        self.assertGreater(np.max(np.abs(flat_E)), 0.0, "flat run produced an all-zero field")
+        self.assertTrue(8 <= flat_E.shape[0] <= 14,
+                        "the dump window holds %d timesteps, not about 11" % flat_E.shape[0])
+        trace = _endcrit_trace(flat_out)
+        self.assertEqual(len(trace), SAMPLED_TIMESTEPS,
+                         "the energy criterion was evaluated at %d timesteps, not at every one" % len(trace))
+        self.assertEqual(_iterations(flat_out), SAMPLED_TIMESTEPS)
+        for name, rows in flat_probes.items():
+            self.assertGreater(len(rows), 1, "probe %s is empty" % name)
+
+        for kw, threads in self.SCHEDULES:
+            name = "%s_%s_%d" % (tag, kw.replace(":", "_"), threads)
+            out, E, H, probes = _run_sampled(name, excitation, boundary, kw, threads)
+            self.assertIn("AVX2 temporal blocking ACTIVE", out,
+                          "blocking did not engage at k:W=%s, %d threads; engine said:\n%s"
+                          % (kw, threads, _relevant_lines(out)))
+            blocked = _blocked_timesteps(out)
+            self.assertIsNotNone(blocked, "k:W=%s, %d threads: no 'Temporal blocking:' line" % (kw, threads))
+            # Short batches at the start (1, 2, 4, ... timesteps) and the dump
+            # window run some timesteps outside blocks; most must be inside.
+            self.assertGreater(blocked[0], blocked[1] // 2,
+                               "k:W=%s, %d threads: only %d of %d timesteps ran blocked"
+                               % (kw, threads, blocked[0], blocked[1]))
+            for pname in sorted(flat_probes):
+                self.assertEqual(flat_probes[pname], probes[pname],
+                                 "k:W=%s, %d threads: probe %s differs from the flat sweep's"
+                                 % (kw, threads, pname))
+            self.assertEqual(trace, _endcrit_trace(out),
+                             "k:W=%s, %d threads: the energy trace differs from the flat sweep's" % (kw, threads))
+            self.assertEqual(_iterations(out), SAMPLED_TIMESTEPS)
+            self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
+                            "k:W=%s with %d threads is not bit-identical to the flat sweep" % (kw, threads))
+
+
+class Test13_SampledExcitations(SampledCaseMixin, unittest.TestCase):
+    """Dirac and step excitations: a probe and an energy evaluation at every
+    timestep, sampled inside the blocks. Mur on x (the edge tiles' hooks),
+    PML on the other faces, a metal block and a lumped RLC across the tile
+    edge at x=48, an E probe on the last x-line."""
+
+    BOUNDARY = ["MUR", "MUR", "PML_8", "PML_8", "PML_8", "PML_8"]
+
+    def test_dirac(self):
+        self._compare_sampled("dirac", "FDTD.SetDiracExcite(10e9)", self.BOUNDARY)
+
+    def test_step(self):
+        self._compare_sampled("step", "FDTD.SetStepExcite(10e9)", self.BOUNDARY)
 
 
 if __name__ == "__main__":

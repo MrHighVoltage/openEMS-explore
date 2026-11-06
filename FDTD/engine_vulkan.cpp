@@ -3997,6 +3997,15 @@ void Engine_Vulkan::CleanupBatchSampling()
 	m_bsRing = 0;
 }
 
+unsigned int Engine_Vulkan::GetPreferredBatchLength() const
+{
+	// Resolved when the first batch is recorded; asked before it.
+	if (m_tbAnnounced)
+		return m_tbActive ? 2 * m_tbK : 0;
+	const TemporalBlockingPlan plan = PlanTemporalBlocking(m_tbRequest);
+	return plan.active ? 2 * plan.k : 0;
+}
+
 unsigned int Engine_Vulkan::MaxSpeculativeBatch() const
 {
 	// A batch of more chunks than the command ring has waits for its own

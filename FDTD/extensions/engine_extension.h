@@ -96,6 +96,13 @@ public:
 	//     once per call, scratch buffers rebuilt per call, and similar are all
 	//     broken by a schedule that visits the same timestep many times for
 	//     different slabs; index such state by numTS instead.
+	//   * Write voltages only in the three voltage hooks and currents only in
+	//     the three current hooks. In-batch sampling takes a slab's voltages
+	//     of a timestep once its Apply2VoltagesSlab() is done and its currents
+	//     once its Apply2CurrentSlab() is (Engine_AVX2_Multithread::
+	//     SampleVoltages(), plans/BATCH_SAMPLING.md §4.4). Every slab-capable
+	//     extension in the tree keeps to it; one that cannot needs the
+	//     sampling points moved first.
 	//
 	// Three shapes cover every extension in the tree:
 	//   A  volume or cell list -- intersect the extension's x-extent with
