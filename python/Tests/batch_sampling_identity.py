@@ -3,12 +3,14 @@
 
     batch_sampling_identity.py [--bin build/openEMS] [--engine avx2-multithreaded]
                                [--threads 1,3] [--schedules flat,4:16]
+                               [--loops pipelined,standard] [--rings 0,1,5]
                                [--cases all] [--work DIR] [--keep]
 
-For every case, engine schedule and thread count, the same model runs twice
-on the same binary: with OPENEMS_BATCH_SAMPLING=0 (the old loop: every
-IterateTS() ends at the next timestep a processing is due at) and with
-in-batch sampling (plans/BATCH_SAMPLING.md). Both runs print the probe files
+For every case, engine schedule and thread count (with --engine=gpu: main
+loop), the same model runs on the same binary with OPENEMS_BATCH_SAMPLING=0
+(the old loop: every IterateTS() ends at the next timestep a processing is due
+at) and with in-batch sampling (plans/BATCH_SAMPLING.md), once per ring size
+(--rings; 0 is the default ring). Both runs print the probe files
 with 17 digits (OPENEMS_PROBE_PRECISION) and trace every evaluation of the
 energy end criterion and every steady-state check. They must agree in:
 
@@ -22,8 +24,11 @@ energy end criterion and every steady-state check. They must agree in:
 The new run must say "In-batch sampling ON". A schedule other than flat is
 asked for with --avx2-temporal-block (OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE=1 lifts
 the size guards on these small grids) or, with --engine=gpu,
-OPENEMS_GPU_TEMPORAL_BLOCK; the "Temporal blocking: <b> of <n>" lines of both
-runs are reported. The models write their XML with the CSXCAD/openEMS Python
+OPENEMS_GPU_TEMPORAL_BLOCK (OPENEMS_GPU_TEMPORAL_BLOCK_MB=1 lifts them); the
+"Temporal blocking: <b> of <n>" lines of both runs are reported. On the GPU
+--loops picks the main loops: "pipelined" (the default one) and "standard"
+(OPENEMS_GPU_PIPELINE=0, for the old run and the new alike); --gpu-index sets
+OPENEMS_GPU_INDEX. The models write their XML with the CSXCAD/openEMS Python
 modules of this interpreter; only the binary under test simulates.
 
 Every openEMS run is wrapped in `flock <--lock>` when --lock is given.
@@ -185,29 +190,36 @@ STOP = re.compile(r"(after \d+ timesteps|Time for \d+ iterations)")
 TBLOCK = re.compile(r"^Temporal blocking: (\d+) of (\d+) timesteps ran blocked")
 
 
-def run(args, case_name, case, schedule, threads, batch):
-	tag = "%s_%s_t%d_%s" % (case_name, schedule.replace(":", "x"), threads, "new" if batch else "old")
+def run(args, case_name, case, schedule, threads, batch, loop="", ring=0):
+	tag = "%s_%s_t%d%s_%s" % (case_name, schedule.replace(":", "x"), threads, ("_" + loop) if loop else "",
+	                          ("new_r%d" % ring) if batch else "old")
 	sim = os.path.join(args.work, tag)
 	shutil.rmtree(sim, ignore_errors=True)
 	os.makedirs(sim)
 	xml = write_model(sim, case)
 	env = dict(os.environ)
 	for k in ("OPENEMS_AVX2_TEMPORAL_BLOCK", "OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE", "OPENEMS_GPU_TEMPORAL_BLOCK",
+	          "OPENEMS_GPU_TEMPORAL_BLOCK_MB", "OPENEMS_GPU_PIPELINE",
 	          "OPENEMS_BATCH_SAMPLING", "OPENEMS_BATCH_SAMPLING_RING"):
 		env.pop(k, None)
+	if loop == "standard":
+		env["OPENEMS_GPU_PIPELINE"] = "0"
+	if args.gpu_index is not None:
+		env["OPENEMS_GPU_INDEX"] = args.gpu_index
 	env["OPENEMS_PROBE_PRECISION"] = "17"
 	env["OPENEMS_ENDCRIT_TRACE"] = "1"
 	env["OPENEMS_STEADYSTATE_TRACE"] = "1"
 	if not batch:
 		env["OPENEMS_BATCH_SAMPLING"] = "0"
-	elif args.ring:
-		env["OPENEMS_BATCH_SAMPLING_RING"] = str(args.ring)
+	elif ring:
+		env["OPENEMS_BATCH_SAMPLING_RING"] = str(ring)
 	cmd = [args.bin, xml, "--engine=" + args.engine] + case.get("args", [])
 	if args.engine != "gpu":
 		cmd.append("--numThreads=%d" % threads)
 	if schedule != "flat":
 		if args.engine == "gpu":
 			env["OPENEMS_GPU_TEMPORAL_BLOCK"] = schedule
+			env["OPENEMS_GPU_TEMPORAL_BLOCK_MB"] = "1"
 		else:
 			cmd.append("--avx2-temporal-block=" + schedule)
 			env["OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE"] = "1"
@@ -274,40 +286,58 @@ def main():
 	ap.add_argument("--threads", default="1,3")
 	ap.add_argument("--schedules", default="flat,4:16", help="flat and/or <k>:<W> schedules")
 	ap.add_argument("--cases", default="all")
-	ap.add_argument("--ring", type=int, default=0, help="OPENEMS_BATCH_SAMPLING_RING for the new runs")
+	ap.add_argument("--rings", default="0", help="OPENEMS_BATCH_SAMPLING_RING values for the new runs, 0: the default")
+	ap.add_argument("--loops", default="pipelined", help="GPU main loops: pipelined and/or standard")
+	ap.add_argument("--gpu-index", default=None, help="OPENEMS_GPU_INDEX for every run")
 	ap.add_argument("--work", default="/dev/shm/openems_batch_sampling_identity")
 	ap.add_argument("--lock", default="", help="flock this file around every run")
 	ap.add_argument("--keep", action="store_true", help="keep the simulation directories")
 	args = ap.parse_args()
+	args.bin = os.path.abspath(args.bin)  # the runs start in their own directories
 
 	names = list(CASES) if args.cases == "all" else args.cases.split(",")
 	threads = [int(t) for t in args.threads.split(",")] if args.engine != "gpu" else [0]
 	schedules = args.schedules.split(",")
+	loops = args.loops.split(",") if args.engine == "gpu" else [""]
+	rings = [int(r) for r in args.rings.split(",")]
 	os.makedirs(args.work, exist_ok=True)
 
 	failures = 0
-	print("%-12s %-6s %3s  %-6s %-22s %-22s %s" % ("case", "sched", "thr", "result", "blocked old", "blocked new", "stop"))
+	print("%-12s %-6s %3s %-9s %4s  %-6s %-14s %-14s %s" % ("case", "sched", "thr", "loop", "ring", "result",
+	      "blocked old", "blocked new", "stop"))
+	fmt = lambda r: ("%d/%d" % r["tblock"][0]) if (r and r["tblock"]) else "-"
 	for name in names:
 		case = CASES[name]
 		for schedule in schedules:
 			for t in threads:
-				try:
-					old = run(args, name, case, schedule, t, False)
-					new = run(args, name, case, schedule, t, True)
-					diffs = compare(old, new)
-				except Exception as exc:  # report and go on
-					old = new = None
-					diffs = ["error: %s" % exc]
-				failures += bool(diffs)
-				fmt = lambda r: ("%d/%d" % r["tblock"][0]) if (r and r["tblock"]) else "-"
-				print("%-12s %-6s %3d  %-6s %-22s %-22s %s" % (name, schedule, t, "FAIL" if diffs else "pass",
-				      fmt(old), fmt(new), (new or {}).get("stop", "")), flush=True)
-				for d in diffs:
-					print("    " + d)
-				if not args.keep and not diffs:
-					for r in (old, new):
-						if r:
-							shutil.rmtree(r["sim"], ignore_errors=True)
+				for loop in loops:
+					try:
+						old = run(args, name, case, schedule, t, False, loop)
+						olderr = None
+					except Exception as exc:  # report and go on
+						old, olderr = None, "error: %s" % exc
+					kept = False
+					for ring in rings:
+						new = None
+						if olderr:
+							diffs = [olderr]
+						else:
+							try:
+								new = run(args, name, case, schedule, t, True, loop, ring)
+								diffs = compare(old, new)
+							except Exception as exc:
+								diffs = ["error: %s" % exc]
+						failures += bool(diffs)
+						print("%-12s %-6s %3d %-9s %4s  %-6s %-14s %-14s %s" % (name, schedule, t, loop or "-",
+						      ring or "def", "FAIL" if diffs else "pass", fmt(old), fmt(new),
+						      (new or {}).get("stop", "")), flush=True)
+						for d in diffs:
+							print("    " + d)
+						kept = kept or bool(diffs)
+						if not args.keep and not diffs and new:
+							shutil.rmtree(new["sim"], ignore_errors=True)
+					if not args.keep and not kept and old:
+						shutil.rmtree(old["sim"], ignore_errors=True)
 	print("%d failure(s)" % failures)
 	return 1 if failures else 0
 
