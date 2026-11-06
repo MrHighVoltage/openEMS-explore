@@ -25,6 +25,7 @@
 #include <string>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <unistd.h>
 
 using std::cout;
@@ -77,6 +78,11 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_blk_W = 0;
 	m_blk_active = false;
 	m_blk_blockedTS = 0;
+	m_sp_on = false;
+	m_sp_len = 0;
+	m_sp_rowCount = 0;
+	m_fpIndexedData = nullptr;
+	m_fpIndexedSize = 0;
 
 	// Synchronisation knobs of the blocked schedule, kept switchable so each
 	// can be measured against the old behaviour on the same binary.
@@ -243,9 +249,11 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 
 	m_iterTS = iterTS;
 	// A call of one timestep runs flat: a block of depth one is the flat
-	// sweep with the wedges' extra barriers. Dirac and step excitations, whose
-	// Nyquist interval is one timestep, call nothing else.
+	// sweep with the wedges' extra barriers. The old main loop calls nothing
+	// else for Dirac and step excitations, whose Nyquist interval is one
+	// timestep; in-batch sampling hands them long batches (IterateSampledTS()).
 	m_blk_active = (m_blk_k > 1) && (iterTS >= 2);
+	PrepareSampledRound();
 
 	m_startBarrier->wait(); // start threads
 	m_stopBarrier->wait();  // wait for completion
@@ -275,11 +283,15 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 // the slab hooks returns false and sends the whole run back to the flat sweep,
 // so this is safe by omission rather than by enumeration.
 //
-// The depth actually used is min(k, iterTS), and openems.cpp calls IterateTS()
-// with the number of timesteps until the next probe or field dump. So the grid
-// is globally coherent whenever a probe reads it, with no work from the
-// processing side -- but the achievable depth is capped by the probe interval,
-// which openems.cpp sets to Nyquist/oversampling, typically 5-25 timesteps.
+// The depth actually used is min(k, iterTS). The old main loop calls
+// IterateTS() with the number of timesteps until the next probe or field dump,
+// so the grid is globally coherent whenever a probe reads it, but the depth is
+// capped by the probe interval: Nyquist/oversampling, typically 5-25
+// timesteps, and one for Dirac and step excitations. With in-batch sampling
+// (IterateSampledTS(), plans/BATCH_SAMPLING.md) the loop hands over long
+// batches instead, and the passes below copy what the probes and the energy
+// end criterion read as each slab completes a timestep; only field dumps end
+// a batch.
 // ----------------------------------------------------------------------------
 
 void Engine_AVX2_Multithread::ConfigureTemporalBlocking(bool announce)
@@ -665,6 +677,9 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		SyncWait(threadID, SYNC_UPDATE);
 		SlabPostVoltage(eS, eE, ts, threadID);
 		SlabApply2Voltages(eS, eE, ts, threadID);
+		// In-batch sampling: the voltages of [eLo,eHi) are final for ts here.
+		if (m_sp_on)
+			SampleVoltages(eLo, eHi, ts, t0, threadID);
 
 		const int hHi = (Bn < NXH) ? Bn : NXH;
 		// The sweep stops at NX-1 because UpdateCurrents reads volt at x+1, but
@@ -684,6 +699,9 @@ void Engine_AVX2_Multithread::TrapezoidSweep(int A0, int B0, int k, int dir,
 		SyncWait(threadID, SYNC_UPDATE);
 		SlabPostCurrent(hS, hE, ts, threadID);
 		SlabApply2Current(hS, hE, ts, threadID);
+		// ... and the currents of [hS,hE).
+		if (m_sp_on)
+			SampleCurrents(An, hHi, (int)hS, (int)hE, ts, t0, threadID);
 
 		A = An;
 		B = Bn;
@@ -718,6 +736,9 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 			deferred = ext->SlabBlockEnd(t0, depth, (int)threadID) || deferred;
 		if (deferred)
 			SyncWait(threadID, SYNC_HOOK);
+		// In-batch sampling: the energy samples of the block, from their rows.
+		if (m_sp_on)
+			FinishBlockEnergy(t0, depth, threadID);
 
 		if ((threadID == 0) && (depth >= 2))
 			m_blk_blockedTS += depth;
@@ -734,6 +755,283 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 	// it again, so the last barrier above orders this write after all of them.
 	if (threadID == 0)
 		numTS += total;
+}
+
+// ----------------------------------------------------------------------------
+// In-batch sampling inside the schedules (plans/BATCH_SAMPLING.md §4.3, §4.4)
+//
+// The sample of timestep t is the state at numTS == t: every write of timestep
+// t-1 done, none of t. A pass of the blocked schedule advances its E range
+// [eLo,eHi) and its hook range [hS,hE) through one timestep ts at a time, and
+// takes the samples of t = ts+1 there, with no barrier of its own:
+//
+// - Probes: the voltages of the footprint in [eLo,eHi) after the pass's
+//   SlabApply2Voltages(ts), the currents in [hS,hE) after its
+//   SlabApply2Current(ts). The E ranges of one timestep partition [0,NX), and
+//   so do the hook ranges (the current updates [An,hHi) partition [0,NX-1),
+//   and only the edge tile's hooks reach NX), so every footprint cell is taken
+//   exactly once per sample, by the pass that advances it through ts.
+// - At the right level: no current-phase slab hook writes a voltage, and no
+//   voltage-phase one a current (the slab contract in engine_extension.h,
+//   checked for every slab-capable extension), so a voltage is final for ts
+//   once the pass's voltage phase is done, and a current once its current
+//   phase is. Every write of that phase ended at a barrier before the
+//   sampling, and the next write of the field comes after the pass's next
+//   update barrier, which a thread reaches only after sampling.
+// - Energy: |V|^2 of the rows (x,y) of [eLo,eHi) after the voltage phase,
+//   |I|^2 of the rows of [An,hHi) after the current phase (x < NX-1 and
+//   y < NY-1, as Engine_AVX2::FastEnergy()), each thread over the share of the
+//   rows it has just updated, into the rows buffer of the sample. The same
+//   partition argument makes every row's two values be summed once per
+//   sample, and Engine_AVX2::FastEnergyFieldRows() sums a row as FastEnergy()
+//   does, bit for bit. At the end of the block, after one barrier, the threads
+//   add up the rows of the block's samples in row order (FastEnergy(eRows,
+//   hRows)), so a sample is CalcFastEnergy() of its timestep, whatever the
+//   threads and tiles. A block may hold up to k energy timesteps (Dirac:
+//   every timestep while the energy criterion is exact), hence one buffer per
+//   energy timestep of a block: 8 bytes per row each.
+//
+// The flat sweep samples after Apply2Current of each timestep, every thread its
+// own x-lines, and then waits at one barrier: the next timestep's hooks may
+// write any cell.
+// ----------------------------------------------------------------------------
+
+template <typename F>
+void Engine_AVX2_Multithread::ForUpdateShare(int lo, int hi, unsigned int ny, unsigned int threadID, F f) const
+{
+	// the split of UpdateVoltageShare() (ny = NY) and UpdateCurrentShare() (ny = NY-1)
+	if (!m_blk_rowSplit)
+	{
+		unsigned int s, e;
+		SplitRange(lo, hi, m_numThreads, threadID, s, e);
+		for (unsigned int x = s; x < e; ++x)
+			f(x, 0u, ny);
+		return;
+	}
+	ForRowShare(lo, hi, ny, m_numThreads, threadID, f);
+}
+
+bool Engine_AVX2_Multithread::IterateSampledTS(unsigned int iterTS)
+{
+	m_bsBatchStart = numTS;
+	if (m_bsProbeTS.empty() && m_bsEnergyTS.empty())
+		return IterateTS(iterTS);
+
+	// As Engine::IterateSampledTS(): after the batch's first timestep and before its last, ascending.
+	const unsigned int start = numTS, end = numTS + iterTS;
+	for (const std::vector<unsigned int>* list : {&m_bsProbeTS, &m_bsEnergyTS})
+		for (size_t i = 0; i < list->size(); ++i)
+			if (((*list)[i] <= start) || ((*list)[i] >= end) || ((i > 0) && ((*list)[i] <= (*list)[i - 1])))
+				throw std::logic_error("in-batch sampling: a sample timestep outside the batch, or not ascending");
+
+	IndexFootprint();
+	// By offset o = ts - start: the samples of ts+1, taken in timestep ts.
+	m_sp_len = iterTS;
+	m_sp_probe.assign(iterTS, -1);
+	for (size_t i = 0; i < m_bsProbeTS.size(); ++i)
+		m_sp_probe[m_bsProbeTS[i] - 1 - start] = (int)i;
+	m_sp_energyBefore.assign((size_t)iterTS + 1, 0);
+	unsigned int j = 0;
+	for (unsigned int o = 0; o < iterTS; ++o)
+	{
+		m_sp_energyBefore[o] = j;
+		if ((j < m_bsEnergyTS.size()) && (m_bsEnergyTS[j] - 1 - start == o))
+			++j;
+	}
+	m_sp_energyBefore[iterTS] = j;
+	m_sp_rowCount = FastEnergyRowCount();
+
+	m_sp_on = true;
+	try
+	{
+		IterateTS(iterTS);
+	}
+	catch (...)
+	{
+		m_sp_on = false;
+		throw;
+	}
+	m_sp_on = false;
+	return true;
+}
+
+void Engine_AVX2_Multithread::IndexFootprint()
+{
+	const std::vector<uint64_t>& fp = GetFootprint();
+	if ((fp.data() == m_fpIndexedData) && (fp.size() == m_fpIndexedSize))
+		return;
+	const unsigned int NX = numLines[0];
+	for (int f = 0; f < 2; ++f)
+	{
+		m_fpX[f].assign((size_t)NX + 1, 0);
+		m_fpCell[f].clear();
+		m_fpMem[f].clear();
+	}
+	unsigned int field, n, x, y, z;
+	for (uint64_t key : fp)
+	{
+		DecodeFootprintKey(key, field, n, x, y, z);
+		if ((field > 1) || (n > 2) || (x >= NX) || (y >= numLines[1]) || (z >= numLines[2]))
+			throw std::logic_error("in-batch sampling: a footprint cell outside the grid");
+		++m_fpX[field][x + 1];
+	}
+	std::vector<uint32_t> pos[2];
+	for (int f = 0; f < 2; ++f)
+	{
+		for (unsigned int i = 0; i < NX; ++i)
+			m_fpX[f][i + 1] += m_fpX[f][i];
+		m_fpCell[f].resize(m_fpX[f][NX]);
+		m_fpMem[f].resize(m_fpX[f][NX]);
+		pos[f].assign(m_fpX[f].begin(), m_fpX[f].end() - 1);
+	}
+	for (size_t c = 0; c < fp.size(); ++c)
+	{
+		DecodeFootprintKey(fp[c], field, n, x, y, z);
+		const uint32_t i = pos[field][x]++;
+		m_fpCell[field][i] = (uint32_t)c;
+		// as Engine_AVX2::GetVolt(): f8vector, then lane
+		const uint64_t v = (uint64_t)n + (uint64_t)(z % numVectors) * m_vs_z + (uint64_t)y * m_vs_y + (uint64_t)x * m_vs_x;
+		m_fpMem[field][i] = v * 8 + z / numVectors;
+	}
+	m_fpIndexedData = fp.data();
+	m_fpIndexedSize = fp.size();
+}
+
+void Engine_AVX2_Multithread::PrepareSampledRound()
+{
+	if (!m_sp_on || m_bsEnergyTS.empty())
+		return;
+	// a block holds at most k energy timesteps (BlockedWorker()), a flat timestep one
+	const unsigned int slots = m_blk_active ? std::max(1u, m_blk_k) : 1u;
+	const size_t size = (size_t)slots * 2 * m_sp_rowCount;
+	if (m_sp_rows.size() < size)
+		m_sp_rows.resize(size);
+}
+
+int Engine_AVX2_Multithread::ProbeSampleAt(int ts) const
+{
+	const int o = ts - (int)m_bsBatchStart;
+	return ((o >= 0) && (o < (int)m_sp_len)) ? m_sp_probe[o] : -1;
+}
+
+int Engine_AVX2_Multithread::EnergySampleAt(int ts) const
+{
+	const int o = ts - (int)m_bsBatchStart;
+	if ((o < 0) || (o >= (int)m_sp_len) || (m_sp_energyBefore[o + 1] == m_sp_energyBefore[o]))
+		return -1;
+	return (int)m_sp_energyBefore[o];
+}
+
+float* Engine_AVX2_Multithread::EnergyRowsFor(int j, int t0, bool currents)
+{
+	// the block's energy samples take the slots 0, 1, ... in order
+	const unsigned int slot = (unsigned int)j - m_sp_energyBefore[t0 - (int)m_bsBatchStart];
+	return m_sp_rows.data() + ((size_t)slot * 2 + (currents ? 1 : 0)) * m_sp_rowCount;
+}
+
+void Engine_AVX2_Multithread::GatherFootprint(unsigned int field, int lo, int hi, int slot,
+                                              unsigned int part, unsigned int parts)
+{
+	const std::vector<uint32_t>& xo = m_fpX[field];
+	if (xo.empty() || (hi <= lo))
+		return;
+	const uint32_t a = xo[lo], b = xo[std::min(hi, (int)numLines[0])];
+	if (a >= b)
+		return;
+	unsigned int s, e;
+	SplitRange((int)a, (int)b, parts, part, s, e);
+	const f8vector* src = field ? m_curr : m_volt;
+	FDTD_FLOAT* out = BatchProbeSample((size_t)slot);
+	const uint32_t* cell = m_fpCell[field].data();
+	const uint64_t* mem = m_fpMem[field].data();
+	for (unsigned int i = s; i < e; ++i)
+		out[cell[i]] = src[mem[i] >> 3].f[mem[i] & 7];
+}
+
+void Engine_AVX2_Multithread::SampleVoltages(int eLo, int eHi, int ts, int t0, unsigned int threadID)
+{
+	const int p = ProbeSampleAt(ts);
+	if (p >= 0)
+		GatherFootprint(0, eLo, eHi, p, threadID, m_numThreads);
+	const int j = EnergySampleAt(ts);
+	if (j < 0)
+		return;
+	float* rows = EnergyRowsFor(j, t0, false);
+	const unsigned int ny = numLines[1] - 1, xEnd = numLines[0] - 1;
+	ForUpdateShare(eLo, eHi, numLines[1], threadID, [&](unsigned int x, unsigned int y0, unsigned int y1)
+	{
+		y1 = std::min(y1, ny);
+		if ((x < xEnd) && (y1 > y0))
+			FastEnergyFieldRows(false, x * ny + y0, x * ny + y1, rows);
+	});
+}
+
+void Engine_AVX2_Multithread::SampleCurrents(int An, int hHi, int hS, int hE, int ts, int t0, unsigned int threadID)
+{
+	const int p = ProbeSampleAt(ts);
+	if (p >= 0)
+		GatherFootprint(1, hS, hE, p, threadID, m_numThreads);
+	const int j = EnergySampleAt(ts);
+	if (j < 0)
+		return;
+	// The rows of the hook range below NX-1 are those of the current update
+	// [An,hHi), and so is their split: hHi = min(hE, NX-1).
+	float* rows = EnergyRowsFor(j, t0, true);
+	const unsigned int ny = numLines[1] - 1;
+	ForUpdateShare(An, hHi, ny, threadID, [&](unsigned int x, unsigned int y0, unsigned int y1)
+	{
+		if (y1 > y0)
+			FastEnergyFieldRows(true, x * ny + y0, x * ny + y1, rows);
+	});
+}
+
+void Engine_AVX2_Multithread::FinishBlockEnergy(int t0, unsigned int k, unsigned int threadID)
+{
+	const unsigned int o0 = (unsigned int)(t0 - (int)m_bsBatchStart);
+	const unsigned int o1 = std::min(o0 + k, m_sp_len);
+	const unsigned int first = m_sp_energyBefore[o0], count = m_sp_energyBefore[o1] - first;
+	if (count == 0)
+		return;
+	// The last pass summed its current rows after its last barrier. No
+	// barrier after the sums: the next block writes the rows only once past its
+	// first update barrier, and the main loop reads the samples after the
+	// stop barrier.
+	SyncWait(threadID, SYNC_HOOK);
+	for (unsigned int s = threadID; s < count; s += m_numThreads)
+	{
+		const float* e = m_sp_rows.data() + (size_t)s * 2 * m_sp_rowCount;
+		SetBatchEnergySample(first + s, FastEnergy(e, e + m_sp_rowCount));
+	}
+}
+
+void Engine_AVX2_Multithread::SampleFlat(unsigned int xStart, unsigned int xStop, int ts, unsigned int threadID)
+{
+	const int p = ProbeSampleAt(ts), j = EnergySampleAt(ts);
+	if ((p < 0) && (j < 0))
+		return;
+	// Every write of ts ended at a barrier; each thread takes its own x-lines.
+	if (p >= 0)
+	{
+		GatherFootprint(0, (int)xStart, (int)xStop, p, 0, 1);
+		GatherFootprint(1, (int)xStart, (int)xStop, p, 0, 1);
+	}
+	if (j >= 0)
+	{
+		const unsigned int ny = numLines[1] - 1;
+		const unsigned int xEnd = std::min(xStop, numLines[0] - 1);
+		if (xEnd > xStart)
+		{
+			FastEnergyFieldRows(false, xStart * ny, xEnd * ny, EnergyRowsFor(j, ts, false));
+			FastEnergyFieldRows(true, xStart * ny, xEnd * ny, EnergyRowsFor(j, ts, true));
+		}
+	}
+	// The next timestep's hooks may write any cell, and the energy needs every row.
+	SyncWait(threadID, SYNC_HOOK);
+	if ((j >= 0) && (threadID == 0))
+	{
+		const float* e = EnergyRowsFor(j, ts, false);
+		SetBatchEnergySample((size_t)j, FastEnergy(e, e + m_sp_rowCount));
+	}
 }
 
 void Engine_AVX2_Multithread::SyncWait(unsigned int threadID, SyncKind kind)
@@ -861,6 +1159,7 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 		m_iterTS = batch;
 		m_blk_active = (m_blk_k > 1) && (batch >= 2);
+		PrepareSampledRound();
 		m_startBarrier->wait();
 		m_stopBarrier->wait();
 		const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -888,6 +1187,7 @@ bool Engine_AVX2_Multithread::CalibrateIterateTS(unsigned int iterTS)
 		// Calibration ended inside this call: the rest on the settled schedule.
 		m_iterTS = remaining;
 		m_blk_active = (m_blk_k > 1) && (remaining >= 2);
+		PrepareSampledRound();
 		m_startBarrier->wait();
 		m_stopBarrier->wait();
 	}
@@ -1080,6 +1380,10 @@ void thread::operator()()
 
 		const bool stats = m_enginePtr->m_syncStats;
 		const int64_t t0 = stats ? HybridBarrier::now() : 0;
+		// Every thread reads numTS before its first barrier, thread 0 writes it
+		// after the last barrier of a timestep (see BlockedWorker()).
+		const int base = (int)m_enginePtr->numTS;
+		const bool sampling = m_enginePtr->m_sp_on;
 		for (unsigned int iter = 0; iter < m_enginePtr->m_iterTS; ++iter)
 		{
 			// Pre-voltage extensions
@@ -1119,6 +1423,10 @@ void thread::operator()()
 			m_enginePtr->Apply2Current(m_threadID);
 			if (m_threadID == 0)
 				m_enginePtr->TraceFieldCell("after current extensions");
+
+			// In-batch sampling: the timestep is complete on the whole grid.
+			if (sampling)
+				m_enginePtr->SampleFlat(m_start, m_stop + 1, base + (int)iter, m_threadID);
 
 			if (m_threadID == 0)
 				++m_enginePtr->numTS;

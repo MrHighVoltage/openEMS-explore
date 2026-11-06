@@ -74,6 +74,18 @@ public:
 	virtual CoreSet GetCoreSet() const {return m_cores;}
 	virtual bool SetThreads(unsigned int numThreads, const CoreSet& cores);
 
+	//! In-batch sampling inside the schedules (plans/BATCH_SAMPLING.md §4.4).
+	/*!
+	  One start/stop round for the whole batch, flat or blocked, the thread
+	  calibration included. The workers take each probe and energy sample as
+	  their slab completes the timestep: a blocked schedule's depth is not
+	  capped by the samples, so Dirac and step excitations block too.
+	*/
+	virtual bool IterateSampledTS(unsigned int iterTS);
+	virtual bool SamplesInsideBlocks() const {return true;}
+	//! Two blocks: at least two thirds of a batch then run at full depth.
+	virtual unsigned int GetPreferredBatchLength() const {return (m_blk_k > 1) ? 2 * m_blk_k : 0;}
+
 	virtual void DoPreVoltageUpdates()  { throw std::runtime_error("Engine_AVX2_Multithread::DoPreVoltageUpdates without thread ID"); }
 	virtual void DoPreVoltageUpdates(int threadID);
 	virtual void DoPostVoltageUpdates() { throw std::runtime_error("Engine_AVX2_Multithread::DoPostVoltageUpdates without thread ID"); }
@@ -138,6 +150,31 @@ protected:
 	//! Worker body for the blocked schedule.
 	void BlockedWorker(unsigned int threadID);
 
+	// --- in-batch sampling inside the schedules (IterateSampledTS()) ---
+	//! Index the footprint by x-line (m_fpX, m_fpCell, m_fpMem), if it changed.
+	void IndexFootprint();
+	//! Before a start barrier of a sampled batch: room for the energy rows of one block.
+	void PrepareSampledRound();
+	//! The probe sample of timestep \a ts+1, or -1; the same for the energy sample.
+	int ProbeSampleAt(int ts) const;
+	int EnergySampleAt(int ts) const;
+	//! Part \a part of \a parts of the footprint cells of \a field with x in [lo,hi), into probe sample \a slot.
+	void GatherFootprint(unsigned int field, int lo, int hi, int slot, unsigned int part, unsigned int parts);
+	//! Visit this thread's share of the rows [lo,hi) x [0,ny) as UpdateVoltageShare() (ny = NY) or
+	//! UpdateCurrentShare() (ny = NY-1) splits them, as runs f(x, y0, y1).
+	template <typename F>
+	void ForUpdateShare(int lo, int hi, unsigned int ny, unsigned int threadID, F f) const;
+	//! The rows buffer of the energy sample \a j for the block that starts at timestep \a t0.
+	float* EnergyRowsFor(int j, int t0, bool currents);
+	//! Blocked: the samples of \a ts+1 a pass takes once its E range [eLo,eHi) has passed Apply2Voltages of \a ts.
+	void SampleVoltages(int eLo, int eHi, int ts, int t0, unsigned int threadID);
+	//! Blocked: those it takes once its current update [An,hHi) and hook range [hS,hE) have passed Apply2Current of \a ts.
+	void SampleCurrents(int An, int hHi, int hS, int hE, int ts, int t0, unsigned int threadID);
+	//! Blocked, after the block [t0,t0+k): the energy samples of the block from their rows.
+	void FinishBlockEnergy(int t0, unsigned int k, unsigned int threadID);
+	//! Flat: the samples of \a ts+1, the thread's x-lines [xStart,xStop) once timestep \a ts is complete.
+	void SampleFlat(unsigned int xStart, unsigned int xStop, int ts, unsigned int threadID);
+
 	//! Wait at m_IterateBarrier, counting the wait if OPENEMS_AVX2_SYNC_STATS is set.
 	enum SyncKind { SYNC_UPDATE = 0, SYNC_HOOK = 1 };
 	void SyncWait(unsigned int threadID, SyncKind kind);
@@ -196,6 +233,28 @@ protected:
 	bool m_blk_rowSplit;     //!< split slab updates by y-row (OPENEMS_AVX2_TBLOCK_SPLIT)
 	bool m_blk_elide;        //!< skip or merge extension barriers (OPENEMS_AVX2_TBLOCK_ELIDE)
 	long long m_blk_blockedTS; //!< timesteps run in blocks of depth >= 2 (thread 0 counts)
+
+	// --- in-batch sampling state (read by every worker; fixed while a batch runs) ---
+	bool m_sp_on;                      //!< the workers sample this batch
+	unsigned int m_sp_len;             //!< its timesteps
+	//! By offset ts - m_bsBatchStart: the probe sample of timestep ts+1, -1 for none.
+	std::vector<int> m_sp_probe;
+	//! By offset: the energy samples of the timesteps before ts+1 (size m_sp_len+1);
+	//! offset o holds one if m_sp_energyBefore[o+1] > m_sp_energyBefore[o].
+	std::vector<unsigned int> m_sp_energyBefore;
+	unsigned int m_sp_rowCount;        //!< FastEnergyRowCount()
+	//! [slot][field][row]: the float row sums of the energy samples of one block, in
+	//! the order of their timesteps (Engine_AVX2::FastEnergyFieldRows()); k slots.
+	std::vector<float> m_sp_rows;
+	//! The footprint by x-line, per field (0 voltages, 1 currents): the entries of
+	//! x-line x are [m_fpX[f][x], m_fpX[f][x+1]) of m_fpCell[f] (the cell's index in a
+	//! probe sample) and m_fpMem[f] (its float offset in m_volt or m_curr).
+	std::vector<uint32_t> m_fpX[2];
+	std::vector<uint32_t> m_fpCell[2];
+	std::vector<uint64_t> m_fpMem[2];
+	//! The footprint m_fpX was built for (StopFootprintRecording() swaps in a new vector).
+	const uint64_t* m_fpIndexedData;
+	size_t m_fpIndexedSize;
 };
 
 #endif // ENGINE_AVX2_MULTITHREAD_H
