@@ -2458,8 +2458,9 @@ void openEMS::RunFDTD()
 		// processings, and N's replay checks that they get there.  N+1 is not
 		// submitted before N's replay where the host needs the GPU still at
 		// N's last timestep, or no plan may be outstanding:
-		// - a frequency-domain dump the GPU sums is due there: the sum takes a
-		//   timestep when the dump processes it, since the run may stop first;
+		// - a frequency-domain dump the GPU sums and cannot stash is due there
+		//   (Engine_Vulkan::DumpNeedsGPUAt()): the sum takes a timestep when
+		//   the dump processes it, since the run may stop first;
 		// - the end criterion relaxes after its first minute, or the status
 		//   needs the live energy once it has;
 		// - the benchmark's boundary (it is timed with the GPU idle), NrTS, an
@@ -2514,7 +2515,7 @@ void openEMS::RunFDTD()
 			const bool relaxDue = exactEndCrit && !m_exactEndCriteria
 			                      && (CalcDiffTime(currTime,startTime) > EXACT_ENDCRIT_TIME);
 			if ((currTS < NrTS) && !statusWaits && !relaxDue && !(bench && (currTS >= bench->Boundary()))
-			    && !gpuEng->DumpDFTDueAt(currTS) && !(aborted = CheckAbortCond()))
+			    && !gpuEng->DumpNeedsGPUAt(currTS) && !(aborted = CheckAbortCond()))
 				submit(currTS, bench ? bench->Clamp(cur.nextStep, currTS) : cur.nextStep, &cur.nextPositions);
 			gpuEng->CollectSampledBatch();
 			gpuEng->EnablePipelinedReading(true);

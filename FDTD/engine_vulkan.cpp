@@ -4007,10 +4007,10 @@ unsigned int Engine_Vulkan::MaxSpeculativeBatch() const
 	return CMD_RING_SIZE * m_maxTSPerSubmit;
 }
 
-bool Engine_Vulkan::DumpDFTDueAt(unsigned int ts) const
+bool Engine_Vulkan::DumpNeedsGPUAt(unsigned int ts) const
 {
 	for (const DumpReg& d : m_dumps)
-		if (d.dft && d.due(ts))
+		if (d.dft && !d.stash.buffer && d.due(ts))
 			return true;
 	return false;
 }
@@ -4540,6 +4540,33 @@ void Engine_Vulkan::EnsureDumpResources()
 		d.lineOff = (uint32_t)lines.size();
 		lines.insert(lines.end(), d.lines.begin(), d.lines.end());
 	}
+	// In-batch sampling: a stash for each DFT dump (DumpReg::stash), read by
+	// the DFT shader as a field of n0*n1*n2 cells per component, half p from
+	// p*count on: its a-lines start at p*3*n0, which times n1*n2 is p*count.
+	unsigned int stashes = 0;
+	for (DumpReg& d : m_dumps)
+	{
+		if (!d.dft || !m_bsGpuOn || (2ull * d.count >= (1ull << 32)))
+			continue;
+		if (!TryCreateBufferWithMemory(2ull * d.count * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, d.stash.buffer, d.stash.memory))
+		{
+			cerr << "Engine_Vulkan: no memory to stash a frequency-domain dump's samples; the pipelined loop "
+			     << "waits at its timesteps" << endl;
+			continue;
+		}
+		for (int half = 0; half < 2; ++half)
+		{
+			d.stashLineOff[half] = (uint32_t)lines.size();
+			for (uint32_t a = 0; a < d.n[0]; ++a)
+				lines.push_back((uint32_t)half * 3u * d.n[0] + a);
+			for (uint32_t b = 0; b < d.n[1]; ++b)
+				lines.push_back(b);
+			for (uint32_t c = 0; c < d.n[2]; ++c)
+				lines.push_back(c);
+		}
+		++stashes;
+	}
 	// A few KB, read only at dump timesteps: host-visible, written in place
 	// (the staging buffer is one field, which a tiny grid's lines may exceed).
 	const VkDeviceSize linesBytes = lines.size() * sizeof(uint32_t);
@@ -4593,7 +4620,7 @@ void Engine_Vulkan::EnsureDumpResources()
 	makePipeline(gpu_spirv::dump_gather_data, gpu_spirv::dump_gather_size, m_dumpGatherPipeline);
 	makePipeline(gpu_spirv::dump_dft_data, gpu_spirv::dump_dft_size, m_dumpDFTPipeline);
 
-	uint32_t numSets = (uint32_t)MAX_DUMP_SLOTS;
+	uint32_t numSets = (uint32_t)MAX_DUMP_SLOTS + 2 * stashes;
 	for (const DumpReg& d : m_dumps)
 		numSets += d.dft ? 1 : 0;
 	VkDescriptorPoolSize poolSz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * numSets};
@@ -4611,6 +4638,18 @@ void Engine_Vulkan::EnsureDumpResources()
 			continue;
 		d.set = AllocDumpSet(d.sums.buffer, VK_WHOLE_SIZE);
 		anyDFT = true;
+		if (!d.stash.buffer)
+			continue;
+		d.stashGatherSet = AllocDumpSet(d.stash.buffer, VK_WHOLE_SIZE);
+		VkDescriptorSetAllocateInfo ai{};
+		ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		ai.descriptorPool     = m_dumpDescPool;
+		ai.descriptorSetCount = 1;
+		ai.pSetLayouts        = &m_dumpDescLayout;
+		VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &d.stashSumSet));
+		VkBuffer bufs[5] = {d.stash.buffer, d.stash.buffer, m_dumpLinesBuf.buffer, d.sums.buffer, m_dumpWeightBuf.buffer};
+		VkDeviceSize sizes[5] = {VK_WHOLE_SIZE, VK_WHOLE_SIZE, VK_WHOLE_SIZE, VK_WHOLE_SIZE, VK_WHOLE_SIZE};
+		WriteDescriptorBuffers(m_device, d.stashSumSet, bufs, sizes, 5);
 	}
 	if (anyDFT)
 		RunSingleCommand([&](VkCommandBuffer cmd)
@@ -4763,12 +4802,18 @@ void Engine_Vulkan::RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts)
 		if ((due[i] = m_dumps[i].due(ts) ? 1 : 0))
 			(m_dumps[i].dft ? dft : gather) = true;
 	// A sampled batch may run past the timestep the replay stops at, and a
-	// DFT sum cannot take a sample back: the dump adds it when it processes
-	// ts (AddDumpDFTSample()), while the GPU still holds ts.  A gather into
-	// the ring is harmless.
+	// DFT sum cannot take a sample back: the batch stashes the footprint, and
+	// the dump adds it when it processes ts (AddDumpDFTSample()); without a
+	// stash it adds ts then from the fields, which the GPU must still hold.
+	// A gather into the ring is harmless.
+	bool stash = false;
 	if (m_bsRecording)
+	{
+		for (size_t i = 0; i < m_dumps.size(); ++i)
+			stash = stash || (due[i] && m_dumps[i].dft && m_dumps[i].stash.buffer);
 		dft = false;
-	if (!gather && !dft)
+	}
+	if (!gather && !dft && !stash)
 		return;
 
 	CmdDumpBarrier(cmd);
@@ -4791,6 +4836,26 @@ void Engine_Vulkan::RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts)
 				slot->has[i] = 1;
 			}
 			CmdDumpHostBarrier(cmd);
+		}
+	}
+	if (stash)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpGatherPipeline);
+		for (size_t i = 0; i < m_dumps.size(); ++i)
+		{
+			DumpReg& d = m_dumps[i];
+			if (!due[i] || !d.dft || !d.stash.buffer)
+				continue;
+			// The free half, else the older one: a timestep the dump never
+			// processed (the run stopped before it).
+			const int half = (d.stashTS[0] == UINT_MAX) ? 0 : (d.stashTS[1] == UINT_MAX) ? 1
+			               : (d.stashTS[0] < d.stashTS[1]) ? 0 : 1;
+			d.stashTS[half] = ts;
+			DumpPC pc = DumpPushConstants(d);
+			pc.outOff = (uint32_t)half * d.count;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpPipeLayout, 0, 1, &d.stashGatherSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_dumpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC), &pc);
+			vkCmdDispatch(cmd, (d.count + 255) / 256, 1, 1);
 		}
 	}
 	if (dft)
@@ -4884,6 +4949,13 @@ bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)
 		d.recorded.pop_front();
 		return true;
 	}
+	for (int half = 0; half < 2; ++half)
+		if (d.stash.buffer && (d.stashTS[half] == ts))
+		{
+			SubmitStashDFT(d, half, ts);
+			d.stashTS[half] = UINT_MAX;
+			return true;
+		}
 
 	// Not added by a batch (timestep 0): add it now, if the GPU still holds
 	// ts.
@@ -4903,6 +4975,59 @@ bool Engine_Vulkan::AddDumpDFTSample(int id, unsigned int ts)
 		CmdDumpBarrier(cmd);
 	});
 	return true;
+}
+
+void Engine_Vulkan::SubmitStashDFT(DumpReg& d, int half, unsigned int ts)
+{
+	// Into the command ring without waiting: it runs after the batch that
+	// computes ahead, which neither reads the sums nor writes this half.  Its
+	// weight region is its command slot's, free until the slot's fence.
+	const int slot = m_cmdIdx;
+	if (m_gpuInFlight[slot])
+	{
+		WaitFence(m_device, m_fences[slot]);
+		if (m_profileEnabled)
+			CollectProfileForSlot(slot);
+		m_gpuInFlight[slot] = false;
+	}
+	VkCommandBuffer cmd = m_cmdBufs[slot];
+	VkCommandBufferBeginInfo bi{};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkResetCommandBuffer(cmd, 0);
+	VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+	CmdDumpBarrier(cmd);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpDFTPipeline);
+	const uint32_t weightOff = (uint32_t)slot * m_dumpFreqs + d.weightOff;
+	d.weights(ts, m_dumpWeightMapped + weightOff);
+	// The stash as a field: lines[a] * NyNz + lines[b] * Nz + lines[c] is the
+	// footprint index of (a, b, c) in half p, and n * N that of component n.
+	DumpPC pc = DumpPushConstants(d);
+	pc.lineOff = d.stashLineOff[half];
+	pc.curr = 0;
+	pc.NyNz = d.n[1] * d.n[2];
+	pc.Nz = d.n[2];
+	pc.N = d.n[0] * d.n[1] * d.n[2];
+	pc.weightOff = weightOff;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_dumpPipeLayout, 0, 1, &d.stashSumSet, 0, nullptr);
+	vkCmdPushConstants(cmd, m_dumpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DumpPC), &pc);
+	vkCmdDispatch(cmd, (d.count + 255) / 256, 1, 1);
+	++d.samples;
+	CmdDumpBarrier(cmd);
+	VK_CHECK(vkEndCommandBuffer(cmd));
+
+	VkSubmitInfo si{};
+	si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers    = &cmd;
+	vkResetFences(m_device, 1, &m_fences[slot]);
+	VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &si, m_fences[slot]));
+	m_submitSerial[slot] = ++m_submitCount;
+	m_gpuInFlight[slot] = true;
+	m_profilePending[slot] = false;
+	m_stageSlotTS[slot] = 0;
+	m_gpuDrained = false;
+	m_cmdIdx = (m_cmdIdx + 1) % CMD_RING_SIZE;
 }
 
 bool Engine_Vulkan::ReadDumpDFT(int id, std::vector<std::complex<float>>& sums, unsigned int& samples)
@@ -4959,7 +5084,10 @@ void Engine_Vulkan::CleanupDumps()
 	}
 	m_dumpSlots.clear();
 	for (DumpReg& d : m_dumps)
+	{
 		DestroyGpuBuf(d.sums);
+		DestroyGpuBuf(d.stash);
+	}
 	m_dumps.clear();
 	if (m_dumpWeightMapped)
 		vkUnmapMemory(m_device, m_dumpWeightBuf.memory);

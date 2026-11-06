@@ -145,10 +145,10 @@ public:
 	//! The longest batch the pipelined loop submits ahead: one that records
 	//! without waiting for the GPU (the command ring, or one steady-state period).
 	unsigned int MaxSpeculativeBatch() const;
-	//! Whether a frequency-domain dump the GPU sums is due at \a ts.  A sampled
-	//! batch does not add that sample (the run may stop before ts); the dump
-	//! adds it when processed, which needs the GPU to still hold ts.
-	bool DumpDFTDueAt(unsigned int ts) const;
+	//! Whether a dump due at \a ts needs the GPU to still hold ts when the dump
+	//! processes it: a frequency-domain dump the GPU sums and a sampled batch
+	//! cannot stash (see DumpReg::stash).
+	bool DumpNeedsGPUAt(unsigned int ts) const;
 
 	// --- Pipelined processing support -------------------------------------
 	//! Begin recording cell accesses. Call before PA->Process().
@@ -998,6 +998,16 @@ private:
 		VkDescriptorSet set = VK_NULL_HANDLE;
 		std::deque<unsigned int> recorded; //!< timesteps added on the GPU, not yet accounted for
 		unsigned int samples = 0; //!< timesteps accounted for
+		// DFT, in-batch sampling: a sampled batch may run past the timestep
+		// the run stops at, so it gathers the footprint of a DFT timestep it
+		// reaches into a stash, and the dump adds the stash to the sums when
+		// it processes that timestep (AddDumpDFTSample()), with the same
+		// pipeline: the stash read as a field through identity lines.
+		GpuBuf stash;             //!< two halves of count floats, device-local; none: no stash
+		uint32_t stashLineOff[2] = {0, 0};  //!< identity lines that read half p as the field
+		unsigned int stashTS[2] = {UINT_MAX, UINT_MAX}; //!< the timestep each half holds
+		VkDescriptorSet stashGatherSet = VK_NULL_HANDLE; //!< the fields into the stash
+		VkDescriptorSet stashSumSet = VK_NULL_HANDLE;    //!< the stash into the sums
 	};
 	struct DumpSlot
 	{
@@ -1049,6 +1059,9 @@ private:
 	//! Gather and DFT dispatches for the dumps due at ts, at the end of a batch.
 	void RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts);
 	void RecordDumpDFT(VkCommandBuffer cmd, DumpReg& d, uint32_t region, unsigned int ts);
+	//! Add stash half \a half of DFT dump \a d, timestep \a ts, to its sums: a
+	//! command of its own, queued behind whatever computes ahead.
+	void SubmitStashDFT(DumpReg& d, int half, unsigned int ts);
 	void CleanupDumps();
 };
 
