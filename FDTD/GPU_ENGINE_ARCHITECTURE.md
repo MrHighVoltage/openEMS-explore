@@ -116,6 +116,17 @@ while (running) {
 }
 ```
 
+With in-batch sampling (the default since 2026-11-06,
+`plans/BATCH_SAMPLING.md`) `step` is no longer the next probe timestep: a
+batch runs about half a second, or to the next field dump, the GPU gathers
+what the probes and the energy criterion read at each of their timesteps
+inside it (inside the temporal blocks too), and the host replays the
+processing of those timesteps afterwards, in the pipelined loop while the
+GPU runs the next batch. So neither the probe interval nor a Dirac or step
+excitation's interval of one timestep caps the batch or the block depth.
+What follows describes one batch; `OPENEMS_BATCH_SAMPLING=0` runs the loop
+as written above.
+
 ### What happens step by step:
 
 ```

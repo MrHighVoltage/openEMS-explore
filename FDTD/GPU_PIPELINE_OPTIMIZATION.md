@@ -163,6 +163,16 @@ next due timestep (at most 64) and hides the host's work behind it: 160³ with
 63 whole-volume E dumps 1.44 s instead of 2.97–3.00 s, the other cases
 unchanged.  `OPENEMS_GPU_SPEC_DEPTH=1` restores the old behaviour.
 
+With in-batch sampling (2026-11-06, `plans/BATCH_SAMPLING.md` §4.5) the
+pipelined loop no longer stops a batch at the next probe: the GPU runs batch
+N+1 (about half a second, or to the next dump) while the host replays batch
+N from samples the GPU took inside it.  There `OPENEMS_GPU_SPEC_DEPTH=<n>`
+and `OPENEMS_GPU_SPEC_MAX_DEPTH=<n>` cap the batch length at n timesteps;
+by default it is capped at what records without waiting for the GPU (16
+command buffers of `OPENEMS_GPU_MAX_TS_PER_SUBMIT`, or one steady-state
+period).  A frequency-domain dump's DFT sample is stashed by the batch and
+added when the dump processes it, since the run may stop before.
+
 **Measured** (RX 6800, 160³ PEC, 4000 timesteps, 63 TD dumps or an NF2FF
 box of 6+6 faces at 3 frequencies; stepping-loop seconds, raw data in
 `python/Tests/results/gpu_dumps_2026-11-01.txt`):

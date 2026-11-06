@@ -78,14 +78,56 @@ Branch `tb-all-exc/avx2`, on top of the core and its tests (`2ad8c61`, the core 
     Gaussian with probes every 32 timesteps old flat 560, old blocked 1302,
     new blocked 1387. The Dirac run evaluates the energy criterion at every
     timestep (first 60 s), the old loop single-threaded on the main thread.
+Branch `tb-all-exc/vulkan`, on top of the core and its tests (`bb3f974`),
+merged with the core's review fixes (`2ad8c61`) and the AVX2 work (`aef7da4`):
+
+| commit | what |
+|---|---|
+| `5ff98ea` | `Engine_Vulkan`: in-batch sampling inside the flat and the blocked schedule, the energy by x-plane, the ring, the counter (§4.5) |
+| `b3640ac` | `RunFDTD()`: the pipelined GPU loop with in-batch sampling; the old pipelined loop checks the end criteria after its first batch too |
+| `14255b3` | `batch_sampling_identity.py`: `--loops`, `--rings`, `--gpu-index` |
+| `a9f3a2e` | `Engine_Vulkan`: a sampled batch stashes the DFT dumps' samples |
+| `98e1d79` | merge of the review fixes; the pipelined loop plans from the live state after a replay that left its plan |
+| `08b444e` | `Processing::NextIntervalAt()`: a step-list entry at the timestep does not hide the interval (shared, see below) |
+| `800919d` | merge of the AVX2 work; `Engine_Vulkan::GetPreferredBatchLength()` |
+| `ca14991` | `test_gpu_temporal_blocking.py`: Dirac and step |
+
+- **Done (Vulkan).** `Engine_Vulkan` samples the probes and the energy
+  inside its blocks, flat and blocked, on discrete and integrated GPUs; the
+  pipelined loop runs batch N+1 while the host replays batch N (§4.5). Dirac
+  and step runs block: 500 of 500 and 400 of 400 timesteps on the identity
+  models (the old loop 0).
+- **Shared code** the Vulkan work changed: `openems.cpp` (the GPU loops;
+  `planBatch()` reports what is read at a batch's last end, `lastProbe` and
+  `lastEnergy`; `progress()` moved in front of the loops, with two defaulted
+  parameters; the sampled standard loop drains the GPU at a benchmark
+  boundary; the GPU's ring size and setup in the footprint block) and
+  `Common/processing.cpp` (`08b444e`: `NextIntervalAt()` passes over a
+  step-list entry at or before the timestep, so that ProcField's
+  `AddStep(maxExcite)` no longer hides its Nyquist interval for one step in
+  the standard loop; it changes the CPU loops only where nothing else is due
+  in that step, e.g. `dump_fails`, where the old pipelined GPU loop, which
+  checks before it processes, already checked at the interval).
+- **Verified (Vulkan)** on the merged tree, RX 6800 unless noted:
+  - `batch_sampling_identity.py --engine gpu`: 144 of 144 rows pass, all
+    twelve cases × flat, 4:16 × pipelined, standard loop ×
+    `OPENEMS_BATCH_SAMPLING_RING` default, 1, 5. On the UHD 770 (Intel
+    RPL-S): `dirac`, `dirac_exact` × flat, 4:16 × both loops pass.
+  - `test_batch_sampling.py`: GPU classes 60 of 60, AVX2 classes 60 of 60.
+  - `batch_sampling_identity.py --engine avx2-multithreaded --threads 3`,
+    with `08b444e`: 36 of 36 rows, all twelve cases × flat, 4:16, 8:16.
+  - `test_gpu_temporal_blocking.py`: 23 of 23 (Dirac and step new);
+    `gpu_tblock_identity.py`: all five cases identical.
+  - `--benchmark` on a 160³ Dirac model: candidates up to k = 32, "probes
+    sampled inside the blocks: they do not cap the block depth".
+  - Speed, indicative only (not quiet; 224³ Mur, two probes, 3 alternating
+    rounds, medians, MC/s, blocked = the default k=26 W=53): Dirac, 1500
+    timesteps, the energy every timestep: old loop flat 3296, old blocked
+    3283 (runs flat), new flat 3989, new blocked **8135**; Gaussian, probes
+    every 6, 3000 timesteps: 5007, 9126, 5213, **10167**.
 - **Not done.**
-  - Vulkan (§4.5): `SupportsBatchSampling()` false, it runs the old loops
-    unchanged and prints `In-batch sampling OFF: the gpu engine does not
-    support it`. Its blocked-timestep counter is not there either, so it
-    prints no `Temporal blocking:` line.
-  - The pipelined GPU loop (`openems.cpp`, "Pipelined GPU main loop") is
-    unchanged.
-  - §6 and §7 below still describe the state before the AVX2 sampler.
+  - §6 below still describes the AVX2 state before its in-block sampler;
+    §1 has the later results.
 - **Open (AVX2).** A run still computes up to one batch past the timestep it
   stops at (a stop found in the replay), as §3.3 says: 775 timesteps for a
   stop at 425 on `gauss_exact`, about 33 000 past 167 533 on `sine_long` (half
@@ -492,27 +534,140 @@ comment block "In-batch sampling inside the schedules"):
 
 ### 4.5 For Vulkan
 
-- `Engine_Vulkan::GetVolt()`/`GetCurr()` record and serve their own probe
-  cache; `BatchRead()` has to come first, and its own recording has to stay
-  out of `BS_RECORD` (the core records before `StartProbeRecording()`).
-- `IterateSampledTS()` maps onto the gather of the probe cache at each sample
-  timestep into a ring slot, and the energy onto a reduction whose result
-  equals `CalcFastEnergyGPU()` bit for bit (or `Engine_Interface_FDTD::
-  CalcFastEnergy()` changes for the GPU to the same reduction, flat and
-  sampled).
-- The pipelined loop can reuse `planBatch()` and `replayBatch()`, which are
-  lambdas of `RunFDTD()` defined before both loops. Planning batch N+1 while
-  batch N is replayed: `planBatch(endOfN, batchN.nextStep,
-  &batchN.nextPositions)` (with the benchmark, clamp `nextStep` first). The
-  samples of N must survive `ScheduleBatchSamples()` of N+1 (the base class
-  keeps one batch: double-buffer, or schedule after the replay), and
-  `BeginBatchReplay()` must accept the timesteps of N while the public `numTS`
-  is N's last (`SubmitSpeculative()` keeps it there). `relaxEndCriteria()`
-  changes ProcField's interval: a batch planned before it and replayed after
-  it diverges and throws, so relax only with no plan outstanding.
-- The standard loop's benchmark branch drains the GPU at a boundary; the
-  sampled loop does not (no GPU engine takes it yet).
-- `GetBlockedTimesteps()` is -1 on the GPU so far: no summary line.
+Done on branch `tb-all-exc/vulkan` (§1). `Engine_Vulkan` samples inside its
+blocks, flat and blocked, and the pipelined GPU loop runs the next batch
+while the host replays the last one.
+
+**Where a sample is taken.** `IterateSampledTS()` records the batch with,
+at each sample timestep `t`, a gather of the footprint and the energy's
+partial sums into a slot of a host-visible ring:
+
+- flat sweep: at the top of iteration `t`, before its pre-voltage passes;
+- blocked: at the top of each slab's step `t`, for the slab's E range
+  `[eLo, eHi)` (`RecordSlabSweep()`). An x-line holds the end of `t-1` until
+  that step: its voltages change first in the voltage update of `t`, and its
+  currents are final for `t-1` (that update reads them) and change only in
+  the current update of `t`, which comes after. The pre-voltage passes before
+  the sample write only their own state (Mur, RLC, dispersive, local
+  absorbing sheets, and Mur/RLC/sheets merged into the previous step's current
+  update); unfused UPML's pre pass, which swaps field and flux, comes after
+  it. No current-phase pass writes voltages on the GPU (§4.3). The E ranges of
+  a timestep partition `[0, NX)`, so every cell and every plane is sampled
+  once.
+
+One barrier follows a sample (the next pass overwrites what it read); none
+precedes it, since every stage ends with a barrier after its writes. A slab
+whose E range holds no footprint cell dispatches no gather.
+
+**The gather** (`batch_sample.comp`) reads a list of the footprint's cells
+sorted by x, with a prefix table, so that the cells of an E range are one
+contiguous run: each entry is the cell's index into its field buffer and
+its footprint position, bit 31 set for a current. The slot is in footprint
+order, so `CollectSampledBatch()` copies the slots into the base class's
+`m_bsValues` as they are.
+
+**The energy.** `CalcFastEnergyGPU()` is now the x-plane sum of
+`reduce_energy_planes.comp` (one float pair (|V|², |I|²) per plane and chunk
+of 4096 cells, which the host adds in plane order in double), the same the
+steady-state checks use; `reduce_energy.comp` (256 workgroups over the whole
+grid) is gone. A sampled energy is the same pipeline over the same planes,
+so it is the live value bit for bit; the old loop's energies changed in
+their last digits with it, both loops alike.
+
+**The ring.** Two halves (the pipelined loop collects one while the next
+batch writes the other), each `ring + 1` slots (the extra one for a batch's
+last timestep), in host-visible memory, cached where the device has it and
+so not in a small BAR. A slot holds the footprint and, where the energy
+criterion is evaluated (no steady-state detection, no `--benchmark`), the
+energy partials, `2 · NX · ceil(NY·NZ/4096)` floats. The default ring is the
+most slots, at most 1024 and at least 1, that fit a byte budget of 64 MB
+over both halves (`OPENEMS_GPU_BATCH_SAMPLING_MB`); `BatchSamplingRing()`
+gives it to `RunFDTD()` before `OPENEMS_BATCH_SAMPLING_RING`, and
+`SetupBatchSampling()` makes the ring. For 64×32×32 and a few hundred probe
+cells that is 1024; a 10⁵-cell mode-matching probe gets about 80, and on
+300³ with energy samples (13200 floats a slot) about 600.
+
+**Probe cache and reads.** `GetVolt()`/`GetCurr()` call `BatchRead()` first;
+the engine's own recording runs only outside `BS_RECORD`. With sampling the
+probe cache is the core's footprint (`SetupProbeCache()`): the pipelined
+reading serves the batch's last timestep from its end sample
+(`ReadEndSample()`, `FootprintSlot()`), and `CalcFastEnergyGPU()` returns
+the end sample's energy while a batch computes ahead; reading either without
+a sample is a `std::logic_error`. Without a batch ahead, a missing end sample
+reads the live fields.
+
+**Standard loop** (`OPENEMS_GPU_PIPELINE=0`, host field readers):
+`IterateSampledTS()` records, submits, waits and collects; the last end reads
+the live fields, as before. Its benchmark branch drains the GPU at a
+boundary.
+
+**Pipelined loop** (`openems.cpp`, "Pipelined GPU main loop, with in-batch
+sampling"):
+
+```
+plan and submit batch 0 (SubmitSampledSpeculative(): numTS stays)
+while a batch is submitted:
+    cur = it; CommitSampledSpeculative()      // wait, numTS = cur's last
+    if it may run ahead: plan cur+1 from cur.nextStep, cur.nextPositions; submit
+    CollectSampledBatch()                     // cur's samples to the replay
+    replayBatch(cur) with the pipelined reading
+    stop, failure: break
+    adaptBatchLength(); progress()
+    if nothing was submitted ahead: drain at a benchmark boundary, plan from the live state, submit
+commit a batch computed past the stop (the timestep count includes it)
+```
+
+`planBatch()` also returns `lastProbe` and `lastEnergy`, whether a probe or
+the energy criterion reads at the batch's last end: the GPU samples those too.
+It does not run ahead where the host needs the GPU at the end of `cur` or the
+plan may not hold: a frequency-domain dump due there that could not be
+stashed (below), the relaxation of the end criterion after its first minute
+(a batch planned before it would be replayed correctly, §3.10, but the one
+after it would be planned from a stale ProcField interval),
+a status that needs the live energy once relaxed (`progress()` puts it off to
+the next batch, which ends drained), a replay that left its plan (§3.10: the
+batch already ahead runs, the one after is planned from the live state), the
+benchmark's boundary, NrTS, an abort.
+
+Batches run about half a second (`adaptBatchLength()`), at most
+`MaxSpeculativeBatch()`: what records without waiting for the GPU, 16 command
+buffers of `OPENEMS_GPU_MAX_TS_PER_SUBMIT` (1024 timesteps), or one
+steady-state period, beyond which `ScheduleSteadyStateChecks()` waits for a
+check. `OPENEMS_GPU_SPEC_DEPTH=<n>` and `OPENEMS_GPU_SPEC_MAX_DEPTH=<n>`
+cap the batch at n timesteps instead (the old loop keeps their old meaning).
+The engine may run up to one batch past the timestep the replay stops at;
+`Temporal blocking: <b> of <n>` counts it, the stop line and "Time for"
+do not.
+
+**Frequency-domain dumps.** A DFT sum cannot take a sample back, and a batch
+may run past the stop, so a sampled batch adds no DFT sample. It gathers the
+footprint of a DFT dump due at its end into a device-local stash (two halves),
+and `AddDumpDFTSample()` adds the stash when the dump processes that timestep,
+in a command of its own queued behind the batch running ahead, with the same
+DFT pipeline (the stash read as a field through identity lines), hence the
+same sums. A dump without a stash makes the loop wait there
+(`DumpNeedsGPUAt()`).
+
+**Time-domain dumps** gathered by the GPU (`RegisterDumpGather()`) still end
+a batch, and are served at its end as before. Serving them inside a batch
+would need a dump-ring slot per dump timestep in the batch, held until the
+dump's thread has written it: a follow-up.
+
+**The old pipelined loop** (`OPENEMS_BATCH_SAMPLING=0`) now evaluates the end
+criteria at the end of its first batch too; it skipped that one, unlike the
+standard loop, which showed in the end-criterion trace (Dirac: timestep 1).
+
+With the review fix `08b444e` (§1) the two orders agree also where
+ProcField's step-list timestep (maxExcite) is a batch end with nothing else
+due before its next interval: the standard loop used to skip that interval
+there, the old pipelined loop did not.
+
+`GetBlockedTimesteps()` counts the timesteps recorded in blocks of depth >= 2
+(`IterateTS()`), speculative batches included. `GetPreferredBatchLength()`
+asks for two blocks of the blocked schedule (resolving the request if no
+batch has been recorded yet). `SamplesInsideBlocks()` is true once the ring
+is set up, so `--benchmark` offers blocked candidates as deep as the grid
+allows, not as the probe interval does.
 
 ## 5. Switches and lines
 
@@ -572,7 +727,11 @@ assertion fails.
 
 ## 7. Open
 
-- The in-block samplers (§4.4, §4.5); until then Dirac and step block nowhere.
+- The in-block samplers are done (§4.4, §4.5). An engine computes up to one
+  batch past a stop found in the replay; on the GPU that is a pipelined batch
+  too (e.g. `custom` at 4:16: 1500 timesteps for a stop at 612).
+- GPU: time-domain dumps the GPU gathers still end a batch (§4.5); the
+  pipelined loop waits at a frequency-domain dump that could not be stashed.
 - A replayed probe read is an index lookup (`Engine::FootprintSlot()`, built
   once by `StopFootprintRecording()`: a dense box per field component where
   its cells fill at least 1/16 of their bounding box, a hash table for the

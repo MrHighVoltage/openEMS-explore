@@ -165,6 +165,15 @@ measured optimum sits. A run oversampled far past Nyquist will not reach the
 numbers above. GPU probes are gathered inside the batch, so they need slab
 ranges before `m_hasGPU_Probes` can stop being a refusal.
 
+**Lifted by in-batch sampling (2026-11-06, `plans/BATCH_SAMPLING.md` §4.5).**
+The probe interval no longer caps the depth, Dirac and step excitations
+(interval 1) included: a batch runs past the timesteps at which only probes
+and the energy end criterion are due, and `RecordSlabSweep()` gathers the
+probe footprint and the energy's x-plane sums of each slab's E range at the
+top of the slab's step, into a host-visible ring; the main loop replays the
+probes from there. Only field dumps still end a batch, and with them the
+blocks. `OPENEMS_BATCH_SAMPLING=0` restores the old cap.
+
 ### 5. Steady-state detection — ~~cannot be blocked~~ done 2026-11-04
 
 Every period it integrates energy over the whole grid, and a blocked schedule
