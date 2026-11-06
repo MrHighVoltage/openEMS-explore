@@ -2085,7 +2085,7 @@ void openEMS::RunFDTD()
 	unsigned int bsMaxLen = bsMinLen;
 	unsigned int bsDoneTS = 0;   // the timestep last replayed: the one the run has got to
 	bool bsStopped = false;      // the run stopped in the replay of a timestep before the batch's last
-	struct {unsigned long long batches = 0, timesteps = 0, ends = 0, probes = 0, energies = 0;} bsStats; // -v
+	struct {unsigned long long batches = 0, timesteps = 0, ends = 0, probes = 0, energies = 0, offPlan = 0;} bsStats; // -v
 
 	// One batch: the timesteps the old loop would have ended its batches at,
 	// and the samples a replay of them needs.
@@ -2168,11 +2168,24 @@ void openEMS::RunFDTD()
 	// the run stops (an end criterion met, a numerical failure); bsDoneTS is
 	// the last end replayed, and bsStopped tells whether that is before the
 	// batch's last. \a step is left as the old loop would have it there.
-	auto replayBatch = [&](const SampledBatch& b, int& step)
+	//
+	// The ends replayed are those the processings ask for, which are the
+	// plan's unless one changes its own schedule while processing (a dump
+	// that disables itself on a write error): then the replay follows the
+	// processings, and replays the batch's last timestep in any case
+	// (plans/BATCH_SAMPLING.md §3.10). Returns true if they did what the
+	// plan looked ahead to, up to the step and step positions after the
+	// last end, false if not. A replayed timestep at which something reads
+	// what the batch did not sample throws in the engine (BatchRead(),
+	// GetBatchReplayEnergy()).
+	auto replayBatch = [&](const SampledBatch& b, int& step) -> bool
 	{
-		for (size_t i = 0; i < b.ends.size(); ++i)
+		const unsigned int last = b.ends.back();
+		bool asPlanned = true;
+		size_t i = 0;  // the first planned end after ts
+		unsigned int ts = b.ends.front();
+		for (;;)
 		{
-			const unsigned int ts = b.ends[i];
 			bsDoneTS = ts;
 			bool ok;
 			{
@@ -2180,24 +2193,26 @@ void openEMS::RunFDTD()
 				step = PA->Process();
 				ok = checkEndCriteria();
 			}
-			const bool last = (i+1 == b.ends.size());
 			if (!ok || (change<=endCrit))
 			{
-				bsStopped = !last;
-				return;
+				bsStopped = (ts != last);
+				return asPlanned;
 			}
 			if ((step<0) || (step>(int)(NrTS - ts))) step=NrTS - ts;
-			// The processings must have done what the plan looked ahead to.
-			const int next = (bench && !last) ? bench->Clamp(step, ts) : step;
-			const bool asPlanned = last ? ((ts >= NrTS) || ((step == b.nextStep) && (PA->GetStepPositions() == b.nextPositions)))
-			                            : ((next > 0) && (ts + (unsigned int)next == b.ends[i+1]));
-			if (!asPlanned)
+			if (ts == last)
 			{
-				std::ostringstream err;
-				err << "in-batch sampling: the replay of timestep " << ts << " continues to timestep "
-				    << ts + next << ", the plan to " << (last ? ts + b.nextStep : b.ends[i+1]);
-				throw std::logic_error(err.str());
+				if ((ts < NrTS) && ((step != b.nextStep) || (PA->GetStepPositions() != b.nextPositions)))
+					asPlanned = false;
+				return asPlanned;
 			}
+			while ((i < b.ends.size()) && (b.ends[i] <= ts))
+				++i;
+			const int next = bench ? bench->Clamp(step, ts) : step;
+			if (next <= 0)
+				throw std::logic_error("in-batch sampling: a replayed step of no timesteps");
+			if (ts + (unsigned int)next != b.ends[i])
+				asPlanned = false;
+			ts = std::min(ts + (unsigned int)next, last);
 		}
 	};
 	// After a batch of batchTS timesteps begun at batchTime: the next may run
@@ -2562,7 +2577,8 @@ void openEMS::RunFDTD()
 		bsStats.ends += batch.ends.size();
 		bsStats.probes += batch.probeTS.size();
 		bsStats.energies += batch.energyTS.size();
-		replayBatch(batch, step);
+		if (!replayBatch(batch, step))
+			++bsStats.offPlan; // the next batch is planned from the live state anyway
 		if (numericalFailure || bsStopped)
 			break;
 		adaptBatchLength(batchTS, batchTime);
@@ -2629,6 +2645,8 @@ void openEMS::RunFDTD()
 		   << setprecision(1) << std::fixed << (double)bsStats.timesteps/bsStats.batches << " per batch), "
 		   << bsStats.ends << " timesteps replayed, " << bsStats.probes << " probe and "
 		   << bsStats.energies << " energy samples";
+		if (bsStats.offPlan)
+			os << ", " << bsStats.offPlan << " batches off their plan";
 		cout << os.str() << endl;
 	}
 
