@@ -86,6 +86,19 @@ double CalcDiffTime(timeval t1, timeval t2)
 	return s_diff;
 }
 
+namespace
+{
+//! The engine in replay of timestep \a ts of its last batch, for as long as this lives (in-batch sampling).
+struct BatchReplayScope
+{
+	Engine* eng;
+	BatchReplayScope(Engine* e, unsigned int ts) : eng(e) {eng->BeginBatchReplay(ts);}
+	~BatchReplayScope() {eng->EndBatchReplay();}
+	BatchReplayScope(const BatchReplayScope&) = delete;
+	BatchReplayScope& operator=(const BatchReplayScope&) = delete;
+};
+}
+
 openEMS::openEMS()
 {
 	setlocale(LC_NUMERIC, "en_US.UTF-8");
@@ -1996,6 +2009,20 @@ void openEMS::RunFDTD()
 		ProcField->SetProcessInterval(endCritInterval);
 	}
 
+	// OPENEMS_ENDCRIT_TRACE=1: a line for every evaluation of the energy end
+	// criterion, all digits, so that the traces of two runs compare as text.
+	const char* envEndCritTrace = std::getenv("OPENEMS_ENDCRIT_TRACE");
+	const bool endCritTrace = envEndCritTrace && (string(envEndCritTrace) == "1");
+	auto traceEndCriteria = [&]()
+	{
+		if (!endCritTrace)
+			return;
+		char line[160];
+		snprintf(line, sizeof(line), "endcrit trace: ts=%u energy=%.17g maxE=%.17g change=%.17g\n",
+		         FDTD_Eng->GetNumberOfTimesteps(), currE, maxE, change);
+		cout << line << flush;
+	};
+
 	// The end criteria after a batch of timesteps: false stops the run on a numerical failure.
 	auto checkEndCriteria = [&]() -> bool
 	{
@@ -2012,6 +2039,7 @@ void openEMS::RunFDTD()
 				return false;
 			if (exactEndCrit && maxE)
 				change = currE/maxE;
+			traceEndCriteria();
 			return validateChange();
 		}
 		return true;
@@ -2027,6 +2055,155 @@ void openEMS::RunFDTD()
 		ProcField->ClearProcessInterval();
 	};
 
+	// ---- In-batch sampling (plans/BATCH_SAMPLING.md) ----
+	// The loop used to end every IterateTS() at the next timestep any
+	// processing was due at, which capped a blocked schedule's depth at the
+	// probe interval. With in-batch sampling a batch runs on past the
+	// timesteps at which only the probes and the energy estimate of the end
+	// criterion are due; the engine samples what those read on the way, and
+	// the loop replays the batch afterwards: at each timestep the old loop
+	// would have ended a batch at, it does what the old loop did there, with
+	// the engine in replay of that timestep. OPENEMS_BATCH_SAMPLING=0 keeps
+	// the old loop.
+	std::string bsOff;
+	if (const char* env = std::getenv("OPENEMS_BATCH_SAMPLING"))
+		if (string(env) == "0")
+			bsOff = "OPENEMS_BATCH_SAMPLING=0";
+	if (bsOff.empty() && !FDTD_Eng->SupportsBatchSampling())
+		bsOff = "the " + EngineOptionValue() + " engine does not support it";
+	const bool bsOn = bsOff.empty();
+	// Per processing: served by the replay. The probes are (ProcessIntegral:
+	// they read only through the engine's GetVolt()/GetCurr()), and so is
+	// ProcField, which reads nothing itself. A batch ends wherever any other
+	// processing reads the fields.
+	std::vector<char> bsServed;
+	size_t bsProcField = 0;
+	unsigned int bsRing = 0;     // the most sampled timesteps of one batch
+	// The most timesteps of one batch: at first the old loop's cap, the
+	// Nyquist interval, then about half a second's worth (adaptBatchLength()).
+	const unsigned int bsMinLen = std::max(1u, PA->GetMaxInterval());
+	unsigned int bsMaxLen = bsMinLen;
+	unsigned int bsDoneTS = 0;   // the timestep last replayed: the one the run has got to
+	bool bsStopped = false;      // the run stopped in the replay of a timestep before the batch's last
+	struct {unsigned long long batches = 0, timesteps = 0, ends = 0, probes = 0, energies = 0;} bsStats; // -v
+
+	// One batch: the timesteps the old loop would have ended its batches at,
+	// and the samples a replay of them needs.
+	struct SampledBatch
+	{
+		std::vector<unsigned int> ends;     // ascending; back() is the batch's last timestep, read live
+		std::vector<unsigned int> probeTS;  // the ends at which a probe reads: footprint samples
+		std::vector<unsigned int> energyTS; // the ends at which the end criterion reads the energy
+		unsigned int longestRun = 0;        // the most timesteps between two samples, or a sample and an end of the batch
+	};
+	// The batch from startTS, whose first old-loop batch is step timesteps
+	// long: what PA->Process() and checkEndCriteria() would do at each end,
+	// looked ahead without doing it (Processing::ProcessAt()). It ends at the
+	// first end at which a processing not served reads the fields, at the
+	// ring's capacity, NrTS, the benchmark's boundary, or past bsMaxLen
+	// timesteps. Every end costs a few operations per processing; the old
+	// loop called PA->Process() at each of them.
+	auto planBatch = [&](unsigned int startTS, int step) -> SampledBatch
+	{
+		SampledBatch b;
+		std::vector<size_t> psPos = PA->GetStepPositions();
+		std::vector<char> reads;
+		const bool energyChecks = !bench && (Eng_Ext_SSD==NULL); // as checkEndCriteria()
+		unsigned int ts = startTS, lastSample = startTS, sampled = 0;
+		for (;;)
+		{
+			if (step <= 0)
+				throw std::logic_error("in-batch sampling: a batch of no timesteps");
+			ts += (unsigned int)step;
+			b.ends.push_back(ts);
+			if ((ts >= NrTS) || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen))
+				break;
+			int next = PA->ProcessAt(ts, psPos, reads);
+			bool probe = false, other = false;
+			for (size_t i = 0; i < reads.size(); ++i)
+			{
+				if (!reads[i])
+					continue;
+				if (bsServed[i])
+					probe = true;
+				else
+					other = true;
+			}
+			const bool energy = energyChecks && ProcField->CheckTimestepAt(ts, psPos.at(bsProcField));
+			if (other || ((probe || energy) && (sampled >= bsRing)))
+				break;  // the processings read the live fields here
+			if (probe)
+				b.probeTS.push_back(ts);
+			if (energy)
+				b.energyTS.push_back(ts);
+			if (probe || energy)
+			{
+				++sampled;
+				b.longestRun = std::max(b.longestRun, ts - lastSample);
+				lastSample = ts;
+			}
+			// as the old loop after PA->Process()
+			if ((next<0) || (next>(int)(NrTS - ts))) next=NrTS - ts;
+			if (bench)
+				next = bench->Clamp(next, ts);
+			step = next;
+		}
+		b.longestRun = std::max(b.longestRun, b.ends.back() - lastSample);
+		return b;
+	};
+	// Replay a batch the engine has run: at each end in order, what the old
+	// loop did after an IterateTS(), PA->Process() and the end criteria, with
+	// the engine in replay of that timestep. Stops at the first end at which
+	// the run stops (an end criterion met, a numerical failure); bsDoneTS is
+	// the last end replayed, and bsStopped tells whether that is before the
+	// batch's last. \a step is left as the old loop would have it there.
+	auto replayBatch = [&](const SampledBatch& b, int& step)
+	{
+		for (size_t i = 0; i < b.ends.size(); ++i)
+		{
+			const unsigned int ts = b.ends[i];
+			bsDoneTS = ts;
+			bool ok;
+			{
+				BatchReplayScope replay(FDTD_Eng, ts);
+				step = PA->Process();
+				ok = checkEndCriteria();
+			}
+			const bool last = (i+1 == b.ends.size());
+			if (!ok || (change<=endCrit))
+			{
+				bsStopped = !last;
+				return;
+			}
+			if ((step<0) || (step>(int)(NrTS - ts))) step=NrTS - ts;
+			if (!last)
+			{
+				const int next = bench ? bench->Clamp(step, ts) : step;
+				if ((next <= 0) || (ts + (unsigned int)next != b.ends[i+1]))
+				{
+					std::ostringstream err;
+					err << "in-batch sampling: the replay of timestep " << ts << " continues to timestep "
+					    << ts + next << ", the plan to " << b.ends[i+1];
+					throw std::logic_error(err.str());
+				}
+			}
+		}
+	};
+	// After a batch of batchTS timesteps begun at batchTime: the next may run
+	// about half a second, at most twice as long as this one, never shorter
+	// than the old loop's cap. That keeps the status line and the abort
+	// checks at the batch ends as frequent as they were.
+	auto adaptBatchLength = [&](unsigned int batchTS, const timeval& batchTime)
+	{
+		timeval now;
+		gettimeofday(&now,NULL);
+		const double seconds = CalcDiffTime(now,batchTime);
+		double len = (seconds > 0) ? 0.5*batchTS/seconds : 2.0*bsMaxLen;
+		len = std::min(len, 2.0*bsMaxLen);
+		len = std::min(len, (double)(1u<<30));
+		bsMaxLen = std::max(bsMinLen, (unsigned int)len);
+	};
+
 	if (m_DumpStats)
 		InitRunStatistics(OPENEMS_RUN_STAT_FILE);
 	//*************** simulate ************//
@@ -2038,6 +2215,49 @@ void openEMS::RunFDTD()
 	try
 	{
 		PA->PreProcess();
+
+		if (bsOn)
+		{
+			// The footprint: every probe reads its cells once while the engine
+			// records them, those with a start time too. What a probe reads does
+			// not depend on the timestep.
+			bsServed.assign(PA->GetNumberOfProcessings(), 0);
+			FDTD_Eng->StartFootprintRecording();
+			for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
+			{
+				Processing* proc = PA->GetProcessing(i);
+				if (proc == ProcField)
+				{
+					bsServed[i] = 1;
+					bsProcField = i;
+					continue;
+				}
+				ProcessIntegral* pi = dynamic_cast<ProcessIntegral*>(proc);
+				if (!pi)
+					continue;
+				bsServed[i] = 1;
+				if (pi->GetEnable())
+					pi->CalcMultipleIntegrals();
+			}
+			FDTD_Eng->StopFootprintRecording();
+			const size_t cells = FDTD_Eng->GetFootprint().size();
+			// At most 1024 sampled timesteps per batch, and about 64 MB of them.
+			bsRing = 1024;
+			if (cells > 0)
+				bsRing = (unsigned int)std::min<size_t>(1024, std::max<size_t>(16, (64u<<20)/(cells*sizeof(FDTD_FLOAT))));
+			if (const char* env = std::getenv("OPENEMS_BATCH_SAMPLING_RING"))
+			{
+				if (atoi(env) > 0)
+					bsRing = (unsigned int)atoi(env);
+				else
+					cerr << "RunFDTD: Warning: invalid OPENEMS_BATCH_SAMPLING_RING='" << env << "' (must be >=1), using " << bsRing << endl;
+			}
+			// the energy estimate, as checkEndCriteria() computes it
+			FDTD_Eng->SetBatchEnergyFunction([ProcField]() {return ProcField->CalcTotalEnergyEstimate();});
+			cout << "In-batch sampling ON: " << cells << " probe cells, ring " << bsRing << " timesteps" << endl;
+		}
+		else
+			cout << "In-batch sampling OFF: " << bsOff << endl;
 
 #ifdef WITH_GPU
 		// Enable probe access recording during initial PA->Process().
@@ -2222,6 +2442,7 @@ void openEMS::RunFDTD()
 							break;
 						if (maxE)
 							change = currE/maxE;
+						traceEndCriteria();
 						if (!validateChange())
 							break;
 					}
@@ -2256,6 +2477,92 @@ void openEMS::RunFDTD()
 	// the GPU engine, a field dump the GPU cannot serve, or neither probes nor
 	// dumps.  On the GPU, IterateTS() is a fire-and-forget submit, and field
 	// dumps gather their cells at the end of that batch.
+
+	// After a batch that ended at currTS: the end criteria relaxed after their
+	// first minute, and every 4 s the status line. False stops the run on a
+	// numerical failure.
+	auto progress = [&]() -> bool
+	{
+		gettimeofday(&currTime,NULL);
+
+		t_diff = CalcDiffTime(currTime,prevTime);
+		relaxEndCriteria();
+
+		if (t_diff>4)
+		{
+			t_run = CalcDiffTime(currTime,startTime);
+			speed = numCells*(currTS-prevTS)/t_diff;
+			status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
+			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
+			if (Eng_Ext_SSD==NULL)
+			{
+				if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
+				{
+					if (!sampleEnergy())
+						return false;
+					if (maxE)
+						change = currE/maxE;
+					traceEndCriteria();
+					if (!validateChange())
+						return false;
+				}
+				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
+			}
+			else
+				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
+			prevTime=currTime;
+			prevTS=currTS;
+
+			PA->FlushNext();
+
+			if (m_DumpStats)
+				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
+			FDTD_Eng->NextInterval(speed);
+		}
+		return true;
+	};
+
+	if (bsOn)
+	{
+	// With in-batch sampling: a batch runs on past the timesteps at which
+	// only probes and the energy estimate are due, and is replayed after.
+	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !numericalFailure && !CheckAbortCond())
+	{
+		currTS = FDTD_Eng->GetNumberOfTimesteps();
+		if (bench)
+		{
+			if (currTS >= bench->Boundary())
+			{
+				if (!bench->Advance(currTS))
+					break;
+			}
+			step = bench->Clamp(step, currTS);
+		}
+		timeval batchTime;
+		gettimeofday(&batchTime,NULL);
+		const SampledBatch batch = planBatch(currTS, step);
+		const unsigned int batchTS = batch.ends.back() - currTS;
+		if (bench)
+			bench->NoteInterval((int)(FDTD_Eng->SamplesInsideBlocks() ? batchTS : batch.longestRun));
+		FDTD_Eng->ScheduleBatchSamples(batch.probeTS, batch.energyTS);
+		FDTD_Eng->IterateSampledTS(batchTS);
+		++bsStats.batches;
+		bsStats.timesteps += batchTS;
+		bsStats.ends += batch.ends.size();
+		bsStats.probes += batch.probeTS.size();
+		bsStats.energies += batch.energyTS.size();
+		replayBatch(batch, step);
+		if (numericalFailure || bsStopped)
+			break;
+		adaptBatchLength(batchTS, batchTime);
+
+		currTS = FDTD_Eng->GetNumberOfTimesteps();
+		if (!progress())
+			break;
+	}
+	}
+	else
+	{
 	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !numericalFailure && !CheckAbortCond())
 	{
 		if (bench)
@@ -2285,41 +2592,9 @@ void openEMS::RunFDTD()
 		currTS = FDTD_Eng->GetNumberOfTimesteps();
 		if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
 
-		gettimeofday(&currTime,NULL);
-
-		t_diff = CalcDiffTime(currTime,prevTime);
-		relaxEndCriteria();
-
-		if (t_diff>4)
-		{
-			t_run = CalcDiffTime(currTime,startTime);
-			speed = numCells*(currTS-prevTS)/t_diff;
-			status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
-			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
-			if (Eng_Ext_SSD==NULL)
-			{
-				if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
-				{
-					if (!sampleEnergy())
-						break;
-					if (maxE)
-						change = currE/maxE;
-					if (!validateChange())
-						break;
-				}
-				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
-			}
-			else
-				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
-			prevTime=currTime;
-			prevTS=currTS;
-
-			PA->FlushNext();
-
-			if (m_DumpStats)
-				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
-			FDTD_Eng->NextInterval(speed);
-		}
+		if (!progress())
+			break;
+	}
 	}
 	} // end standard main loop
 	} // end simulation try block
@@ -2330,6 +2605,29 @@ void openEMS::RunFDTD()
 	catch (...)
 	{
 		failNumerically("unknown FDTD engine exception");
+	}
+
+	// The timestep the run got to. With in-batch sampling the last one
+	// replayed, where the old loop would have stopped; the engine may have
+	// run on to the end of that batch.
+	const unsigned int doneTS = bsOn ? bsDoneTS : FDTD_Eng->GetNumberOfTimesteps();
+	if (bsOn && (g_settings.GetVerboseLevel()>0) && bsStats.batches)
+	{
+		std::ostringstream os;
+		os << "In-batch sampling: " << bsStats.batches << " batches of " << bsStats.timesteps << " timesteps ("
+		   << setprecision(1) << std::fixed << (double)bsStats.timesteps/bsStats.batches << " per batch), "
+		   << bsStats.ends << " timesteps replayed, " << bsStats.probes << " probe and "
+		   << bsStats.energies << " energy samples";
+		cout << os.str() << endl;
+	}
+
+	// Temporal blocking: what share of the timesteps ran blocked.
+	{
+		const long long blockedTS = FDTD_Eng->GetBlockedTimesteps();
+		const TemporalBlockingRequest tbReq = FDTD_Eng->GetTemporalBlocking();
+		if ((blockedTS >= 0) && ((tbReq.mode == TemporalBlockingRequest::FORCED) || FDTD_Eng->PlanTemporalBlocking(tbReq).active))
+			cout << "Temporal blocking: " << blockedTS << " of " << FDTD_Eng->GetNumberOfTimesteps()
+			     << " timesteps ran blocked" << endl;
 	}
 
 	if (numericalFailure)
@@ -2357,7 +2655,7 @@ void openEMS::RunFDTD()
 
 		gettimeofday(&currTime,NULL);
 		t_diff = CalcDiffTime(currTime,startTime);
-		cout << "Time for " << FDTD_Eng->GetNumberOfTimesteps()
+		cout << "Time for " << doneTS
 		     << " iterations with " << FDTD_Op->GetNumberCells()
 		     << " cells : " << t_diff << " sec (cancelled)" << endl;
 
@@ -2369,12 +2667,12 @@ void openEMS::RunFDTD()
 	{
 		if (Eng_Ext_SSD == NULL)
 			cout << "RunFDTD: residual field energy reached -"
-			     << fabs(10.0*log10(endCrit)) << " dB after " << FDTD_Eng->GetNumberOfTimesteps()
+			     << fabs(10.0*log10(endCrit)) << " dB after " << doneTS
 			     << " timesteps (-" << setprecision(2) << std::fixed << fabs(10.0*log10(change))
 			     << " dB); stopping simulation." << endl;
 		else
 			cout << "RunFDTD: steady-state criterion of " << setprecision(2) << std::fixed
-			     << 10.0*log10(endCrit) << " dB reached after " << FDTD_Eng->GetNumberOfTimesteps()
+			     << 10.0*log10(endCrit) << " dB reached after " << doneTS
 			     << " timesteps (" << 10.0*log10(change) << " dB); stopping simulation." << endl;
 	}
 
@@ -2391,11 +2689,11 @@ void openEMS::RunFDTD()
 	gettimeofday(&currTime,NULL);
 	t_diff = CalcDiffTime(currTime,startTime);
 
-	cout << "Time for " << FDTD_Eng->GetNumberOfTimesteps() << " iterations with " << FDTD_Op->GetNumberCells() << " cells : " << t_diff << " sec" << endl;
-	cout << "Speed: " << numCells*(double)FDTD_Eng->GetNumberOfTimesteps()/t_diff*1e-6 << " MCells/s " << endl;
+	cout << "Time for " << doneTS << " iterations with " << FDTD_Op->GetNumberCells() << " cells : " << t_diff << " sec" << endl;
+	cout << "Speed: " << numCells*(double)doneTS/t_diff*1e-6 << " MCells/s " << endl;
 
 	if (m_DumpStats)
-		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
+		DumpStatistics(OPENEMS_STAT_FILE, t_diff, doneTS);
 
 	//*************** postproc ************//
 	PA->PostProcess();
@@ -2406,7 +2704,7 @@ void openEMS::RunFDTD()
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 }
 
-bool openEMS::DumpStatistics(const string& filename, double time)
+bool openEMS::DumpStatistics(const string& filename, double time, unsigned int numTS)
 {
 	ofstream stat_file;
 	stat_file.open(filename.c_str());
@@ -2419,10 +2717,10 @@ bool openEMS::DumpStatistics(const string& filename, double time)
 	stat_file << std::setprecision( 16 );
 	stat_file << FDTD_Op->GetNumberCells() << "\t% number of cells" << endl;
 	stat_file << FDTD_Op->GetTimestep() << "\t% timestep (s)" << endl;
-	stat_file << FDTD_Eng->GetNumberOfTimesteps() << "\t% number of iterations" << endl;
-	stat_file << FDTD_Eng->GetNumberOfTimesteps()*FDTD_Op->GetTimestep() << "\t% total numerical time (s)" << endl;
+	stat_file << numTS << "\t% number of iterations" << endl;
+	stat_file << numTS*FDTD_Op->GetTimestep() << "\t% total numerical time (s)" << endl;
 	stat_file << time << "\t% simulation time (s)" << endl;
-	stat_file << (double)FDTD_Op->GetNumberCells()*(double)FDTD_Eng->GetNumberOfTimesteps()/time << "\t% speed (cells/s)" << endl;
+	stat_file << (double)FDTD_Op->GetNumberCells()*(double)numTS/time << "\t% speed (cells/s)" << endl;
 
 	stat_file.close();
 	return true;

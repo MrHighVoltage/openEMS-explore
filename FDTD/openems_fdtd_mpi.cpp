@@ -541,7 +541,7 @@ void openEMS_FDTD_MPI::RunFDTD()
 		cout << "Speed: " << numCells*(double)FDTD_Eng->GetNumberOfTimesteps()/t_diff*1e-6 << " MCells/s " << endl;
 
 		if (m_DumpStats)
-			DumpStatistics(__OPENEMS_STAT_FILE__, t_diff);
+			DumpStatistics(__OPENEMS_STAT_FILE__, t_diff, FDTD_Eng->GetNumberOfTimesteps());
 	}
 
 	//*************** postproc ************//

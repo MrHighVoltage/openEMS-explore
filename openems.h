@@ -215,8 +215,8 @@ protected:
 	//! Setup all processings.
 	virtual bool SetupProcessing();
 
-	//! Dump statistics to file
-	virtual bool DumpStatistics(const std::string& filename, double time);
+	//! Dump statistics of a run of \a numTS timesteps to file
+	virtual bool DumpStatistics(const std::string& filename, double time, unsigned int numTS);
 
 	//! Dump run statistivs to file
 	virtual bool InitRunStatistics(const std::string& filename);
