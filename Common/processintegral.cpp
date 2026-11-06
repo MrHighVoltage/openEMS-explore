@@ -17,16 +17,33 @@
 
 #include "processintegral.h"
 #include "Common/operator_base.h"
+#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 
 using namespace std;
+
+//! OPENEMS_PROBE_PRECISION=<n>: the significant digits of the probe files, in
+//! place of 12 (time domain) and the stream's default of 6 (frequency domain);
+//! 0 where not set. A testing aid: probe files compared as text.
+static unsigned int ProbePrecisionOverride()
+{
+	static const unsigned int digits = []() -> unsigned int
+	{
+		const char* env = std::getenv("OPENEMS_PROBE_PRECISION");
+		const int n = env ? std::atoi(env) : 0;
+		return (n > 0) ? (unsigned int)n : 0u;
+	}();
+	return digits;
+}
 
 ProcessIntegral::ProcessIntegral(Engine_Interface_Base* eng_if)  : Processing(eng_if)
 {
 	m_Results=NULL;
 	m_FD_Results=NULL;
 	m_normDir = -1;
+	if (ProbePrecisionOverride())
+		SetPrecision(ProbePrecisionOverride());
 }
 
 ProcessIntegral::~ProcessIntegral()
@@ -97,6 +114,8 @@ void ProcessIntegral::Dump_FD_Data(double factor, string filename)
 	file.open( filename.c_str() );
 	if (!file.is_open())
 		cerr << "ProcessIntegral::Dump_FD_Data: Error: Can't open file: " << filename << endl;
+	if (ProbePrecisionOverride())
+		file << setprecision(ProbePrecisionOverride());
 
 	//write header
 	time_t rawTime;
