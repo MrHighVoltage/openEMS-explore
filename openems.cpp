@@ -2101,6 +2101,11 @@ void openEMS::RunFDTD()
 		// is replayed (the pipelined loop), planBatch() continues from these.
 		int nextStep = 0;
 		std::vector<size_t> nextPositions;
+		// At the last end: whether a probe reads, and whether the end
+		// criterion reads the energy. The pipelined GPU loop samples those
+		// too, since the GPU runs on before the replay gets there.
+		bool lastProbe = false;
+		bool lastEnergy = false;
 	};
 	// The batch from startTS, whose first old-loop batch is step timesteps
 	// long: what PA->Process() and checkEndCriteria() would do at each end,
@@ -2124,7 +2129,16 @@ void openEMS::RunFDTD()
 			ts += (unsigned int)step;
 			b.ends.push_back(ts);
 			if (ts >= NrTS)
+			{
+				// What is read at this last end, on a copy of the positions:
+				// nothing continues from them.
+				std::vector<size_t> pos = psPos;
+				PA->ProcessAt(ts, pos, reads);
+				for (size_t i = 0; i < reads.size(); ++i)
+					b.lastProbe = b.lastProbe || (reads[i] && bsServed[i]);
+				b.lastEnergy = energyChecks && ProcField->CheckTimestepAt(ts, pos.at(bsProcField));
 				break;
+			}
 			int next = PA->ProcessAt(ts, psPos, reads);
 			bool probe = false, other = false;
 			for (size_t i = 0; i < reads.size(); ++i)
@@ -2142,7 +2156,12 @@ void openEMS::RunFDTD()
 			b.nextStep = next;
 			if (other || ((probe || energy) && (sampled >= bsRing))
 			    || (bench && (ts >= bench->Boundary())) || (ts - startTS >= bsMaxLen))
-				break;  // the last end: the processings read the live fields here
+			{
+				// the last end: the processings read the live fields here
+				b.lastProbe = probe;
+				b.lastEnergy = energy;
+				break;
+			}
 			if (probe)
 				b.probeTS.push_back(ts);
 			if (energy)
@@ -2253,6 +2272,13 @@ void openEMS::RunFDTD()
 			bsRing = 1024;
 			if (cells > 0)
 				bsRing = (unsigned int)std::min<size_t>(1024, std::max<size_t>(16, (64u<<20)/(cells*sizeof(FDTD_FLOAT))));
+#ifdef WITH_GPU
+			// The GPU gathers the samples into host-visible rings, by a byte
+			// budget of its own that counts the energy's partial sums too.
+			const bool bsEnergy = !bench && (Eng_Ext_SSD==NULL); // as planBatch()
+			if (gpuEng)
+				bsRing = gpuEng->BatchSamplingRing(cells, bsEnergy);
+#endif
 			if (const char* env = std::getenv("OPENEMS_BATCH_SAMPLING_RING"))
 			{
 				if (atoi(env) > 0)
@@ -2260,6 +2286,10 @@ void openEMS::RunFDTD()
 				else
 					cerr << "RunFDTD: Warning: invalid OPENEMS_BATCH_SAMPLING_RING='" << env << "' (must be >=1), using " << bsRing << endl;
 			}
+#ifdef WITH_GPU
+			if (gpuEng)
+				gpuEng->SetupBatchSampling(bsRing, bsEnergy);
+#endif
 			// the energy estimate, as checkEndCriteria() computes it
 			FDTD_Eng->SetBatchEnergyFunction([ProcField]() {return ProcField->CalcTotalEnergyEstimate();});
 			cout << "In-batch sampling ON: " << cells << " probe cells, ring " << bsRing << " timesteps" << endl;
@@ -2280,6 +2310,59 @@ void openEMS::RunFDTD()
 			bench->NoteInterval(step);
 			step = bench->Clamp(step, FDTD_Eng->GetNumberOfTimesteps());
 		}
+
+	// After a batch that ended at currTS: the end criteria relaxed after their
+	// first minute, and every 4 s the status line. False stops the run on a
+	// numerical failure. The pipelined GPU loop, with a batch computing
+	// ahead, must not relax (\a mayRelax: a plan is outstanding), and gives
+	// \a statusWaits: a status that needs the energy, which the GPU no longer
+	// holds, is put off and *statusWaits set.
+	auto progress = [&](bool mayRelax = true, bool* statusWaits = nullptr) -> bool
+	{
+		gettimeofday(&currTime,NULL);
+
+		t_diff = CalcDiffTime(currTime,prevTime);
+		if (mayRelax)
+			relaxEndCriteria();
+
+		if (t_diff>4)
+		{
+			if (statusWaits && (Eng_Ext_SSD==NULL) && !exactEndCrit)
+			{
+				*statusWaits = true;
+				return true;
+			}
+			t_run = CalcDiffTime(currTime,startTime);
+			speed = numCells*(currTS-prevTS)/t_diff;
+			status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
+			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
+			if (Eng_Ext_SSD==NULL)
+			{
+				if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
+				{
+					if (!sampleEnergy())
+						return false;
+					if (maxE)
+						change = currE/maxE;
+					traceEndCriteria();
+					if (!validateChange())
+						return false;
+				}
+				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
+			}
+			else
+				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
+			prevTime=currTime;
+			prevTS=currTS;
+
+			PA->FlushNext();
+
+			if (m_DumpStats)
+				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
+			FDTD_Eng->NextInterval(speed);
+		}
+		return true;
+	};
 
 #ifdef WITH_GPU
 	if (gpuEng)
@@ -2318,18 +2401,22 @@ void openEMS::RunFDTD()
 	// OPENEMS_GPU_PIPELINE=0 takes the standard loop, for A/B comparisons.
 	const char* envPipeline = std::getenv("OPENEMS_GPU_PIPELINE");
 	const bool gpuPipelineOff = envPipeline && string(envPipeline) == "0";
-
 	// Use pipelined loop if probe gather is set up and no CPU extensions
-	if (gpuEng && gpuEng->HasPipelinedProcessing() && !gpuPipelineOff)
+	const bool gpuPipelined = gpuEng && gpuEng->HasPipelinedProcessing() && !gpuPipelineOff;
+
+	// How far the GPU computes ahead while the host processes.  The old loop:
+	// by default (auto) up to the next timestep a processing is due at, at
+	// most gpuSpecMaxDepth; OPENEMS_GPU_SPEC_DEPTH=<n> fixes it at n
+	// timesteps.  Auto hides the host's work on a dump behind the GPU's:
+	// 160^3 with 63 whole-volume dumps runs 1.44 s instead of 3.0 s at depth
+	// 1.  With in-batch sampling a batch runs past the processings, and the
+	// two cap its length instead (see the loop).
+	int gpuSpecDepth = 1;
+	bool gpuSpecAuto = true;
+	int gpuSpecMaxDepth = 64;
+	bool gpuSpecMaxGiven = false;
+	if (gpuPipelined)
 	{
-		// How far the GPU computes ahead while the host processes: by default
-		// (auto) up to the next timestep a processing is due at, at most
-		// gpuSpecMaxDepth; OPENEMS_GPU_SPEC_DEPTH=<n> fixes it at n timesteps.
-		// Auto hides the host's work on a dump behind the GPU's: 160^3 with 63
-		// whole-volume dumps runs 1.44 s instead of 3.0 s at depth 1.
-		int gpuSpecDepth = 1;
-		bool gpuSpecAuto = true;
-		int gpuSpecMaxDepth = 64;
 		if (const char* envSpecDepth = std::getenv("OPENEMS_GPU_SPEC_DEPTH"))
 		{
 			string specStr(envSpecDepth);
@@ -2350,12 +2437,123 @@ void openEMS::RunFDTD()
 		{
 			int parsedMaxDepth = atoi(envSpecMaxDepth);
 			if (parsedMaxDepth > 0)
+			{
 				gpuSpecMaxDepth = parsedMaxDepth;
+				gpuSpecMaxGiven = true;
+			}
 			else
 				cerr << "RunFDTD: Warning: invalid OPENEMS_GPU_SPEC_MAX_DEPTH='" << envSpecMaxDepth
 				     << "' (must be >=1). Using default max depth=64." << endl;
 		}
+	}
 
+	if (gpuPipelined && bsOn && gpuEng->BatchSamplingReady())
+	{
+		// ====== Pipelined GPU main loop, with in-batch sampling ======
+		// The GPU runs batch N+1 while the host replays batch N.  N's samples
+		// stay in their half of the GPU's ring, and so do those of its last
+		// timestep (the footprint for the pipelined reading, the energy for
+		// CalcFastEnergyGPU()), since the GPU has moved on by the time the
+		// replay gets there.  N+1 is planned from where N's plan leaves the
+		// processings, and N's replay checks that they get there.  N+1 is not
+		// submitted before N's replay where the host needs the GPU still at
+		// N's last timestep, or no plan may be outstanding:
+		// - a frequency-domain dump the GPU sums is due there: the sum takes a
+		//   timestep when the dump processes it, since the run may stop first;
+		// - the end criterion relaxes after its first minute, or the status
+		//   needs the live energy once it has;
+		// - the benchmark's boundary (it is timed with the GPU idle), NrTS, an
+		//   abort.
+		// A batch runs about half a second (adaptBatchLength()), and at most
+		// what records without waiting for the GPU (MaxSpeculativeBatch()):
+		// OPENEMS_GPU_SPEC_DEPTH=<n> caps it at n timesteps instead,
+		// OPENEMS_GPU_SPEC_MAX_DEPTH=<n> at n as well; a batch holds one
+		// step of the old loop at least.
+		unsigned int specCap = gpuEng->MaxSpeculativeBatch();
+		if (!gpuSpecAuto)
+			specCap = (unsigned int)gpuSpecDepth;
+		else if (gpuSpecMaxGiven)
+			specCap = (unsigned int)gpuSpecMaxDepth;
+		if (!gpuSpecAuto || gpuSpecMaxGiven)
+			cout << "RunFDTD: GPU batches of at most " << specCap << " timesteps" << endl;
+		specCap = std::max(1u, specCap);
+		bsMaxLen = std::min(bsMaxLen, specCap);
+
+		SampledBatch cur, ahead;
+		unsigned int curStart = 0, aheadStart = 0;
+		bool haveAhead = false, statusWaits = false, aborted = false;
+		auto submit = [&](unsigned int startTS, int firstStep, const std::vector<size_t>* positions)
+		{
+			ahead = planBatch(startTS, firstStep, positions);
+			aheadStart = startTS;
+			const unsigned int batchTS = ahead.ends.back() - startTS;
+			if (bench)
+				bench->NoteInterval((int)batchTS);
+			gpuEng->ScheduleBatchSamples(ahead.probeTS, ahead.energyTS);
+			gpuEng->SubmitSampledSpeculative(batchTS, ahead.lastProbe, ahead.lastEnergy);
+			haveAhead = true;
+			++bsStats.batches;
+			bsStats.timesteps += batchTS;
+			bsStats.ends += ahead.ends.size();
+			bsStats.probes += ahead.probeTS.size();
+			bsStats.energies += ahead.energyTS.size();
+		};
+		timeval batchTime;
+		gettimeofday(&batchTime,NULL);
+		currTS = FDTD_Eng->GetNumberOfTimesteps();
+		if ((currTS < NrTS) && (change > endCrit) && !CheckAbortCond())
+			submit(currTS, step, nullptr);
+		while (haveAhead)
+		{
+			cur = std::move(ahead);
+			curStart = aheadStart;
+			haveAhead = false;
+			gpuEng->CommitSampledSpeculative();
+			currTS = cur.ends.back();
+			gettimeofday(&currTime,NULL);
+			const bool relaxDue = exactEndCrit && !m_exactEndCriteria
+			                      && (CalcDiffTime(currTime,startTime) > EXACT_ENDCRIT_TIME);
+			if ((currTS < NrTS) && !statusWaits && !relaxDue && !(bench && (currTS >= bench->Boundary()))
+			    && !gpuEng->DumpDFTDueAt(currTS) && !(aborted = CheckAbortCond()))
+				submit(currTS, bench ? bench->Clamp(cur.nextStep, currTS) : cur.nextStep, &cur.nextPositions);
+			gpuEng->CollectSampledBatch();
+			gpuEng->EnablePipelinedReading(true);
+			replayBatch(cur, step);
+			gpuEng->EnablePipelinedReading(false);
+			if (numericalFailure || bsStopped || (change<=endCrit))
+				break;
+			adaptBatchLength(currTS - curStart, batchTime);
+			bsMaxLen = std::min(bsMaxLen, specCap);
+			gettimeofday(&batchTime,NULL);
+
+			statusWaits = false;
+			if (!progress(!haveAhead, haveAhead ? &statusWaits : nullptr))
+				break;
+			if (haveAhead)
+				continue;
+			// The GPU holds currTS, and nothing is planned beyond it.
+			if (aborted || (currTS >= NrTS))
+				break;
+			if (bench && (currTS >= bench->Boundary()))
+			{
+				// Time a run to its end, not to its last submit.
+				gpuEng->DrainGPU();
+				if (!bench->Advance(currTS))
+					break;
+			}
+			if (CheckAbortCond())
+				break;
+			if (bench)
+				step = bench->Clamp(step, currTS);
+			submit(currTS, step, nullptr);
+		}
+		gpuEng->EnablePipelinedReading(false);
+		// A batch computed past the stop: count it, as the engine ran it.
+		if (haveAhead)
+			gpuEng->CommitSampledSpeculative();
+	}
+	else if (gpuPipelined && !bsOn)
+	{
 		if (!gpuSpecAuto)
 			cout << "RunFDTD: GPU speculative depth set to " << gpuSpecDepth << endl;
 
@@ -2366,8 +2564,11 @@ void openEMS::RunFDTD()
 		FDTD_Eng->IterateTS(step);                   // submit first batch
 		gpuEng->DrainGPU();                           // wait for first batch
 		gpuEng->SnapshotProbeCache();                 // capture probe results
+		// The end criteria at the first batch's end too, as the loop below has
+		// them at every later one, and the standard loop after every batch.
+		const bool primeChecked = checkEndCriteria();
 
-		while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
+		while (primeChecked && (FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
 		{
 			// Every iteration ends with the GPU drained, so the schedule can change here.
 			currTS = FDTD_Eng->GetNumberOfTimesteps();
@@ -2486,50 +2687,6 @@ void openEMS::RunFDTD()
 	// dumps.  On the GPU, IterateTS() is a fire-and-forget submit, and field
 	// dumps gather their cells at the end of that batch.
 
-	// After a batch that ended at currTS: the end criteria relaxed after their
-	// first minute, and every 4 s the status line. False stops the run on a
-	// numerical failure.
-	auto progress = [&]() -> bool
-	{
-		gettimeofday(&currTime,NULL);
-
-		t_diff = CalcDiffTime(currTime,prevTime);
-		relaxEndCriteria();
-
-		if (t_diff>4)
-		{
-			t_run = CalcDiffTime(currTime,startTime);
-			speed = numCells*(currTS-prevTS)/t_diff;
-			status << "[@" <<  FormatTime(t_run) <<  "] Timestep: " << setw(12)  << currTS ;
-			status << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
-			if (Eng_Ext_SSD==NULL)
-			{
-				if (!exactEndCrit) // otherwise already kept current above, every Nyquist period
-				{
-					if (!sampleEnergy())
-						return false;
-					if (maxE)
-						change = currE/maxE;
-					traceEndCriteria();
-					if (!validateChange())
-						return false;
-				}
-				status << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
-			}
-			else
-				status << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
-			prevTime=currTime;
-			prevTS=currTS;
-
-			PA->FlushNext();
-
-			if (m_DumpStats)
-				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
-			FDTD_Eng->NextInterval(speed);
-		}
-		return true;
-	};
-
 	if (bsOn)
 	{
 	// With in-batch sampling: a batch runs on past the timesteps at which
@@ -2541,6 +2698,11 @@ void openEMS::RunFDTD()
 		{
 			if (currTS >= bench->Boundary())
 			{
+#ifdef WITH_GPU
+				// Time a run to its end, not to its last submit.
+				if (gpuEng)
+					gpuEng->DrainGPU();
+#endif
 				if (!bench->Advance(currTS))
 					break;
 			}
