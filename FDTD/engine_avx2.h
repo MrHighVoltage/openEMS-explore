@@ -37,22 +37,22 @@ public:
 	// replay of in-batch sampling reads the sample instead (Engine::BatchRead()).
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
-		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v;}
+		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v;}
 		return m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
 	{
-		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(0, n, pos[0], pos[1], pos[2], v)) return v;}
+		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(0, n, pos[0], pos[1], pos[2], v)) return v;}
 		return m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
-		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(1, n, x, y, z, v)) return v;}
+		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(1, n, x, y, z, v)) return v;}
 		return m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
 	{
-		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(1, n, pos[0], pos[1], pos[2], v)) return v;}
+		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(1, n, pos[0], pos[1], pos[2], v)) return v;}
 		return m_curr[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
 	}
 
@@ -79,6 +79,10 @@ protected:
 
 	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
 	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
+
+	//! Engine::SampleFootprint() from the cells' float offsets into m_volt/m_curr, computed once.
+	virtual void SampleFootprint(size_t i);
+	std::vector<uint64_t> m_bsOffsets; //!< per footprint cell: field<<63 | float offset
 
 	//! The same updates for the y-rows [yStart,yStop) of the single x-line \a x.
 	/*!

@@ -52,6 +52,8 @@ Engine::Engine(const Operator* op)
 	m_bsReplaySlot = -1;
 	m_bsReplayEnergySlot = -1;
 	m_bsBatchStart = 0;
+	m_bsHashShift = 63;
+	m_bsReplayValues = nullptr;
 	m_traceFieldEnabled = false;
 	m_traceFieldCell[0] = m_traceFieldCell[1] = m_traceFieldCell[2] = 0;
 	if (const char* env = std::getenv("OPENEMS_CPU_TRACE_CELL"))
@@ -359,10 +361,94 @@ void Engine::StopFootprintRecording()
 	m_bsFootprint.swap(m_bsRecorded);
 	m_bsRecorded.clear();
 	m_bsRecorded.shrink_to_fit();
+
+	// A replayed read finds its cell in O(1): a probe does not read its
+	// cells in key order (an interpolation reads the neighbours too).
+	// A component whose cells fill at least 1/16 of their bounding box gets a
+	// dense index of it, the others go into a hash table.
+	m_bsHashKeys.clear();
+	m_bsHashSlots.clear();
+	for (FootprintBox& b : m_bsBoxes)
+		b = FootprintBox();
+	if (m_bsFootprint.empty())
+		return;
+	for (size_t first = 0; first < m_bsFootprint.size();)
+	{
+		unsigned int field, n, p[3];
+		DecodeFootprintKey(m_bsFootprint[first], field, n, p[0], p[1], p[2]);
+		unsigned int lo[3] = {p[0], p[1], p[2]}, hi[3] = {p[0], p[1], p[2]};
+		size_t last = first;
+		for (; last < m_bsFootprint.size(); ++last)
+		{
+			unsigned int f, m, q[3];
+			DecodeFootprintKey(m_bsFootprint[last], f, m, q[0], q[1], q[2]);
+			if ((f != field) || (m != n))
+				break;
+			for (int d = 0; d < 3; ++d)
+			{
+				lo[d] = std::min(lo[d], q[d]);
+				hi[d] = std::max(hi[d], q[d]);
+			}
+		}
+		const uint64_t volume = (uint64_t)(hi[0]-lo[0]+1)*(hi[1]-lo[1]+1)*(hi[2]-lo[2]+1);
+		if (volume <= std::max<uint64_t>(4096, 16*(uint64_t)(last-first)))
+		{
+			FootprintBox& b = m_bsBoxes[field*3+n];
+			for (int d = 0; d < 3; ++d)
+			{
+				b.lo[d] = lo[d];
+				b.len[d] = hi[d]-lo[d]+1;
+			}
+			b.slot.assign(volume, -1);
+			for (size_t c = first; c < last; ++c)
+			{
+				unsigned int f, m, q[3];
+				DecodeFootprintKey(m_bsFootprint[c], f, m, q[0], q[1], q[2]);
+				b.slot[((size_t)(q[0]-lo[0])*b.len[1] + (q[1]-lo[1]))*b.len[2] + (q[2]-lo[2])] = (int32_t)c;
+			}
+		}
+		first = last;
+	}
+	size_t hashed = 0;
+	for (size_t c = 0; c < m_bsFootprint.size(); ++c)
+		hashed += m_bsBoxes[((m_bsFootprint[c]>>62)&1)*3 + ((m_bsFootprint[c]>>60)&3)].slot.empty();
+	if (hashed == 0)
+		return;
+	unsigned int bits = 4;
+	while ((1ull<<bits) < 2*hashed)
+		++bits;
+	m_bsHashShift = 64 - bits;
+	m_bsHashKeys.assign(1ull<<bits, ~0ull);
+	m_bsHashSlots.assign(1ull<<bits, -1);
+	for (size_t c = 0; c < m_bsFootprint.size(); ++c)
+	{
+		if (!m_bsBoxes[((m_bsFootprint[c]>>62)&1)*3 + ((m_bsFootprint[c]>>60)&3)].slot.empty())
+			continue;
+		size_t h = (size_t)((m_bsFootprint[c]*0x9E3779B97F4A7C15ull) >> m_bsHashShift);
+		while (m_bsHashKeys[h] != ~0ull)
+			h = (h+1) & (m_bsHashKeys.size()-1);
+		m_bsHashKeys[h] = m_bsFootprint[c];
+		m_bsHashSlots[h] = (int64_t)c;
+	}
 }
 
 bool Engine::BatchRead(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const
 {
+	if (m_bsReplayValues)
+	{
+		const int64_t c = FootprintSlot(field, n, x, y, z);
+		if (c >= 0)
+		{
+			value = m_bsReplayValues[c];
+			return true;
+		}
+	}
+	return BatchReadSlow(field, n, x, y, z, value);
+}
+
+bool Engine::BatchReadSlow(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& value) const
+{
+	(void)value;
 	const uint64_t key = FootprintKey(field, n, x, y, z);
 	if (m_bsMode == BS_RECORD)
 	{
@@ -378,16 +464,8 @@ bool Engine::BatchRead(unsigned int field, unsigned int n, unsigned int x, unsig
 		err << "in-batch sampling: replaying timestep " << m_bsReplayTS << " (engine at " << numTS
 		    << "), which has no probe sample, a processing reads ";
 	else
-	{
-		const std::vector<uint64_t>::const_iterator it = std::lower_bound(m_bsFootprint.begin(), m_bsFootprint.end(), key);
-		if ((it != m_bsFootprint.end()) && (*it == key))
-		{
-			value = m_bsValues[(size_t)m_bsReplaySlot*m_bsFootprint.size() + (size_t)(it - m_bsFootprint.begin())];
-			return true;
-		}
 		err << "in-batch sampling: replaying timestep " << m_bsReplayTS << " (engine at " << numTS
 		    << "), a processing reads outside the probe footprint: ";
-	}
 	err << (field ? "current" : "voltage") << " " << n << " at (" << x << "," << y << "," << z << ")";
 	throw std::logic_error(err.str());
 }
@@ -467,12 +545,14 @@ void Engine::BeginBatchReplay(unsigned int ts)
 	m_bsReplaySlot = ((p != m_bsProbeTS.end()) && (*p == ts)) ? (int)(p - m_bsProbeTS.begin()) : -1;
 	const std::vector<unsigned int>::const_iterator q = std::lower_bound(m_bsEnergyTS.begin(), m_bsEnergyTS.end(), ts);
 	m_bsReplayEnergySlot = ((q != m_bsEnergyTS.end()) && (*q == ts)) ? (int)(q - m_bsEnergyTS.begin()) : -1;
+	m_bsReplayValues = (m_bsReplaySlot >= 0) ? BatchProbeSample((size_t)m_bsReplaySlot) : nullptr;
 	m_bsReplayTS = ts;
 	m_bsMode = BS_REPLAY;
 }
 
 void Engine::EndBatchReplay()
 {
+	m_bsReplayValues = nullptr;
 	if (m_bsMode == BS_REPLAY)
 		m_bsMode = BS_OFF;
 	m_bsReplaySlot = -1;
