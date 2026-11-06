@@ -142,6 +142,11 @@ public:
 	virtual bool SupportsBatchSampling() const {return false;}
 	//! True if IterateSampledTS() samples inside blocks, so that its depth is not capped by the gaps between samples.
 	virtual bool SamplesInsideBlocks() const {return false;}
+	//! The fewest timesteps a batch should hold, 0 for no preference. The main
+	//! loop keeps its batch length at least this (a batch still ends at a dump,
+	//! the ring's capacity, NrTS or a benchmark boundary). An engine that blocks
+	//! inside a batch asks for a few blocks.
+	virtual unsigned int GetPreferredBatchLength() const {return 0;}
 
 	//! From now on GetVolt()/GetCurr() record the cells they read (and return the live values).
 	void StartFootprintRecording();

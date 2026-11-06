@@ -2081,8 +2081,10 @@ void openEMS::RunFDTD()
 	unsigned int bsRing = 0;     // the most sampled timesteps of one batch
 	// The most timesteps of one batch: at first the old loop's cap, the
 	// Nyquist interval, then about half a second's worth (adaptBatchLength()).
+	// Never fewer than the engine asks for: a few of its blocks, where it
+	// samples inside them (Engine::GetPreferredBatchLength()).
 	const unsigned int bsMinLen = std::max(1u, PA->GetMaxInterval());
-	unsigned int bsMaxLen = bsMinLen;
+	unsigned int bsMaxLen = std::max(bsMinLen, FDTD_Eng->GetPreferredBatchLength());
 	unsigned int bsDoneTS = 0;   // the timestep last replayed: the one the run has got to
 	bool bsStopped = false;      // the run stopped in the replay of a timestep before the batch's last
 	struct {unsigned long long batches = 0, timesteps = 0, ends = 0, probes = 0, energies = 0, offPlan = 0;} bsStats; // -v
@@ -2217,8 +2219,10 @@ void openEMS::RunFDTD()
 	};
 	// After a batch of batchTS timesteps begun at batchTime: the next may run
 	// about half a second, at most twice as long as this one, never shorter
-	// than the old loop's cap. That keeps the status line and the abort
-	// checks at the batch ends as frequent as they were.
+	// than the old loop's cap or the engine's preferred length. That keeps the
+	// status line and the abort checks at the batch ends as frequent as they
+	// were, and a blocked schedule as deep as it is set up (a huge grid may
+	// take less than half a second for one block).
 	auto adaptBatchLength = [&](unsigned int batchTS, const timeval& batchTime)
 	{
 		timeval now;
@@ -2227,7 +2231,7 @@ void openEMS::RunFDTD()
 		double len = (seconds > 0) ? 0.5*batchTS/seconds : 2.0*bsMaxLen;
 		len = std::min(len, 2.0*bsMaxLen);
 		len = std::min(len, (double)(1u<<30));
-		bsMaxLen = std::max(bsMinLen, (unsigned int)len);
+		bsMaxLen = std::max({bsMinLen, FDTD_Eng->GetPreferredBatchLength(), (unsigned int)len});
 	};
 
 	if (m_DumpStats)
