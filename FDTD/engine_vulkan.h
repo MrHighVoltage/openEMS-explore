@@ -98,8 +98,57 @@ public:
 	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const;
 	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const;
 
+	virtual long long GetBlockedTimesteps() const {return m_blockedTS;}
+
 	//! GPU-side energy estimation — avoids downloading entire field arrays.
+	//! The sum of |V|^2 and |I|^2 by x-plane (reduce_energy_planes.comp), the
+	//! planes' partial sums added in plane order on the host, so that the
+	//! blocked schedule, which reaches a timestep slab by slab, can sample
+	//! the same bits (in-batch sampling).  While a batch computes ahead
+	//! (SubmitSampledSpeculative()), the energy that batch's predecessor
+	//! sampled at its last timestep.
 	double CalcFastEnergyGPU() const;
+
+	// --- In-batch sampling (plans/BATCH_SAMPLING.md §4.5) -------------------
+	// IterateSampledTS() records a batch with a gather of the probe footprint
+	// and a sum of the energy at each sample timestep, into a slot of a
+	// host-visible ring: at the top of the iteration in the flat sweep, at the
+	// top of each slab's step in the blocked one (the E ranges of a timestep
+	// partition the grid, and an x-line holds both fields of the end of the
+	// timestep before until its voltage update).  Without SetupBatchSampling()
+	// the engine falls back to Engine's generic sampler.
+	virtual bool SupportsBatchSampling() const {return true;}
+	virtual bool SamplesInsideBlocks() const {return m_bsGpuOn;}
+	virtual void ScheduleBatchSamples(const std::vector<unsigned int>& probeTS, const std::vector<unsigned int>& energyTS);
+	virtual bool IterateSampledTS(unsigned int iterTS);
+	//! The sampled timesteps a batch may hold (the ring) for a footprint of
+	//! \a cells cells, with energy samples or without, within the byte budget
+	//! of the two host-visible rings (OPENEMS_GPU_BATCH_SAMPLING_MB, default 64).
+	unsigned int BatchSamplingRing(size_t cells, bool energy) const;
+	//! After the footprint is recorded: the gather and the rings for \a ring
+	//! sampled timesteps per batch.  False if they cannot be made; the engine
+	//! then samples with Engine's generic implementation.
+	bool SetupBatchSampling(unsigned int ring, bool energy);
+	//! Whether SetupBatchSampling() succeeded.
+	bool BatchSamplingReady() const {return m_bsGpuOn;}
+	//! The pipelined loop: record and submit the batch ScheduleBatchSamples()
+	//! set up, without waiting and without advancing the public timestep, and
+	//! sample its last timestep too: the footprint (\a endProbe; the pipelined
+	//! reading serves it) and the energy (\a endEnergy; CalcFastEnergyGPU()
+	//! returns it while the next batch computes).
+	void SubmitSampledSpeculative(unsigned int nTS, bool endProbe, bool endEnergy);
+	//! Wait for the batch submitted ahead and advance the public timestep to its end.
+	void CommitSampledSpeculative();
+	//! Hand the samples of the batch committed last to the replay.  Separate
+	//! from the commit, so that the next batch can be submitted in between.
+	void CollectSampledBatch();
+	//! The longest batch the pipelined loop submits ahead: one that records
+	//! without waiting for the GPU (the command ring, or one steady-state period).
+	unsigned int MaxSpeculativeBatch() const;
+	//! Whether a frequency-domain dump the GPU sums is due at \a ts.  A sampled
+	//! batch does not add that sample (the run may stop before ts); the dump
+	//! adds it when processed, which needs the GPU to still hold ts.
+	bool DumpDFTDueAt(unsigned int ts) const;
 
 	// --- Pipelined processing support -------------------------------------
 	//! Begin recording cell accesses. Call before PA->Process().
@@ -128,13 +177,22 @@ public:
 	void DrainGPU() const;
 
 	// --- Field access (lazy sync from GPU) --------------------------------
-	// Probes read the probe cache in the pipelined loop.  Any other read
+	// In a replay of an earlier timestep, the sample (in-batch sampling).
+	// Probes read the probe cache in the pipelined loop: with in-batch
+	// sampling the footprint sampled at the end of the batch.  Any other read
 	// brings both fields over by DMA, once per batch.
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		if (m_bsMode != BS_OFF) { FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v; }
 		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
-		if (m_recordingProbeAccess)
+		if (m_recordingProbeAccess && (m_bsMode == BS_OFF))
 			m_recordedCells.push_back((uint64_t)0 << 48 | linIdx);
+		else if (m_pipelinedReading && m_bsGpuOn)
+		{
+			FDTD_FLOAT v;
+			if (ReadEndSample(0, n, x, y, z, v))
+				return v;
+		}
 		else if (m_pipelinedReading)
 		{
 			const uint64_t key = (uint64_t)0 << 48 | linIdx;
@@ -155,9 +213,16 @@ public:
 	{ return GetVolt(n, pos[0], pos[1], pos[2]); }
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		if (m_bsMode != BS_OFF) { FDTD_FLOAT v; if (BatchRead(1, n, x, y, z, v)) return v; }
 		uint64_t linIdx = (uint64_t)n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
-		if (m_recordingProbeAccess)
+		if (m_recordingProbeAccess && (m_bsMode == BS_OFF))
 			m_recordedCells.push_back((uint64_t)1 << 48 | linIdx);
+		else if (m_pipelinedReading && m_bsGpuOn)
+		{
+			FDTD_FLOAT v;
+			if (ReadEndSample(1, n, x, y, z, v))
+				return v;
+		}
 		else if (m_pipelinedReading)
 		{
 			const uint64_t key = (uint64_t)1 << 48 | linIdx;
@@ -800,18 +865,77 @@ private:
 	unsigned int m_speculativeTS = 0;   //!< Timesteps in speculative batch
 
 	// ---- GPU energy reduction -----------------------------------------
-	static constexpr uint32_t ENERGY_NUM_WG = 256; //!< workgroups for energy reduction
-	GpuBuf       m_energyPartialBuf;   //!< [2 * ENERGY_NUM_WG] float partials (E, H)
+	// reduce_energy_planes.comp: one (E, H) pair of floats per x-plane and
+	// chunk of STEADY_ENERGY_CHUNK cells, which the host adds in plane order
+	// (SumEnergyPartials()).  The same pipeline sums the live fields
+	// (CalcFastEnergyGPU()) and the samples of a batch, so both give the
+	// same bits.
+	GpuBuf       m_energyPartialBuf;   //!< m_energyFloats float partials of the live fields
 	float*       m_energyMapped = nullptr; //!< m_energyPartialBuf, persistently mapped
+	uint32_t     m_energyChunks = 0;   //!< workgroups per x-plane
+	uint32_t     m_energyFloats = 0;   //!< 2 * NX * m_energyChunks: one energy's partials
 	VkDescriptorSetLayout m_energyDescLayout = VK_NULL_HANDLE;
 	VkPipelineLayout      m_energyPipeLayout = VK_NULL_HANDLE;
 	VkPipeline            m_energyPipeline   = VK_NULL_HANDLE;
 	VkDescriptorPool      m_energyDescPool   = VK_NULL_HANDLE;
 	VkDescriptorSet       m_energyDescSet    = VK_NULL_HANDLE;
-	//! Push constant struct for energy reduction shader.
-	struct EnergyPC { uint32_t N; uint32_t numWG; };
+	VkDescriptorSet       m_bsEnergyDescSet  = VK_NULL_HANDLE; //!< the same into the in-batch sampling ring
 	void SetupGPU_EnergyReduction();     //!< Create energy reduction resources
 	void CleanupGPU_EnergyReduction();   //!< Destroy energy reduction resources
+	//! Record the energy partials of the x-planes [xLo,xHi) into \a set's buffer from float \a slotBase on.
+	void RecordEnergyPlanes(VkCommandBuffer cmd, VkDescriptorSet set, uint32_t xLo, uint32_t xHi, uint32_t slotBase) const;
+	//! The energy estimate from one energy's partials, the planes in order.
+	double SumEnergyPartials(const float* partials) const;
+
+	// ---- In-batch sampling (plans/BATCH_SAMPLING.md §4.5) ----------------
+	bool     m_bsGpuOn = false;        //!< SetupBatchSampling() done: batches sample on the GPU
+	bool     m_bsGpuEnergy = false;    //!< the energy ring exists
+	uint32_t m_bsCells = 0;            //!< footprint cells
+	uint32_t m_bsRing = 0;             //!< sampled timesteps per batch; a ring half has one slot more, for the batch's end
+	//! [NX+1]: the gather entries of the x-lines [a,b) are [m_bsXStart[a], m_bsXStart[b]).
+	std::vector<uint32_t> m_bsXStart;
+	GpuBuf   m_bsEntryBuf;             //!< per entry (sorted by x): field index, footprint position | curr<<31
+	GpuBuf   m_bsProbeRing;            //!< [2][m_bsRing+1][m_bsCells] floats, host-visible
+	float*   m_bsProbeRingMapped = nullptr;
+	GpuBuf   m_bsEnergyRing;           //!< [2][m_bsRing+1][m_energyFloats] floats, host-visible
+	float*   m_bsEnergyRingMapped = nullptr;
+	VkDescriptorSetLayout m_bsDescLayout = VK_NULL_HANDLE;
+	VkPipelineLayout      m_bsPipeLayout = VK_NULL_HANDLE;
+	VkPipeline            m_bsPipeline   = VK_NULL_HANDLE;
+	VkDescriptorPool      m_bsDescPool   = VK_NULL_HANDLE;
+	VkDescriptorSet       m_bsDescSet    = VK_NULL_HANDLE;
+	struct BatchSamplePC { uint32_t first, end, outBase; };
+	//! A sample timestep of the batch being recorded and its ring slots (-1: none).
+	struct BsSample { uint32_t ts; int32_t probeSlot, energySlot; };
+	std::vector<BsSample> m_bsRec;     //!< the batch being recorded, by timestep
+	bool     m_bsRecording = false;    //!< IterateTS() records a sampled batch
+	uint32_t m_bsRecHalf = 0;          //!< its ring half
+	uint32_t m_bsRecEnd = 0;           //!< its last timestep
+	mutable bool m_bsCmdWrote = false; //!< the command buffer being recorded writes the rings
+	//! One sampled batch: its schedule, where its samples go, and the submit that ends it.
+	struct BsBatch
+	{
+		std::vector<unsigned int> probeTS, energyTS;
+		unsigned int start = 0, len = 0;
+		uint32_t half = 0;
+		bool endProbe = false, endEnergy = false;
+	};
+	BsBatch  m_bsSched;                //!< ScheduleBatchSamples(): the next batch
+	std::deque<BsBatch> m_bsSubmitted; //!< submitted ahead, not committed
+	BsBatch  m_bsCommitted;            //!< committed, its samples not yet collected
+	bool     m_bsHaveCommitted = false;
+	uint32_t m_bsNextHalf = 0;
+	unsigned int m_bsEndProbeTS = UINT_MAX;  //!< m_probeCacheCPU holds the footprint of this timestep
+	unsigned int m_bsEndEnergyTS = UINT_MAX; //!< m_bsEndEnergy is the energy of this timestep
+	double   m_bsEndEnergy = 0;
+	long long m_blockedTS = 0;         //!< timesteps run in blocks of depth >= 2
+	//! Record the samples of timestep \a ts the batch being recorded takes, for the x-lines [xLo,xHi).
+	void RecordBatchSample(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo, uint32_t xHi) const;
+	//! Record and submit the scheduled batch of \a nTS timesteps with its samples.
+	void SubmitSampled(unsigned int nTS, bool endProbe, bool endEnergy);
+	//! The pipelined reading of a cell at the batch's end; false if it is not in the footprint.
+	bool ReadEndSample(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT& v) const;
+	void CleanupBatchSampling();
 
 	// ---- Optional raw-field finite-value scan -------------------------
 	GpuBuf       m_validateBadBuf;       //!< [V0,V1,V2,C0,C1,C2] first bad cell indices

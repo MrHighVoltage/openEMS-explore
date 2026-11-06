@@ -745,7 +745,7 @@ void Engine_Vulkan::Init()
 		cout << "  GPU steady-state sampling active (" << m_steadyProbeCount << " probes)" << endl;
 	if (!m_gpuLocalABC.empty())
 		cout << "  GPU local absorbing sheets active (" << m_gpuLocalABC.size() << " sheet(s))" << endl;
-	cout << "  GPU energy reduction active (" << ENERGY_NUM_WG << " workgroups)" << endl;
+	cout << "  GPU energy reduction active (" << numLines[0] << " planes x " << m_energyChunks << " workgroups)" << endl;
 
 	if (startupTrace)
 	{
@@ -3606,6 +3606,24 @@ void Engine_Vulkan::SetupProbeCache(ProcessingArray* /*PA*/)
 	// from the cell accesses captured during the initial PA->Process().
 	m_recordingProbeAccess = false;
 
+	// With in-batch sampling the probe cache is the footprint the core
+	// recorded, gathered at the end of a batch by the same dispatch that
+	// samples it inside (SetupBatchSampling()), in footprint order.
+	if (m_bsGpuOn)
+	{
+		m_recordedCells.clear();
+		m_recordedCells.shrink_to_fit();
+		m_probeCacheCount = 0;
+		m_probeCacheKeys.clear();
+		m_probeCacheCPU.assign(m_bsCells, 0.0f);
+		m_probeCacheHits = 0;
+		m_probeCacheMisses = 0;
+		m_hasGPU_Probes = (m_bsCells > 0);
+		if (m_hasGPU_Probes)
+			cerr << "[Vulkan] Probe cache: the " << m_bsCells << " cells of the in-batch sampling footprint." << endl;
+		return;
+	}
+
 	// Probe resources are used even when there are no other GPU extensions.
 	// In that case SetupGPUExtensions() may have skipped creating layouts.
 	if (m_probeDescLayout == VK_NULL_HANDLE)
@@ -3762,6 +3780,449 @@ void Engine_Vulkan::CommitSpeculative()
 	if (m_speculativeTS == 0) return;
 	numTS += m_speculativeTS;
 	m_speculativeTS = 0;
+}
+
+// ===========================================================================
+// In-batch sampling (plans/BATCH_SAMPLING.md §4.5)
+// ===========================================================================
+//
+// A sampled batch records, at each of its sample timesteps t, a gather of the
+// probe footprint and the energy partials into a slot of a host-visible ring.
+// The sample of t is the state between the last write of timestep t-1 and
+// the first write of t: at the top of iteration t in the flat sweep, before
+// its pre-voltage passes.  In the blocked schedule an x-line holds that state
+// until the slab whose E range contains it starts step t: its voltages are
+// those of t-1 until the voltage update of t, and its currents, which the
+// voltage update of t reads, are final for t-1 and stay so until the current
+// update of t, which comes after.  The pre-voltage passes of a step write
+// only their own state (Mur, RLC, dispersive, local absorbing sheets), apart
+// from the unfused UPML pass, which comes after the sample.  The E ranges of
+// one timestep partition [0, NX), so every x-line, and every footprint cell,
+// is sampled once, and each plane's energy partials are those of the flat
+// sum.  The ring has two halves, so that the pipelined loop can submit the
+// next batch before the host has read this one's samples.
+
+unsigned int Engine_Vulkan::BatchSamplingRing(size_t cells, bool energy) const
+{
+	double mb = 64;
+	if (const char* env = std::getenv("OPENEMS_GPU_BATCH_SAMPLING_MB"))
+	{
+		const double v = std::atof(env);
+		if (v > 0)
+			mb = v;
+		else
+			cerr << "Engine_Vulkan: invalid OPENEMS_GPU_BATCH_SAMPLING_MB='" << env << "', using 64" << endl;
+	}
+	// Both halves, and in each one slot more for the batch's last timestep.
+	const double slotBytes = 2.0 * sizeof(float) * ((double)cells + (energy ? (double)m_energyFloats : 0.0));
+	if (slotBytes <= 0)
+		return 1024;
+	const double slots = mb * (1 << 20) / slotBytes - 1;
+	return (unsigned int)std::max(1.0, std::min(1024.0, std::floor(slots)));
+}
+
+bool Engine_Vulkan::SetupBatchSampling(unsigned int ring, bool energy)
+{
+	CleanupBatchSampling();
+	if (ring == 0)
+		return false;
+	const size_t cells = m_bsFootprint.size();
+	const uint64_t probeFloats  = 2ull * (ring + 1ull) * cells;
+	const uint64_t energyFloats = energy ? 2ull * (ring + 1ull) * m_energyFloats : 0;
+	if ((cells > 0x7FFFFFFFu) || (probeFloats > UINT32_MAX) || (energyFloats > UINT32_MAX))
+	{
+		cerr << "Engine_Vulkan: in-batch sampling: a ring of " << ring << " timesteps does not fit 32-bit indexing; "
+		     << "sampling on the host" << endl;
+		return false;
+	}
+
+	// The gather entries, sorted by x, and the prefix table of x.
+	struct Entry { uint32_t idx, pos, x; };
+	std::vector<Entry> entries(cells);
+	for (size_t c = 0; c < cells; ++c)
+	{
+		unsigned int field, n, x, y, z;
+		DecodeFootprintKey(m_bsFootprint[c], field, n, x, y, z);
+		if ((n > 2) || (x >= numLines[0]) || (y >= numLines[1]) || (z >= numLines[2]))
+			throw std::logic_error("in-batch sampling: a footprint cell outside the grid");
+		entries[c].idx = n * m_fieldN + x * m_strideYZ + y * numLines[2] + z;
+		entries[c].pos = (uint32_t)c | (field ? 0x80000000u : 0u);
+		entries[c].x   = x;
+	}
+	std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {return a.x < b.x;});
+	m_bsXStart.assign(numLines[0] + 1, 0);
+	{
+		size_t e = 0;
+		for (uint32_t x = 0; x <= numLines[0]; ++x)
+		{
+			while ((e < entries.size()) && (entries[e].x < x))
+				++e;
+			m_bsXStart[x] = (uint32_t)e;
+		}
+	}
+
+	const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	// The host reads the rings once per batch: a cached type keeps that an
+	// ordinary read, and keeps them out of a small BAR.
+	auto makeRing = [&](GpuBuf& buf, float*& mapped, uint64_t floats) -> bool
+	{
+		if (floats == 0)
+			return true;
+		const VkDeviceSize bytes = floats * sizeof(float);
+		if (!TryCreateBufferWithMemory(bytes, storage, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, buf.buffer, buf.memory) &&
+		    !TryCreateBufferWithMemory(bytes, storage, host, buf.buffer, buf.memory))
+			return false;
+		VK_CHECK(vkMapMemory(m_device, buf.memory, 0, bytes, 0, (void**)&mapped));
+		std::memset(mapped, 0, bytes);
+		return true;
+	};
+	if (!makeRing(m_bsProbeRing, m_bsProbeRingMapped, probeFloats) ||
+	    !makeRing(m_bsEnergyRing, m_bsEnergyRingMapped, energyFloats))
+	{
+		cerr << "Engine_Vulkan: in-batch sampling: no host-visible memory for a ring of " << ring
+		     << " timesteps; sampling on the host" << endl;
+		CleanupBatchSampling();
+		return false;
+	}
+
+	if (cells > 0)
+	{
+		std::vector<uint32_t> packed(2 * cells);
+		for (size_t c = 0; c < cells; ++c)
+		{
+			packed[2 * c]     = entries[c].idx;
+			packed[2 * c + 1] = entries[c].pos;
+		}
+		const VkDeviceSize entryBytes = packed.size() * sizeof(uint32_t);
+		CreateGpuBuf(m_bsEntryBuf, entryBytes, storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		UploadGpuBuf(m_bsEntryBuf, packed.data(), entryBytes);
+
+		VkDescriptorSetLayoutBinding bindings[4];
+		for (uint32_t i = 0; i < 4; ++i)
+			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+		VkDescriptorSetLayoutCreateInfo dli{};
+		dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		dli.bindingCount = 4;
+		dli.pBindings = bindings;
+		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &dli, nullptr, &m_bsDescLayout));
+		VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BatchSamplePC)};
+		VkPipelineLayoutCreateInfo pli{};
+		pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pli.setLayoutCount = 1;
+		pli.pSetLayouts = &m_bsDescLayout;
+		pli.pushConstantRangeCount = 1;
+		pli.pPushConstantRanges = &pcRange;
+		VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_bsPipeLayout));
+		VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+		VkDescriptorPoolCreateInfo dpi{};
+		dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+		dpi.maxSets = 1;
+		dpi.poolSizeCount = 1;
+		dpi.pPoolSizes = &poolSize;
+		VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_bsDescPool));
+		VkDescriptorSetAllocateInfo ai{};
+		ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		ai.descriptorPool = m_bsDescPool;
+		ai.descriptorSetCount = 1;
+		ai.pSetLayouts = &m_bsDescLayout;
+		VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_bsDescSet));
+		VkBuffer bufs[4] = {m_voltBuf, m_currBuf, m_bsEntryBuf.buffer, m_bsProbeRing.buffer};
+		VkDeviceSize sizes[4] = {m_fieldBufSize, m_fieldBufSize, entryBytes, probeFloats * sizeof(float)};
+		WriteDescriptorBuffers(m_device, m_bsDescSet, bufs, sizes, 4);
+
+		VkShaderModule mod = CreateShaderModule(gpu_spirv::batch_sample_data, gpu_spirv::batch_sample_size);
+		VkPipelineShaderStageCreateInfo stage{};
+		stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stage.module = mod;
+		stage.pName = "main";
+		VkComputePipelineCreateInfo ci{};
+		ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		ci.stage = stage;
+		ci.layout = m_bsPipeLayout;
+		VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_bsPipeline));
+		vkDestroyShaderModule(m_device, mod, nullptr);
+	}
+
+	if (energy)
+	{
+		// The energy partials into the ring, by the live sum's pipeline.
+		VkDescriptorSetAllocateInfo ai{};
+		ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		ai.descriptorPool = m_energyDescPool;
+		ai.descriptorSetCount = 1;
+		ai.pSetLayouts = &m_energyDescLayout;
+		VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_bsEnergyDescSet));
+		VkBuffer bufs[3] = {m_voltBuf, m_currBuf, m_bsEnergyRing.buffer};
+		VkDeviceSize sizes[3] = {m_fieldBufSize, m_fieldBufSize, energyFloats * sizeof(float)};
+		WriteDescriptorBuffers(m_device, m_bsEnergyDescSet, bufs, sizes, 3);
+	}
+
+	m_bsCells = (uint32_t)cells;
+	m_bsRing = ring;
+	m_bsGpuEnergy = energy;
+	m_bsGpuOn = true;
+	if (g_settings.GetVerboseLevel() > 0)
+		cout << "Engine_Vulkan: in-batch sampling: " << cells << " footprint cells"
+		     << (energy ? " and the energy" : "") << ", 2 x " << ring + 1 << " ring slots, "
+		     << std::fixed << std::setprecision(1)
+		     << (double)(probeFloats + energyFloats) * sizeof(float) / (1 << 20) << " MB host-visible" << endl;
+	return true;
+}
+
+void Engine_Vulkan::CleanupBatchSampling()
+{
+	if (m_device == VK_NULL_HANDLE)
+		return;
+	if (m_bsProbeRingMapped)
+		vkUnmapMemory(m_device, m_bsProbeRing.memory);
+	if (m_bsEnergyRingMapped)
+		vkUnmapMemory(m_device, m_bsEnergyRing.memory);
+	m_bsProbeRingMapped = m_bsEnergyRingMapped = nullptr;
+	DestroyGpuBuf(m_bsProbeRing);
+	DestroyGpuBuf(m_bsEnergyRing);
+	DestroyGpuBuf(m_bsEntryBuf);
+	if (m_bsPipeline)   { vkDestroyPipeline(m_device, m_bsPipeline, nullptr); m_bsPipeline = VK_NULL_HANDLE; }
+	if (m_bsPipeLayout) { vkDestroyPipelineLayout(m_device, m_bsPipeLayout, nullptr); m_bsPipeLayout = VK_NULL_HANDLE; }
+	if (m_bsDescLayout) { vkDestroyDescriptorSetLayout(m_device, m_bsDescLayout, nullptr); m_bsDescLayout = VK_NULL_HANDLE; }
+	if (m_bsDescPool)   { vkDestroyDescriptorPool(m_device, m_bsDescPool, nullptr); m_bsDescPool = VK_NULL_HANDLE; }
+	m_bsDescSet = VK_NULL_HANDLE;
+	// The energy pool frees its sets with it (CleanupGPU_EnergyReduction()).
+	m_bsEnergyDescSet = VK_NULL_HANDLE;
+	m_bsGpuOn = false;
+	m_bsGpuEnergy = false;
+	m_bsCells = 0;
+	m_bsRing = 0;
+}
+
+unsigned int Engine_Vulkan::MaxSpeculativeBatch() const
+{
+	// A batch of more chunks than the command ring has waits for its own
+	// first chunks while recording; with steady-state detection a batch of
+	// more than one period waits for its checks (ScheduleSteadyStateChecks()).
+	if (m_steadyEnergyPipeline && m_steadyPeriod > 0)
+		return m_steadyPeriod;
+	return CMD_RING_SIZE * m_maxTSPerSubmit;
+}
+
+bool Engine_Vulkan::DumpDFTDueAt(unsigned int ts) const
+{
+	for (const DumpReg& d : m_dumps)
+		if (d.dft && d.due(ts))
+			return true;
+	return false;
+}
+
+void Engine_Vulkan::ScheduleBatchSamples(const std::vector<unsigned int>& probeTS, const std::vector<unsigned int>& energyTS)
+{
+	if (!m_bsGpuOn)
+	{
+		Engine::ScheduleBatchSamples(probeTS, energyTS);
+		return;
+	}
+	// The samples of the batch before stay where the replay reads them.
+	if (m_bsMode != BS_OFF)
+		throw std::logic_error("in-batch sampling: a batch scheduled during a replay or the footprint recording");
+	if ((probeTS.size() > m_bsRing) || (energyTS.size() > m_bsRing))
+		throw std::logic_error("in-batch sampling: a batch scheduled with more samples than the GPU ring holds");
+	if (!energyTS.empty() && !m_bsGpuEnergy)
+		throw std::logic_error("in-batch sampling: an energy sample scheduled, but the GPU ring has no energy part");
+	m_bsSched.probeTS = probeTS;
+	m_bsSched.energyTS = energyTS;
+}
+
+void Engine_Vulkan::RecordBatchSample(VkCommandBuffer cmd, uint32_t ts, uint32_t xLo, uint32_t xHi) const
+{
+	if (!m_bsRecording)
+		return;
+	xHi = std::min(xHi, numLines[0]);
+	if (xHi <= xLo)
+		return;
+	const auto it = std::lower_bound(m_bsRec.begin(), m_bsRec.end(), ts,
+	                                 [](const BsSample& s, uint32_t t) {return s.ts < t;});
+	if ((it == m_bsRec.end()) || (it->ts != ts))
+		return;
+	const uint32_t slotBase = m_bsRecHalf * (m_bsRing + 1);
+	bool any = false;
+	if ((it->probeSlot >= 0) && m_bsPipeline)
+	{
+		const uint32_t b = m_bsXStart[xLo], e = m_bsXStart[xHi];
+		if (e > b)
+		{
+			const BatchSamplePC pc = {b, e, (slotBase + (uint32_t)it->probeSlot) * m_bsCells};
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bsPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bsPipeLayout, 0, 1, &m_bsDescSet, 0, nullptr);
+			vkCmdPushConstants(cmd, m_bsPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BatchSamplePC), &pc);
+			vkCmdDispatch(cmd, (e - b + 255) / 256, 1, 1);
+			any = true;
+		}
+	}
+	if (it->energySlot >= 0)
+	{
+		RecordEnergyPlanes(cmd, m_bsEnergyDescSet, xLo, xHi, (slotBase + (uint32_t)it->energySlot) * m_energyFloats);
+		any = true;
+	}
+	if (!any)
+		return;
+	// What comes next writes the fields read here.  Every stage before ends
+	// with a barrier after its writes, so none is needed in front.
+	VkMemoryBarrier barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	CmdComputeBarrier(cmd, barrier);
+	m_bsCmdWrote = true;
+}
+
+void Engine_Vulkan::SubmitSampled(unsigned int nTS, bool endProbe, bool endEnergy)
+{
+	if (m_speculativeTS != 0 || !m_bsSubmitted.empty())
+		throw std::logic_error("in-batch sampling: a sampled batch submitted while another computes ahead");
+	BsBatch b;
+	b.probeTS.swap(m_bsSched.probeTS);
+	b.energyTS.swap(m_bsSched.energyTS);
+	m_bsSched = BsBatch();
+	b.start = numTS;
+	b.len = nTS;
+	b.half = m_bsNextHalf;
+	b.endProbe = endProbe && (m_bsCells > 0);
+	b.endEnergy = endEnergy && m_bsGpuEnergy;
+	if (m_bsHaveCommitted && (m_bsCommitted.half == b.half))
+		throw std::logic_error("in-batch sampling: a batch would overwrite samples not yet collected");
+
+	// The sample timesteps, each in (start, start+len), ascending, and the end.
+	const unsigned int end = b.start + b.len;
+	m_bsRec.clear();
+	size_t p = 0, e = 0;
+	unsigned int last = b.start;
+	while ((p < b.probeTS.size()) || (e < b.energyTS.size()))
+	{
+		unsigned int t = UINT_MAX;
+		if (p < b.probeTS.size()) t = std::min(t, b.probeTS[p]);
+		if (e < b.energyTS.size()) t = std::min(t, b.energyTS[e]);
+		if ((t <= last) || (t >= end))
+			throw std::logic_error("in-batch sampling: a sample timestep at or before the batch start, after its last, or not ascending");
+		BsSample s = {t, -1, -1};
+		if ((p < b.probeTS.size()) && (b.probeTS[p] == t))
+			s.probeSlot = (int32_t)p++;
+		if ((e < b.energyTS.size()) && (b.energyTS[e] == t))
+			s.energySlot = (int32_t)e++;
+		m_bsRec.push_back(s);
+		last = t;
+	}
+	if (b.endProbe || b.endEnergy)
+		m_bsRec.push_back({end, b.endProbe ? (int32_t)m_bsRing : -1, b.endEnergy ? (int32_t)m_bsRing : -1});
+
+	m_bsRecHalf = b.half;
+	m_bsRecEnd = end;
+	m_bsRecording = true;
+	try
+	{
+		IterateTS(nTS);
+	}
+	catch (...)
+	{
+		m_bsRecording = false;
+		throw;
+	}
+	m_bsRecording = false;
+	m_bsNextHalf ^= 1u;
+	m_bsSubmitted.push_back(std::move(b));
+}
+
+bool Engine_Vulkan::IterateSampledTS(unsigned int iterTS)
+{
+	if (!m_bsGpuOn)
+		return Engine::IterateSampledTS(iterTS);
+	// The standard loop: the batch, then its samples, then the replay.
+	SubmitSampled(iterTS, false, false);
+	DrainGPU();
+	m_bsCommitted = std::move(m_bsSubmitted.front());
+	m_bsSubmitted.pop_front();
+	m_bsHaveCommitted = true;
+	CollectSampledBatch();
+	return true;
+}
+
+void Engine_Vulkan::SubmitSampledSpeculative(unsigned int nTS, bool endProbe, bool endEnergy)
+{
+	const unsigned int savedTS = numTS;
+	SubmitSampled(nTS, endProbe, endEnergy);
+	numTS = savedTS;
+	m_speculativeTS = nTS;
+}
+
+void Engine_Vulkan::CommitSampledSpeculative()
+{
+	if (m_bsSubmitted.empty())
+		throw std::logic_error("in-batch sampling: no batch to commit");
+	if (m_bsHaveCommitted)
+		throw std::logic_error("in-batch sampling: a batch committed before the one before was collected");
+	// The only work in flight.
+	DrainGPU();
+	m_bsCommitted = std::move(m_bsSubmitted.front());
+	m_bsSubmitted.pop_front();
+	m_bsHaveCommitted = true;
+	numTS += m_bsCommitted.len;
+	m_speculativeTS = 0;
+}
+
+void Engine_Vulkan::CollectSampledBatch()
+{
+	if (!m_bsHaveCommitted)
+		throw std::logic_error("in-batch sampling: no committed batch to collect");
+	if (m_bsMode != BS_OFF)
+		throw std::logic_error("in-batch sampling: samples collected during a replay");
+	BsBatch& b = m_bsCommitted;
+	const size_t halfSlot = (size_t)b.half * (m_bsRing + 1);
+	m_bsProbeTS.swap(b.probeTS);
+	m_bsEnergyTS.swap(b.energyTS);
+	m_bsValues.resize(m_bsProbeTS.size() * (size_t)m_bsCells);
+	if (!m_bsValues.empty())
+		std::memcpy(m_bsValues.data(), m_bsProbeRingMapped + halfSlot * m_bsCells, m_bsValues.size() * sizeof(float));
+	m_bsEnergy.resize(m_bsEnergyTS.size());
+	for (size_t j = 0; j < m_bsEnergyTS.size(); ++j)
+		m_bsEnergy[j] = SumEnergyPartials(m_bsEnergyRingMapped + (halfSlot + j) * m_energyFloats);
+	m_bsEndProbeTS = m_bsEndEnergyTS = UINT_MAX;
+	if (b.endProbe)
+	{
+		m_probeCacheCPU.resize(m_bsCells);
+		std::memcpy(m_probeCacheCPU.data(), m_bsProbeRingMapped + (halfSlot + m_bsRing) * m_bsCells,
+		            (size_t)m_bsCells * sizeof(float));
+		m_bsEndProbeTS = b.start + b.len;
+	}
+	if (b.endEnergy)
+	{
+		m_bsEndEnergy = SumEnergyPartials(m_bsEnergyRingMapped + (halfSlot + m_bsRing) * m_energyFloats);
+		m_bsEndEnergyTS = b.start + b.len;
+	}
+	m_bsBatchStart = b.start;
+	m_bsHaveCommitted = false;
+	b = BsBatch();
+}
+
+bool Engine_Vulkan::ReadEndSample(unsigned int field, unsigned int n, unsigned int x, unsigned int y, unsigned int z,
+                                  FDTD_FLOAT& v) const
+{
+	const uint64_t key = FootprintKey(field, n, x, y, z);
+	const auto it = std::lower_bound(m_bsFootprint.begin(), m_bsFootprint.end(), key);
+	if ((it == m_bsFootprint.end()) || (*it != key))
+	{
+		m_probeCacheMisses++;
+		return false;
+	}
+	if (m_bsEndProbeTS != numTS)
+	{
+		std::ostringstream err;
+		err << "in-batch sampling: a probe reads timestep " << numTS << " while the GPU computes ahead, "
+		    << "and its batch did not sample the footprint there";
+		throw std::logic_error(err.str());
+	}
+	m_probeCacheHits++;
+	v = m_probeCacheCPU[(size_t)(it - m_bsFootprint.begin())];
+	return true;
 }
 
 // ===========================================================================
@@ -4301,6 +4762,12 @@ void Engine_Vulkan::RecordDumpSamples(VkCommandBuffer cmd, unsigned int ts)
 	for (size_t i = 0; i < m_dumps.size(); ++i)
 		if ((due[i] = m_dumps[i].due(ts) ? 1 : 0))
 			(m_dumps[i].dft ? dft : gather) = true;
+	// A sampled batch may run past the timestep the replay stops at, and a
+	// DFT sum cannot take a sample back: the dump adds it when it processes
+	// ts (AddDumpDFTSample()), while the GPU still holds ts.  A gather into
+	// the ring is harmless.
+	if (m_bsRecording)
+		dft = false;
 	if (!gather && !dft)
 		return;
 
@@ -5293,6 +5760,10 @@ void Engine_Vulkan::RecordSlabSweep(VkCommandBuffer cmd, int A0, int B0, int k, 
 
 		const uint32_t ts = t0 + (uint32_t)t;
 
+		// --- In-batch sampling: the E range at the end of ts-1 ---
+		// Before anything of step ts writes it: see RecordBatchSample().
+		RecordBatchSample(cmd, ts, (uint32_t)eLo, (uint32_t)eHi);
+
 		// --- Pre-voltage: dispersive ADE, Mur, lumped RLC, then UPML (unfused) ---
 		// Ordered exactly as the flat path has it: the pre passes run before
 		// the update, the apply passes after it and before the excitation.
@@ -5754,6 +6225,8 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		{
 			const int kk = (int)std::min<unsigned int>(k, iterTS - base);
 			const uint32_t t0 = numTS + base;
+			if (kk >= 2)
+				m_blockedTS += kk;
 			for (size_t i = 0; i + 1 < m_tbEdges.size(); ++i)
 				RecordSlabSweep(cmd, m_tbEdges[i], m_tbEdges[i + 1], kk, +1, t0,
 				                gridPC, gridPCc, fusedPC, barrier, hasExcVolt, hasExcCurr);
@@ -5766,6 +6239,9 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 	for (unsigned int iter = 0; iter < iterTS; ++iter)
 	{
 		uint32_t ts = numTS + iter;
+
+		// In-batch sampling: the grid at the end of ts-1.
+		RecordBatchSample(cmd, ts, 0, numLines[0]);
 
 		if (m_hasFusedUPML)
 		{
@@ -6292,6 +6768,22 @@ bool Engine_Vulkan::IterateTS(unsigned int iterTS)
 		                     1, &hostBarrier, 0, nullptr, 0, nullptr);
 	}
 
+	// In-batch sampling: the batch's last timestep, which the pipelined loop
+	// reads while the next batch runs; and the rings to the host.
+	if (m_bsRecording && (numTS + iterTS == m_bsRecEnd))
+		RecordBatchSample(cmd, numTS + iterTS, 0, numLines[0]);
+	if (m_bsCmdWrote)
+	{
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_HOST_BIT, 0,
+		                     1, &hostBarrier, 0, nullptr, 0, nullptr);
+		m_bsCmdWrote = false;
+	}
+
 	if (m_profileEnabled && m_tsQueryPool && m_profilePhaseEnabled)
 	{
 		// End of compute/update section (before probe gather/copy section)
@@ -6384,6 +6876,9 @@ void Engine_Vulkan::CleanupVulkan()
 
 	// Field-dump gather ring, DFT sums and pipelines
 	CleanupDumps();
+
+	// In-batch sampling rings and gather
+	CleanupBatchSampling();
 
 	// First clean up extension resources
 	CleanupExtensions();
@@ -6932,34 +7427,30 @@ void Engine_Vulkan::CleanupFusedUPML()
 
 void Engine_Vulkan::SetupGPU_EnergyReduction()
 {
-	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
+	// One (E, H) pair per x-plane and chunk; the host adds them in plane order.
+	m_energyChunks = (m_strideYZ + STEADY_ENERGY_CHUNK - 1) / STEADY_ENERGY_CHUNK;
+	m_energyFloats = 2u * numLines[0] * m_energyChunks;
+	VkDeviceSize partialSize = (VkDeviceSize)m_energyFloats * sizeof(float);
 	VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 	                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-	// The reduction writes only 2 KiB. Keep that output directly CPU-visible
+	// The reduction writes a few KiB. Keep that output directly CPU-visible
 	// even when the large field buffers stay in device-local memory on a dGPU.
 	CreateGpuBuf(m_energyPartialBuf, partialSize,
 	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVisible);
 	VK_CHECK(vkMapMemory(m_device, m_energyPartialBuf.memory, 0, partialSize, 0,
 	                     (void**)&m_energyMapped));
 	// Descriptor layout: 3 bindings (volt, curr, partials)
-	auto makeLayout = [&](uint32_t nBindings) -> VkDescriptorSetLayout
-	{
-		std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
-		for (uint32_t i = 0; i < nBindings; i++)
-			bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-		VkDescriptorSetLayoutCreateInfo ci{};
-		ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-		ci.bindingCount = nBindings;
-		ci.pBindings    = bindings.data();
-		VkDescriptorSetLayout layout;
-		VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr, &layout));
-		return layout;
-	};
-	m_energyDescLayout = makeLayout(3);
+	VkDescriptorSetLayoutBinding bindings[3];
+	for (uint32_t i = 0; i < 3; i++)
+		bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+	VkDescriptorSetLayoutCreateInfo dli{};
+	dli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	dli.bindingCount = 3;
+	dli.pBindings    = bindings;
+	VK_CHECK(vkCreateDescriptorSetLayout(m_device, &dli, nullptr, &m_energyDescLayout));
 
-	// Pipeline layout: push constant = EnergyPC (8 bytes)
-	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EnergyPC)};
+	VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SteadyEnergyPC)};
 	VkPipelineLayoutCreateInfo pli{};
 	pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pli.setLayoutCount         = 1;
@@ -6968,11 +7459,12 @@ void Engine_Vulkan::SetupGPU_EnergyReduction()
 	pli.pPushConstantRanges    = &pcRange;
 	VK_CHECK(vkCreatePipelineLayout(m_device, &pli, nullptr, &m_energyPipeLayout));
 
-	// Descriptor pool + set
-	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+	// Two sets: the live fields' partials, and the in-batch sampling ring's
+	// (allocated by SetupBatchSampling()).
+	VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
 	VkDescriptorPoolCreateInfo dpi{};
 	dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpi.maxSets       = 1;
+	dpi.maxSets       = 2;
 	dpi.poolSizeCount = 1;
 	dpi.pPoolSizes    = &poolSize;
 	VK_CHECK(vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_energyDescPool));
@@ -6984,14 +7476,12 @@ void Engine_Vulkan::SetupGPU_EnergyReduction()
 	ai.pSetLayouts        = &m_energyDescLayout;
 	VK_CHECK(vkAllocateDescriptorSets(m_device, &ai, &m_energyDescSet));
 
-	// Write descriptors: volt, curr, partials
 	VkBuffer      bufs[3] = {m_voltBuf, m_currBuf, m_energyPartialBuf.buffer};
 	VkDeviceSize sizes[3] = {m_fieldBufSize, m_fieldBufSize, partialSize};
 	WriteDescriptorBuffers(m_device, m_energyDescSet, bufs, sizes, 3);
 
-	// Compute pipeline
-	VkShaderModule mod = CreateShaderModule(gpu_spirv::reduce_energy_data,
-	                                        gpu_spirv::reduce_energy_size);
+	VkShaderModule mod = CreateShaderModule(gpu_spirv::reduce_energy_planes_data,
+	                                        gpu_spirv::reduce_energy_planes_size);
 	VkPipelineShaderStageCreateInfo stage{};
 	stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -7004,7 +7494,32 @@ void Engine_Vulkan::SetupGPU_EnergyReduction()
 	ci.layout = m_energyPipeLayout;
 	VK_CHECK(vkCreateComputePipelines(m_device, m_pipelineCache, 1, &ci, nullptr, &m_energyPipeline));
 	vkDestroyShaderModule(m_device, mod, nullptr);
+}
 
+void Engine_Vulkan::RecordEnergyPlanes(VkCommandBuffer cmd, VkDescriptorSet set, uint32_t xLo, uint32_t xHi,
+                                       uint32_t slotBase) const
+{
+	if (xHi <= xLo)
+		return;
+	const SteadyEnergyPC pc = {m_fieldN, m_strideYZ, STEADY_ENERGY_CHUNK, m_energyChunks, xLo, slotBase};
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_energyPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                        m_energyPipeLayout, 0, 1, &set, 0, nullptr);
+	vkCmdPushConstants(cmd, m_energyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(SteadyEnergyPC), &pc);
+	vkCmdDispatch(cmd, m_energyChunks, xHi - xLo, 1);
+}
+
+double Engine_Vulkan::SumEnergyPartials(const float* partials) const
+{
+	// The planes in order, as the CPU engines add their rows.
+	double E_energy = 0.0, H_energy = 0.0;
+	for (uint32_t i = 0; i < m_energyFloats; i += 2)
+	{
+		E_energy += (double)partials[i];
+		H_energy += (double)partials[i + 1];
+	}
+	return EPS0 * E_energy + MUE0 * H_energy;
 }
 
 void Engine_Vulkan::SetupGPU_FieldValidation()
@@ -7126,20 +7641,24 @@ void Engine_Vulkan::CleanupGPU_EnergyReduction()
 
 double Engine_Vulkan::CalcFastEnergyGPU() const
 {
+	// The GPU computes ahead (the pipelined loop with in-batch sampling): the
+	// fields are past this timestep, whose batch sampled the energy at its end.
+	if (m_speculativeTS > 0)
+	{
+		if (m_bsEndEnergyTS == numTS)
+			return m_bsEndEnergy;
+		std::ostringstream err;
+		err << "in-batch sampling: the energy of timestep " << numTS << " is read while the GPU computes "
+		    << m_speculativeTS << " timesteps ahead, and its batch did not sample it";
+		throw std::logic_error(err.str());
+	}
+
 	// Ensure GPU compute is done
 	DrainGPU();
 
-	EnergyPC pc = {m_fieldN, ENERGY_NUM_WG};
-
-	// Dispatch energy reduction
 	RunSingleCommand([&](VkCommandBuffer cmd)
 	{
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_energyPipeline);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-		                        m_energyPipeLayout, 0, 1, &m_energyDescSet, 0, nullptr);
-		vkCmdPushConstants(cmd, m_energyPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(EnergyPC), &pc);
-		vkCmdDispatch(cmd, ENERGY_NUM_WG, 1, 1);
+		RecordEnergyPlanes(cmd, m_energyDescSet, 0, numLines[0], 0);
 
 		VkMemoryBarrier hostBarrier{};
 		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -7150,21 +7669,7 @@ double Engine_Vulkan::CalcFastEnergyGPU() const
 			0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 	});
 
-	// Read back the partial sums
-	VkDeviceSize partialSize = 2 * ENERGY_NUM_WG * sizeof(float);
-	float partials[2 * ENERGY_NUM_WG];
-
-	memcpy(partials, m_energyMapped, partialSize);
-
-	// CPU-side reduction of the partial sums (256 E + 256 H floats)
-	double E_energy = 0.0, H_energy = 0.0;
-	for (uint32_t i = 0; i < ENERGY_NUM_WG; ++i)
-	{
-		E_energy += (double)partials[i];
-		H_energy += (double)partials[ENERGY_NUM_WG + i];
-	}
-
-	return EPS0 * E_energy + MUE0 * H_energy;
+	return SumEnergyPartials(m_energyMapped);
 }
 
 #endif // WITH_GPU

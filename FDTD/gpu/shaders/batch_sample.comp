@@ -1,0 +1,36 @@
+/*
+ * In-batch sampling: the probe footprint into a ring slot
+ * (plans/BATCH_SAMPLING.md §4.5).
+ *
+ * The footprint's cells are listed sorted by x, so that the cells of the
+ * x-lines [a, b) are the entries [first, end): the blocked schedule samples
+ * each slab's E range as the slab reaches the sample timestep, the flat one
+ * all entries at once. An entry is the cell's index into its field buffer
+ * and its position in the footprint (the order the host reads a sample in),
+ * with bit 31 set for a current.
+ *
+ * Dispatch: vkCmdDispatch(cmd, (end - first + 255) / 256, 1, 1).
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly  buffer VoltBuf  { float volt[];  };
+layout(set=0, binding=1) readonly  buffer CurrBuf  { float curr[];  };
+layout(set=0, binding=2) readonly  buffer EntryBuf { uvec2 entry[]; };
+layout(set=0, binding=3) writeonly buffer OutBuf   { float outv[];  };
+
+layout(push_constant) uniform PC {
+    uint first;    // first entry of this dispatch
+    uint end;      // one past its last
+    uint outBase;  // first float of the ring slot
+};
+
+void main()
+{
+    uint i = first + gl_GlobalInvocationID.x;
+    if (i >= end) return;
+    uvec2 e = entry[i];
+    float v = ((e.y & 0x80000000u) != 0u) ? curr[e.x] : volt[e.x];
+    outv[outBase + (e.y & 0x7FFFFFFFu)] = v;
+}

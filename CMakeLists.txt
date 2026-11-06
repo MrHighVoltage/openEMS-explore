@@ -100,7 +100,7 @@ if (WITH_GPU)
 		tfsf_voltage tfsf_current
 		mur_pre_voltage mur_post_voltage mur_apply_voltage update_voltages_mur
 		rlc_pre_voltage rlc_apply_voltage
-		gather_probes reduce_energy reduce_energy_planes validate_fields
+		gather_probes reduce_energy_planes validate_fields batch_sample
 		dump_gather dump_dft
 		steady_state_sample
 		local_absorbing_bc
