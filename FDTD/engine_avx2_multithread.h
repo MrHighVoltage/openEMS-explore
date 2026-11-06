@@ -113,7 +113,7 @@ protected:
 	//! Latch the fastest measured thread count and leave calibration mode.
 	void FinishCalibration();
 
-	// --- trapezoidal temporal blocking (prototype, opt-in) ---
+	// --- trapezoidal temporal blocking (on by default for large grids) ---
 	virtual TemporalBlockingRequest GetTemporalBlocking() const {return m_blk_request;}
 	virtual bool SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce = true);
 	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const;

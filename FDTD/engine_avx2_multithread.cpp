@@ -263,7 +263,7 @@ bool Engine_AVX2_Multithread::IterateTS(unsigned int iterTS)
 }
 
 // ----------------------------------------------------------------------------
-// Trapezoidal temporal blocking  (prototype -- off unless asked for)
+// Trapezoidal temporal blocking  (on by default; off with ...TEMPORAL_BLOCK=0)
 //
 // The flat sweep streams the whole grid from DRAM once per timestep. Advancing
 // a cache-resident tile through k timesteps before moving on divides that
@@ -304,7 +304,9 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking(bool announce)
 		return;
 
 	if (plan.active)
-		cout << "AVX2 temporal blocking ACTIVE (prototype): k=" << m_blk_k
+		cout << "AVX2 temporal blocking ACTIVE"
+		     << (m_blk_request.mode == TemporalBlockingRequest::AUTO ? " (default)" : "")
+		     << ": k=" << m_blk_k
 		     << ", tile width " << m_blk_W << " x-lines, " << plan.detail << endl;
 	else if (!plan.why.empty())
 		cout << "AVX2 temporal blocking: disabled, " << plan.why << endl;
@@ -330,8 +332,12 @@ TemporalBlockingPlan Engine_AVX2_Multithread::PlanTemporalBlocking(const Tempora
 	TemporalBlockingPlan plan;
 	if (edgesOut)
 		edgesOut->clear();
-	// Off unless forced: "auto" is the flat sweep while this is a prototype.
-	if (req.mode != TemporalBlockingRequest::FORCED || req.k < 2)
+	// Off on request; otherwise on. "auto" uses the default block depth; the
+	// guards below still refuse grids that blocking cannot help.
+	if (req.mode == TemporalBlockingRequest::OFF)
+		return plan;
+	long k = (req.mode == TemporalBlockingRequest::FORCED) ? (long)req.k : 16;
+	if (k < 2)
 		return plan;
 
 	// The two guards below refuse grids that blocking cannot help. Both are
@@ -342,7 +348,6 @@ TemporalBlockingPlan Engine_AVX2_Multithread::PlanTemporalBlocking(const Tempora
 	// makes small runs slower, which is the point of the guards.
 	const char* forceEnv = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK_FORCE");
 	const bool force = forceEnv && forceEnv[0] == '1';
-	long k = (long)req.k;
 
 	// One tile of both field arrays should be about half the last-level cache
 	// the run has -- unless that costs block depth on a model with little else

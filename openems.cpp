@@ -388,9 +388,9 @@ openEMS::optionDesc()
 		{
 			m_avx2TBOption = readSchedule("avx2-temporal-block", val);
 		},
-		"Trapezoidal temporal blocking in the avx2-multithreaded engine: off "
-		"(default), <k> or <k>:<W> -- blocks of k timesteps over tiles of W "
-		"x-lines (default W: half the L3 cache)"
+		"Trapezoidal temporal blocking in the avx2-multithreaded engine: auto "
+		"(default), off, <k> or <k>:<W> -- blocks of k timesteps over tiles of W "
+		"x-lines (default k: 16, default W: half the L3 cache)"
 	);
 #ifdef WITH_GPU
 	optdesc.addStringOption("gpu-temporal-block", "",
@@ -614,15 +614,9 @@ void openEMS::WarnUntunedSettings() const
 		if (m_cpuCoresOption.empty() && CpuTopology::Get().DistinctSets().size() > 1)
 			unset.push_back("--cpu-cores");
 	}
-	const std::string tb = TemporalBlockingOptionName();
-	if (!tb.empty())
-	{
-		std::string env = "OPENEMS_" + tb;
-		std::transform(env.begin(), env.end(), env.begin(), [](char c) {return c == '-' ? '_' : (char)std::toupper(c);});
-		const std::string& option = (tb == "gpu-temporal-block") ? m_gpuTBOption : m_avx2TBOption;
-		if (option.empty() && !std::getenv(env.c_str()))
-			unset.push_back("--" + tb);
-	}
+	// Temporal blocking is on by default on both engines (auto), so it is no
+	// longer listed here; --gpu-temporal-block/--avx2-temporal-block only tune
+	// or switch it off.
 	if (unset.empty())
 		return;
 	cerr << "openEMS - Warning: running on default performance settings, not on ones tuned for this model and machine (";

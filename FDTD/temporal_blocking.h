@@ -31,7 +31,7 @@ struct TemporalBlockingRequest
 {
 	enum Mode
 	{
-		AUTO,   //!< the engine's default: on for a GPU and a large grid, off on the CPU
+		AUTO,   //!< the engine's default: on for a grid larger than the cache, on CPU and GPU alike
 		OFF,    //!< the flat sweep
 		FORCED  //!< blocks of k timesteps
 	};
