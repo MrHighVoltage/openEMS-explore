@@ -27,6 +27,9 @@ Branch `tb-all-exc/core`, on top of `1922d00`:
 | `a1a6264` | `RunFDTD()`: the sampled standard loop, `OPENEMS_ENDCRIT_TRACE`, the summary lines |
 | `189ff16` | `planBatch()` continues from given positions; the replay checks the last end too |
 | `53d827d` | `python/Tests/batch_sampling_identity.py` |
+| `0ca88f5` | review: a replayed read is an index lookup; `Engine_AVX2::SampleFootprint()` from offsets |
+| `c7a230b` | review: a batch holds at most 4094 steady-state periods (§3.8) |
+| `90849d6` | review: the replay follows processings that change their schedule (§3.10) |
 
 - **Done.** Everything in §3 and the generic implementation of §4, used by
   `Engine_AVX2` and `Engine_AVX2_Multithread`. Identity holds on every case
@@ -136,10 +139,9 @@ end where the run stops, an end criterion met or a numerical failure; that end
 is `bsDoneTS`. Then the loop leaves (`bsStopped`) without the status block. A
 stop at the batch's last end runs the status block first, as the old loop did.
 
-The replay checks that the processings did what the plan looked ahead to: the
-next end, and after the last one `nextStep` and `nextPositions`. A mismatch
-throws `std::logic_error`, which `RunFDTD()` turns into a cancelled run
-(`FDTD engine exception: in-batch sampling: ...`), never a silent divergence.
+The replay follows what the processings do, not the plan; where they leave
+it, §3.10 applies. `replayBatch()` returns whether they did what the plan
+looked ahead to, up to `nextStep` and `nextPositions` after the last end.
 
 The post-loop lines report `bsDoneTS`: the stop message, `Time for <n>
 iterations`, the speed and `--dumpstatistics`. The engine may have run on to
@@ -208,6 +210,13 @@ passes it, so a run prints the checks it stopped on and none it ran ahead to.
 `SlabBlockDepth()` still caps a block at one period, which the batch length
 does not affect.
 
+The queue holds at most `Engine_Ext_SteadyState::MAX_QUEUED_VERDICTS` (4096)
+checks; beyond that `CheckPeriod()` passes the oldest itself, which only a run
+that never asks needs (`--benchmark`). `planBatch()` therefore ends a batch
+after `GetMaxRunAhead()` = 4094 periods, so that a batch never queues more
+checks than its replay finds (a 12³ box with an 11-timestep period ran batches
+of 13 000 periods and stopped at 265213 instead of 167533 before this cap).
+
 ### 3.9 Old-loop equivalence, and what is not equivalent
 
 Bit-identical by construction: the replayed timesteps, `PA->Process()` and
@@ -218,6 +227,43 @@ Wall-clock-dependent, as before: the status line, `PA->FlushNext()`, the
 relaxation of the energy criterion after 60 s, and the abort check. These run
 at batch ends only. The intermediate `*_FD` flushes can therefore come at other
 timesteps; the files written at the end are the same.
+
+### 3.10 When a processing changes its own schedule
+
+The plan assumes that a processing's schedule depends only on its step
+position. A processing can still change it while processing: a dump that
+fails to write disables itself (`ProcessFieldsTD`, e.g. `FileType` 2), and
+`ProcessFieldsFD::Process()` returns -1 when `CalcField()` fails. Dumps only
+process at a batch's last end, so this usually changes only what comes after
+the batch, which the standard loop plans from the live state anyway.
+
+`replayBatch()` therefore follows the processings, not the plan: after each
+end it goes to the end their `step` asks for, also one the plan does not have
+(the batch replays any timestep in it), and skips planned ends they no longer
+ask for. It replays the batch's last timestep in any case, since the engine is
+there. The real schedule of a processing that disabled itself is a subset of
+the plan, and then
+
+- every timestep at which a processing reads was planned, and sampled: a
+  planned end is any timestep some processing's next interval pointed to;
+- the replay visits the old loop's ends, except that it also replays the
+  batch's last timestep, and that after it the Nyquist cap counts from there:
+  where nothing is due, an end the old loop would not have had. Only the
+  steady-state verdict is read there, so a sine run can stop up to one
+  old-loop step earlier than the old loop in this case.
+
+`replayBatch()` returns false where the processings left the plan (`-v`
+counts these batches). A hard error remains only where they need what the
+batch did not sample: a read at a replayed timestep without a probe sample or
+outside the footprint (`BatchRead()`), or an energy estimate without a sample
+(`GetBatchReplayEnergy()`), both `std::logic_error`, which `RunFDTD()` turns
+into a cancelled run. For a batch planned ahead (the pipelined loop, §4.5),
+the return value says that the plan of the next batch, made from this one's
+`nextStep` and `nextPositions`, is stale: it is still a superset if the
+change was a processing disabling itself, so it may run, but a new plan from
+the live state is exact. The same holds for `relaxEndCriteria()`, which only
+clears ProcField's interval: a batch planned before it and replayed after it
+no longer throws.
 
 ## 4. The engine contract
 
@@ -425,9 +471,15 @@ assertion fails.
 ## 7. Open
 
 - The in-block samplers (§4.4, §4.5); until then Dirac and step block nowhere.
-- A replayed probe read is a binary search in the footprint. Negligible for a
-  few probes; a mode-matching probe over 10⁵ cells pays about 10⁵ searches per
-  probe timestep.
+- A replayed probe read is an index lookup (`Engine::FootprintSlot()`, built
+  once by `StopFootprintRecording()`: a dense box per field component where
+  its cells fill at least 1/16 of their bounding box, a hash table for the
+  rest), and `Engine_AVX2::SampleFootprint()` reads precomputed offsets. Until
+  the review fix a read was a binary search behind an `std::ostringstream`,
+  3.4 to 5.2 times slower than the old loop on mode-matching probes over whole
+  planes; now 1.08 (50×50×200, 1000 timesteps) and 1.16 (120×120×40, 600
+  timesteps) of the old loop's time, paired A/B of 3 runs each, 4 threads,
+  medians, on the busy workstation. The rest is the sampling and the lookups.
 - The ring holds `ring × footprint` floats; a footprint of millions of cells
   takes its 16 slots regardless of the 64 MB target.
 - The intermediate flushes of the `*_FD` files and the 4 s status come at

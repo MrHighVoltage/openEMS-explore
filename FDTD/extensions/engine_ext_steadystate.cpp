@@ -249,9 +249,10 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int TS, double energy, const s
 	// passed it: an engine may run ahead of the timestep the main loop
 	// processes (in-batch sampling), and a run stopping in between never
 	// sees the checks it ran ahead to. A run that never asks (--benchmark)
-	// keeps a few.
+	// keeps a few; a sampled batch never runs further ahead than
+	// GetMaxRunAhead(), so that this never passes a verdict its replay needs.
 	m_verdicts.push_back(Verdict{TS, curr_total_energy, m_last_max_diff});
-	while (m_verdicts.size() > 4096)
+	while (m_verdicts.size() > MAX_QUEUED_VERDICTS)
 	{
 		PassVerdict(m_verdicts.front());
 		m_verdicts.pop_front();
