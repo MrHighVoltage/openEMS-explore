@@ -29,12 +29,19 @@ A sine excitation adds steady-state detection. The blocked schedule carries
 it (plans/STEADY_STATE_TEMPORAL_BLOCKING.md), and its cases compare the trace
 of every check (OPENEMS_STEADYSTATE_TRACE=1) and the timestep the run stops
 at, besides the fields.
+
+A Dirac or a step excitation has a Nyquist interval of one timestep: its
+probes and its energy end criterion are due every timestep, and before
+in-batch sampling (plans/BATCH_SAMPLING.md) no timestep of such a run ran
+blocked. Their cases compare the probe files (17 digits) and plane dumps in
+a short time window, and check that the blocked runs say they did block.
 """
 
 import os
 import re
 import sys
 import shutil
+import xml.etree.ElementTree as ET
 import subprocess
 import tempfile
 import textwrap
@@ -94,22 +101,52 @@ xl, yl, zl = mesh.GetLines("x"), mesh.GetLines("y"), mesh.GetLines("z")
 exc = CSX.AddExcitation("exc", exc_type=0, exc_val=[0, 0, 1])
 exc.AddBox([xl[{exc_x}], yl[10], zl[10]], [xl[{exc_x}] + 1, yl[22], zl[22]])
 
-dumpE = CSX.AddDump("Et", dump_type=0, dump_mode=0, file_type=1)
-dumpE.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
-dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
-dumpH.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
+{dump_setup}
 
 FDTD.Write2XML({xml!r})
 """
 
+# Every timestep's E and H, in full: what most cases compare.
+FULL_DUMPS = """
+dumpE = CSX.AddDump("Et", dump_type=0, dump_mode=0, file_type=1)
+dumpE.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
+dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
+dumpH.AddBox([xl[0], yl[0], zl[0]], [xl[-1], yl[-1], zl[-1]])
+"""
 
-def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GAUSS_SETUP, delta=1e-3):
+# A Dirac or step run has everything due every timestep, so full dumps would
+# be huge and would end every batch. Probes instead, on and next to the tile
+# edges of 4:16 and 3:12, and an E and an H plane in a window of about ten
+# timesteps near the end (DUMP_WINDOW); a timestep is 1.93 ps here.
+PROBES_AND_PLANES = """
+ut = CSX.AddProbe("ut", p_type=0)
+ut.AddBox([xl[40], yl[16], zl[12]], [xl[40], yl[16], zl[20]])
+it = CSX.AddProbe("it", p_type=1, norm_dir=0)
+it.AddBox([xl[48], yl[12], zl[12]], [xl[48], yl[20], zl[20]])
+ef = CSX.AddProbe("Ef_edge", p_type=2)
+ef.AddBox([xl[36], yl[16], zl[16]], [xl[36], yl[16], zl[16]])
+hf = CSX.AddProbe("Hf_edge", p_type=3)
+hf.AddBox([xl[47], yl[15], zl[16]], [xl[47], yl[15], zl[16]])
+dumpE = CSX.AddDump("Et", dump_type=0, dump_mode=0, file_type=1)
+dumpE.AddBox([xl[0], yl[0], zl[16]], [xl[-1], yl[-1], zl[16]])
+dumpH = CSX.AddDump("Ht", dump_type=1, dump_mode=0, file_type=1)
+dumpH.AddBox([xl[0], yl[16], zl[0]], [xl[-1], yl[16], zl[-1]])
+"""
+DUMP_WINDOW = (1.8e-10, 2.0e-10)
+DIRAC_SETUP = "FDTD = openEMS(NrTS=%d, EndCriteria=0)\nFDTD.SetDiracExcite(10e9)" % TIMESTEPS
+STEP_SETUP = "FDTD = openEMS(NrTS=%d, EndCriteria=0)\nFDTD.SetStepExcite(10e9)" % TIMESTEPS
+
+
+def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GAUSS_SETUP, delta=1e-3,
+         dump_setup=FULL_DUMPS, dump_window=None, want_probes=False):
     """Write one small model to XML and run it on the GPU engine.
 
-    Returns (output, E_time_series, H_time_series). `block_env` is the value
-    of OPENEMS_GPU_TEMPORAL_BLOCK for this run, or None for the flat sweep
-    (blocking explicitly off: it is on by default for large grids); the two
-    runs being compared must differ in *only* that.
+    Returns (output, E_time_series, H_time_series), and with want_probes the
+    probe files too, as {name: lines without the dated header}. `block_env`
+    is the value of OPENEMS_GPU_TEMPORAL_BLOCK for this run, or None for the
+    flat sweep (blocking explicitly off: it is on by default for large
+    grids); the two runs being compared must differ in *only* that.
+    `dump_window` = (start, stop) in seconds limits the dumps to that time.
     """
     sim_path = os.path.join(tempfile.gettempdir(), "gputblk_%s" % tag)
     shutil.rmtree(sim_path, ignore_errors=True)
@@ -120,6 +157,7 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GA
         fdtd_setup=fdtd_setup, delta=delta, boundary=boundary, nx=NX, ny=NY, nz=NZ,
         exc_x=EXC_X, xml=xml,
         extra_setup=textwrap.dedent(extra_setup).strip(),
+        dump_setup=textwrap.dedent(dump_setup).strip(),
     )
     script_path = os.path.join(sim_path, "model.py")
     with open(script_path, "w") as f:
@@ -129,6 +167,13 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GA
         shutil.rmtree(sim_path, ignore_errors=True)
         raise RuntimeError("writing the model failed (tag=%s, rc=%s):\n%s\n%s"
                            % (tag, proc.returncode, proc.stdout[-4000:], proc.stderr[-4000:]))
+    if dump_window:
+        # The Python modules cannot set a dump's start and stop time.
+        tree = ET.parse(xml)
+        for db in tree.iter("DumpBox"):
+            db.set("StartTime", repr(dump_window[0]))
+            db.set("StopTime", repr(dump_window[1]))
+        tree.write(xml)
 
     env = dict(os.environ)
     env["OPENEMS_STEADYSTATE_TRACE"] = "1"
@@ -155,9 +200,20 @@ def _run(tag, boundary, block_env, extra_env=None, extra_setup="", fdtd_setup=GA
                 return np.array([np.array(td[k]) for k in sorted(td.keys())])
 
         E, H = _load("Et.h5"), _load("Ht.h5")
+        probes = {}
+        if want_probes:
+            for name in sorted(os.listdir(sim_path)):
+                if name in ("model.py", "model.xml") or name.endswith(".h5") or name in ("et", "ht"):
+                    continue
+                path = os.path.join(sim_path, name)
+                if os.path.isfile(path):
+                    with open(path) as f:
+                        probes[name] = [l for l in f.read().splitlines() if not (l.startswith("%") and "@" in l)]
     finally:
         shutil.rmtree(sim_path, ignore_errors=True)
 
+    if want_probes:
+        return proc.stdout + proc.stderr, E, H, probes
     return proc.stdout + proc.stderr, E, H
 
 
@@ -170,6 +226,12 @@ def _relevant_lines(output):
 def _steady_trace(output):
     """Every steady-state check of a run, as OPENEMS_STEADYSTATE_TRACE prints it."""
     return [l for l in output.splitlines() if l.startswith("SteadyState check:")]
+
+
+def _blocked(output):
+    """(b, n) of the "Temporal blocking: <b> of <n> timesteps ran blocked" line, or None."""
+    m = re.search(r"^Temporal blocking: (\d+) of (\d+) timesteps ran blocked", output, re.M)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _stop_timestep(output):
@@ -470,6 +532,40 @@ class GPUTemporalBlockingTest(unittest.TestCase):
     def test_steady_state_period_multiple(self):
         """A period of 80 and a processing interval of 10, which divides it."""
         self._compare_steady("ss_p80", ["PEC"] * 6, "", DELTA_P80, ("5:16", "3:12"))
+
+    def _compare_interval_one(self, tag, fdtd_setup, boundary=("MUR",) * 6):
+        """A run whose probes and energy criterion are due every timestep,
+        flat and blocked: probe files, dumps, and that the blocked runs ran
+        blocked, which before in-batch sampling they could not."""
+        kw = dict(fdtd_setup=fdtd_setup, dump_setup=PROBES_AND_PLANES, dump_window=DUMP_WINDOW,
+                  want_probes=True, extra_env={"OPENEMS_PROBE_PRECISION": "17"})
+        flat_out, flat_E, flat_H, flat_probes = _run(tag + "_flat", list(boundary), None, **kw)
+        self.assertIn("In-batch sampling ON", flat_out, "in-batch sampling did not engage")
+        self.assertEqual(sorted(flat_probes), ["Ef_edge", "Hf_edge", "it", "ut"],
+                         "the flat run did not write the probe files")
+        self.assertGreater(float(np.max(np.abs(flat_E))), 0.0, "the flat run dumped an all-zero E plane")
+        self.assertGreaterEqual(len(flat_E), 8, "the dump window holds only %d frames" % len(flat_E))
+        for env in ("4:16", "3:12"):
+            with self.subTest(schedule=env):
+                out, E, H, probes = _run("%s_%s" % (tag, env.replace(":", "_")), list(boundary), env, **kw)
+                self.assertIn(ACTIVE_MARK, out, _relevant_lines(out))
+                blocked = _blocked(out)
+                self.assertIsNotNone(blocked, "no 'Temporal blocking: <b> of <n>' line:\n%s" % _relevant_lines(out))
+                self.assertGreater(blocked[0], TIMESTEPS // 2,
+                                   "only %d of %d timesteps ran blocked" % blocked)
+                for name in sorted(flat_probes):
+                    self.assertEqual(flat_probes[name], probes.get(name),
+                                     "schedule %s: probe %s differs from the flat sweep's" % (env, name))
+                self.assertTrue(np.array_equal(flat_E, E) and np.array_equal(flat_H, H),
+                                "schedule %s: the dumps are not bit-identical to the flat sweep's" % env)
+
+    def test_dirac(self):
+        """A Dirac pulse: every timestep a probe and energy timestep."""
+        self._compare_interval_one("dirac", DIRAC_SETUP)
+
+    def test_step(self):
+        """A step excitation, with UPML on two faces."""
+        self._compare_interval_one("step", STEP_SETUP, boundary=("MUR", "MUR", "PML_8", "PML_8", "MUR", "MUR"))
 
     def test_steady_state_with_extensions(self):
         """Mur, a lumped port and an RLC element, which write the fields in
