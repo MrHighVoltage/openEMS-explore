@@ -33,6 +33,7 @@ public:
 	virtual void InitProcess();
 
 	virtual int Process();
+	virtual int ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const;
 	virtual void PostProcess();
 
 	virtual bool IsDueAt(unsigned int ts) const;

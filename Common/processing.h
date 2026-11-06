@@ -76,6 +76,24 @@ public:
 	//! Whether this processing would act at timestep \a ts, without CheckTimestep()'s side effects.
 	virtual bool IsDueAt(unsigned int ts) const;
 
+	//! \name Look-ahead (in-batch sampling, plans/BATCH_SAMPLING.md)
+	//! What Process() and CheckTimestep() would do at a later timestep, without
+	//! doing it. The only state they change is the position in the step list
+	//! (AddStep()); \a psPos stands in for it, starting at GetStepPosition().
+	//@{
+	size_t GetStepPosition() const {return m_PS_pos;}
+	//! CheckTimestep() at timestep \a ts; advances \a psPos as CheckTimestep() would.
+	bool CheckTimestepAt(unsigned int ts, size_t& psPos) const;
+	//! GetNextInterval() at timestep \a ts.
+	int NextIntervalAt(unsigned int ts, size_t psPos) const;
+	//! What Process() returns at timestep \a ts; advances \a psPos as Process()
+	//! would. \a readsFields: whether Process() reads the fields there.
+	/*!
+	  A subclass that overrides Process() overrides this to match.
+	  */
+	virtual int ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const;
+	//@}
+
 	//! Process data prior to the simulation run.
 	virtual void PreProcess() {};
 
@@ -194,6 +212,18 @@ public:
 	int Process();
 	//! Whether any processing would act at timestep \a ts (see Processing::IsDueAt()).
 	bool IsDueAt(unsigned int ts) const;
+
+	//! The step-list positions of all processings, for ProcessAt().
+	std::vector<size_t> GetStepPositions() const;
+	//! What Process() returns at timestep \a ts, without processing (Processing::ProcessAt()).
+	/*!
+	  \a psPos holds the step-list positions (GetStepPositions()) and is
+	  advanced as Process() would; \a readsFields[i] is set to whether
+	  processing i reads the fields at \a ts.
+	  */
+	int ProcessAt(unsigned int ts, std::vector<size_t>& psPos, std::vector<char>& readsFields) const;
+	//! The interval Process() returns at most.
+	unsigned int GetMaxInterval() const {return maxInterval;}
 
 	//! Invoke PostProcess() on all Processings.
 	void PostProcess();

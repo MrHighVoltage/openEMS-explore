@@ -170,6 +170,15 @@ int ProcessIntegral::Process()
 	return GetNextInterval();
 }
 
+int ProcessIntegral::ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const
+{
+	// as Process()
+	readsFields = false;
+	if (Enabled==false) return -1;
+	readsFields = CheckTimestepAt(ts, psPos);
+	return NextIntervalAt(ts, psPos);
+}
+
 double* ProcessIntegral::CalcMultipleIntegrals()
 {
 	m_Results[0] = CalcIntegral();

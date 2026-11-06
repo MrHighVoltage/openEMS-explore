@@ -81,14 +81,18 @@ void Processing::SetName(string val, int number)
 
 bool Processing::CheckTimestep()
 {
-	unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+	return CheckTimestepAt(m_Eng_Interface->GetNumberOfTimesteps(), m_PS_pos);
+}
+
+bool Processing::CheckTimestepAt(unsigned int ts, size_t& psPos) const
+{
 	if (ts<startTS || ts>stopTS)
 		return false;
-	if (m_ProcessSteps.size()>m_PS_pos)
+	if (m_ProcessSteps.size()>psPos)
 	{
-		if (m_ProcessSteps.at(m_PS_pos)==ts)
+		if (m_ProcessSteps.at(psPos)==ts)
 		{
-			++m_PS_pos;
+			++psPos;
 			return true;
 		}
 	}
@@ -123,12 +127,17 @@ bool Processing::IsDueAt(unsigned int ts) const
 
 int Processing::GetNextInterval() const
 {
+	return NextIntervalAt(m_Eng_Interface->GetNumberOfTimesteps(), m_PS_pos);
+}
+
+int Processing::NextIntervalAt(unsigned int timestep, size_t psPos) const
+{
 	if (Enabled==false) return -1;
 	int next=INT_MAX;
-	int ts = (int)m_Eng_Interface->GetNumberOfTimesteps();
-	if (m_ProcessSteps.size()>m_PS_pos)
+	int ts = (int)timestep;
+	if (m_ProcessSteps.size()>psPos)
 	{
-		next = (int)m_ProcessSteps.at(m_PS_pos)-ts;
+		next = (int)m_ProcessSteps.at(psPos)-ts;
 	}
 	if (ProcessInterval!=0)
 	{
@@ -146,6 +155,13 @@ int Processing::GetNextInterval() const
 	}
 
 	return next;
+}
+
+int Processing::ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const
+{
+	// Process() is GetNextInterval(): it neither reads nor checks the timestep
+	readsFields = false;
+	return NextIntervalAt(ts, psPos);
 }
 
 void Processing::AddStep(unsigned int step)
@@ -388,6 +404,30 @@ bool ProcessingArray::IsDueAt(unsigned int ts) const
 		if (ProcessArray.at(i)->IsDueAt(ts))
 			return true;
 	return false;
+}
+
+std::vector<size_t> ProcessingArray::GetStepPositions() const
+{
+	std::vector<size_t> psPos(ProcessArray.size());
+	for (size_t i=0; i<ProcessArray.size(); ++i)
+		psPos[i] = ProcessArray.at(i)->GetStepPosition();
+	return psPos;
+}
+
+int ProcessingArray::ProcessAt(unsigned int ts, std::vector<size_t>& psPos, std::vector<char>& readsFields) const
+{
+	// as Process()
+	int nextProcess=maxInterval;
+	readsFields.assign(ProcessArray.size(), 0);
+	for (size_t i=0; i<ProcessArray.size(); ++i)
+	{
+		bool reads = false;
+		int step = ProcessArray.at(i)->ProcessAt(ts, psPos.at(i), reads);
+		readsFields[i] = reads;
+		if ((step>0) && (step<nextProcess))
+			nextProcess=step;
+	}
+	return nextProcess;
 }
 
 void ProcessingArray::PostProcess()

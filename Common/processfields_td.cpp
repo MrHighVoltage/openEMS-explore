@@ -97,6 +97,15 @@ void ProcessFieldsTD::FlushData()
 		m_HDF5_Dump_File->FlushFile();
 }
 
+int ProcessFieldsTD::ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const
+{
+	// as Process()
+	readsFields = false;
+	if (Enabled==false) return -1;
+	readsFields = CheckTimestepAt(ts, psPos);
+	return NextIntervalAt(ts, psPos);
+}
+
 int ProcessFieldsTD::Process()
 {
 	if (Enabled==false) return -1;

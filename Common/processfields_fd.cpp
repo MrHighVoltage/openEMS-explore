@@ -159,6 +159,16 @@ bool ProcessFieldsFD::InterpolateGPUDFT(const std::vector<std::complex<float>>& 
 	return true;
 }
 
+int ProcessFieldsFD::ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const
+{
+	// as Process(), and ProcessFieldsSAR::Process(): the fields are read at
+	// the samples of the DFT only
+	readsFields = false;
+	if (Enabled==false) return -1;
+	readsFields = CheckTimestepAt(ts, psPos) && (m_FD_Interval!=0) && (ts%m_FD_Interval==0);
+	return NextIntervalAt(ts, psPos);
+}
+
 int ProcessFieldsFD::Process()
 {
 	if (Enabled==false) return -1;

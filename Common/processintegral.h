@@ -56,6 +56,7 @@ public:
 
 	//! This method will write the TD and FD dump files using CalcIntegral() to calculate the integral parameter
 	virtual int Process();
+	virtual int ProcessAt(unsigned int ts, size_t& psPos, bool& readsFields) const;
 
 protected:
 	ProcessIntegral(Engine_Interface_Base* eng_if);
