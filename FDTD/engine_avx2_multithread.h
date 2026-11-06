@@ -107,6 +107,7 @@ protected:
 	virtual TemporalBlockingPlan PlanTemporalBlocking(const TemporalBlockingRequest& req) const;
 	virtual std::vector<TemporalBlockingRequest> TemporalBlockingCandidates(unsigned int maxDepth) const;
 	virtual bool IsCalibrating() const {return m_opt_speed;}
+	virtual long long GetBlockedTimesteps() const {return m_blk_blockedTS;}
 	//! Resolve m_blk_request to k, the tile width and the tile edges, or leave blocking disabled.
 	//! \a announce: print the result, unless m_blk_quiet.
 	void ConfigureTemporalBlocking(bool announce = true);
@@ -194,6 +195,7 @@ protected:
 	bool m_blk_active;       //!< workers take the trapezoidal path this batch
 	bool m_blk_rowSplit;     //!< split slab updates by y-row (OPENEMS_AVX2_TBLOCK_SPLIT)
 	bool m_blk_elide;        //!< skip or merge extension barriers (OPENEMS_AVX2_TBLOCK_ELIDE)
+	long long m_blk_blockedTS; //!< timesteps run in blocks of depth >= 2 (thread 0 counts)
 };
 
 #endif // ENGINE_AVX2_MULTITHREAD_H

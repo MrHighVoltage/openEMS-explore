@@ -30,23 +30,29 @@ public:
 	virtual void Init();
 	virtual void Reset();
 
-	virtual unsigned int GetNumberOfTimesteps() { return numTS; }
+	//! The generic in-batch sampling of Engine (plans/BATCH_SAMPLING.md).
+	virtual bool SupportsBatchSampling() const {return true;}
 
-	// Scalar element access (for post-processing / probes)
+	// Scalar element access (for post-processing / probes); a probe in a
+	// replay of in-batch sampling reads the sample instead (Engine::BatchRead()).
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v;}
 		return m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
 	{
+		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(0, n, pos[0], pos[1], pos[2], v)) return v;}
 		return m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
+		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(1, n, x, y, z, v)) return v;}
 		return m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
 	{
+		if (m_bsMode != BS_OFF) {FDTD_FLOAT v; if (BatchRead(1, n, pos[0], pos[1], pos[2], v)) return v;}
 		return m_curr[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
 	}
 

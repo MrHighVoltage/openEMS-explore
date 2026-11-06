@@ -76,6 +76,7 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	m_blk_k = 0;
 	m_blk_W = 0;
 	m_blk_active = false;
+	m_blk_blockedTS = 0;
 
 	// Synchronisation knobs of the blocked schedule, kept switchable so each
 	// can be measured against the old behaviour on the same binary.
@@ -718,6 +719,8 @@ void Engine_AVX2_Multithread::BlockedWorker(unsigned int threadID)
 		if (deferred)
 			SyncWait(threadID, SYNC_HOOK);
 
+		if ((threadID == 0) && (depth >= 2))
+			m_blk_blockedTS += depth;
 		done += depth;
 	}
 
