@@ -135,7 +135,7 @@ int Processing::NextIntervalAt(unsigned int timestep, size_t psPos) const
 	if (Enabled==false) return -1;
 	int next=INT_MAX;
 	int ts = (int)timestep;
-	if (m_ProcessSteps.size()>psPos)
+	if ((m_ProcessSteps.size()>psPos) && ((int)m_ProcessSteps.at(psPos)>ts))
 	{
 		next = (int)m_ProcessSteps.at(psPos)-ts;
 	}
