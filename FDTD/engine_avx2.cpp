@@ -276,6 +276,8 @@ void Engine_AVX2::FastEnergyFieldRows(bool currents, unsigned int first, unsigne
 {
 	const f8vector* fld = currents ? m_curr : m_volt;
 	const unsigned int ny = numLines[1] - 1;
+	if (ny == 0)
+		return;  // no rows; grids have >= 3 lines per direction, but do not divide by zero
 	unsigned int r = first;
 	unsigned int x = r / ny, y = r % ny;
 	// the base of row (x,y), advanced row by row without a division

@@ -3864,7 +3864,11 @@ bool Engine_Vulkan::SetupBatchSampling(unsigned int ring, bool energy)
 	const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	// The host reads the rings once per batch: a cached type keeps that an
-	// ordinary read, and keeps them out of a small BAR.
+	// ordinary read, and keeps them out of a small BAR. COHERENT is mandatory,
+	// not optional: FindMemoryTypeSoft requires every requested flag, so both
+	// attempts above can only return a coherent type, and the host reads after
+	// the fence wait in DrainGPU need no vkInvalidateMappedMemoryRanges. Do not
+	// drop COHERENT from `host` -- that would silently turn those reads stale.
 	auto makeRing = [&](GpuBuf& buf, float*& mapped, uint64_t floats) -> bool
 	{
 		if (floats == 0)
