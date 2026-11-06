@@ -2573,7 +2573,7 @@ void openEMS::RunFDTD()
 		const SampledBatch batch = planBatch(currTS, step);
 		const unsigned int batchTS = batch.ends.back() - currTS;
 		if (bench)
-			bench->NoteInterval((int)(FDTD_Eng->SamplesInsideBlocks() ? batchTS : batch.longestRun));
+			bench->NoteInterval((int)batch.longestRun, FDTD_Eng->SamplesInsideBlocks());
 		FDTD_Eng->ScheduleBatchSamples(batch.probeTS, batch.energyTS);
 		FDTD_Eng->IterateSampledTS(batchTS);
 		++bsStats.batches;

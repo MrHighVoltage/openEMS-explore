@@ -75,7 +75,13 @@ public:
 	//! \a step, shortened so that it does not run past Boundary().
 	int Clamp(int step, unsigned int currTS) const;
 	//! The main loop's next processing interval (PA->Process()); it caps the block depth.
-	void NoteInterval(int step);
+	/*!
+	  With in-batch sampling, \a step is the longest run between two samples
+	  of a batch, which caps it the same way, unless \a sampledInsideBlocks:
+	  the engine samples the probes inside its blocks
+	  (Engine::SamplesInsideBlocks()), and the probes cap nothing.
+	*/
+	void NoteInterval(int step, bool sampledInsideBlocks = false);
 	//! At Boundary(), with the engine idle: score the run that ended and start
 	//! the next. False once every run is done.
 	bool Advance(unsigned int currTS);
@@ -161,6 +167,7 @@ private:
 	double m_rate;             //!< timesteps per second of the last segment
 	double m_warmRate;         //!< timesteps per second at the end of the warm-up
 	unsigned int m_maxInterval; //!< longest processing interval seen; 0 = none
+	bool m_sampledInside;      //!< the probes are sampled inside the blocks: no interval caps the depth
 	TemporalBlockingRequest m_configured;
 	std::string m_noBlocking;  //!< why no blocked schedule applies, if none does
 
