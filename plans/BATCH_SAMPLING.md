@@ -11,7 +11,8 @@ bit-identical to the old loop's.
 
 This document is the design and the engine contract. The core (interface,
 generic implementation, main loop) and the AVX2 in-block sampler (§4.4) are
-done; the Vulkan engine is implemented against §4.5.
+done; the Vulkan engine is implemented against §4.5. §8 collects the
+behaviour changes and trade-offs an upstream port would have to decide on.
 
 ## 1. Status (2026-11-06)
 
@@ -769,10 +770,105 @@ Known limitations (documented, not bugs):
   `2·(ring+1)·(footprint+energy)` floats within its 64 MB budget, and a
   footprint of millions of cells takes ring=1 (16 B/cell, which may exceed the
   budget) — allocation failure falls back to host sampling.
-- Cross-version behaviour changes vs master `1922d00`, all intended: the GPU
-  per-x-plane energy sum changes the last digits of every GPU energy in both
-  loops; `08b444e` changes the CPU energy-check timesteps in the step-list edge
-  case; the old pipelined GPU loop checks the end criterion after its first
-  batch.
+- Cross-version behaviour changes vs master `1922d00`, all intended and kept
+  (decided 2026-11-07): see §8.
 - The intermediate flushes of the `*_FD` files and the 4 s status come at
   batch ends, i.e. less often than the old loop's ends could give them.
+
+## 8. For an upstream port: behaviour changes and trade-offs
+
+This fork is exploratory. What follows is what an implementation in upstream
+openEMS would have to decide, or would run into, beyond the design above.
+"Upstream" means `upstream/master` `5fecbb5`; "before" is the fork at
+`1922d00`.
+
+### 8.1 Behaviour changes vs `1922d00` (intended, kept)
+
+Probe values are never affected; what can move is *when* the end criterion is
+evaluated, and with it the stop timestep.
+
+**B1. A step-list entry no longer hides a processing's interval (`08b444e`,
+`Processing::NextIntervalAt()`, shared CPU/GPU).**
+- Before, and in upstream's `GetNextInterval()` (the same test): a step-list
+  entry equal to the current timestep gave an interval of 0, which
+  `ProcessingArray` ignores, so the processing's regular interval was lost
+  for that step. The standard loop processes before the end criteria advance
+  ProcField's step position, so at ProcField's `AddStep(maxExcite)` timestep
+  it skipped the next energy check on the Nyquist grid whenever nothing else
+  was due. Example (`dump_fails`, a run whose only dump disabled itself):
+  checks at 186 → 211 → 225 instead of 186 → 200.
+- After: an entry at or before the timestep is passed over; the check at 200
+  happens.
+- Why: the replay runs in the standard loop's order, the pipelined GPU loop
+  checks before it processes and did check there; with the quirk the two
+  disagreed, and identity between them could not hold.
+- Upstream: the quirk exists there too. Fixing it moves the stop timestep of
+  affected runs to an earlier, on-schedule energy check; leaving it keeps
+  upstream's results but an in-batch replay must then reproduce the skip.
+
+**B2. The old pipelined GPU loop checks the end criteria after its first
+batch (`b3640ac`, `openems.cpp`, `primeChecked`).**
+- Before: the pipelined loop (`OPENEMS_BATCH_SAMPLING=0`) skipped the check
+  at the end of its first batch, unlike the standard loop.
+- After: it checks there; the end-criterion trace gains that line (Dirac:
+  timestep 1), and a criterion met at the first batch end stops there instead
+  of one batch later.
+- Upstream: no pipelined loop; relevant only if one is ported, which should
+  check from the first batch on, as the standard loop does.
+
+**B3. The GPU energy is a per-x-plane sum (`5ff98ea`, `Engine_Vulkan`,
+`reduce_energy_planes.comp`; `reduce_energy.comp` removed).**
+- Before: 256 workgroups reduced the whole grid in one pass.
+- After: one float pair (|V|², |I|²) per x-plane and 4096-cell chunk, added
+  by the host in plane order in double; the steady-state checks use the same
+  pipeline.
+- Effect: the last digits of every GPU energy change, in both loops, so a
+  run whose criterion is met within rounding of a check can stop one check
+  earlier or later than at `1922d00`.
+- Why: a sample taken inside a batch must be the live value bit for bit, so
+  sampled and live energy share one pipeline and one summation order.
+- Upstream: the general rule carries over to any engine: whatever
+  `CalcFastEnergy()` computes, the in-batch energy sample must compute in
+  exactly the same order (the AVX2 engine does it with its row sums, §4.4).
+
+**B4. Temporal blocking is on by default in the AVX2 engine (`66e604b`).**
+Results are bit-identical to the flat sweep; only speed changes. The guards
+still run small grids and slab-incapable extensions flat;
+`--avx2-temporal-block=off` switches it off (`8c9c289` makes the log say so).
+
+### 8.2 Trade-offs of in-batch sampling itself
+
+None of these changes a probe value; all are in §3 and §7 in detail.
+
+- **Overshoot.** A run computes up to one batch (about 0.5 s of work; on the
+  GPU also a pipelined batch) past the stop the replay finds. The timesteps
+  reported (`Time for <n> iterations`, the end-criterion lines, `Speed`) are
+  the replayed ones, so `Speed` leaves the overshoot's work uncounted.
+- **Batch-end granularity** for everything wall-clock-driven: the status line,
+  the intermediate `*_FD` flushes, the abort check, and the relaxation of the
+  energy criterion after 60 s. Abort latency grows to one batch.
+- **Energy every timestep** (Dirac/step in the first 60 s, any run with
+  `--exact-endcriteria`) costs an extra pass while the data is in cache.
+- **Dumps still end a batch** (time-domain dumps on the GPU, frequency-domain
+  dumps on the CPU), so a dump every probe interval keeps batches as short as
+  before.
+- **A processing that changes its own schedule** (a dump that disables itself)
+  makes the replay leave the plan (§3.10); a sine run can then stop up to one
+  old-loop step earlier than the old loop.
+- **Memory**: the AVX2 energy-row buffer and the GPU ring (§7).
+
+### 8.3 Lessons for the implementation
+
+- **Keep the sampling test out of hot loops.** The record/replay test in
+  `GetVolt()`/`GetCurr()` calls an out-of-line `BatchRead()` that may write
+  memory. Inlined into the extensions' loops it made the compiler reload every
+  member per cell: the Mur ABC ran twice the instructions, and AVX2 runs with
+  Mur were 6 % slower until `298fc6b` gave the extensions
+  `GetVoltRaw()`/`GetCurrRaw()`. In upstream, which dispatches extensions the
+  same way (`ENG_DISPATCH`), test on the probe side only.
+- **Bit identity needs one summation order** for live and sampled energy (B3)
+  and the replay in the standard loop's order (B1).
+- **The footprint is recorded by a dry run of the processings.** A processing
+  that reads a cell it did not read in the dry run throws in a replay
+  (`std::logic_error`, the run is cancelled), so every probe type must read
+  through `GetVolt()`/`GetCurr()` and read the same cells every time.
