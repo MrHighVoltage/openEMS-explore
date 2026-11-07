@@ -149,7 +149,7 @@ void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesImpl(EngType* eng, unsigned in
 #endif
 	unsigned int **pos = m_Op_Ext_Deb->m_LM_pos[0];
 	PreVoltageEntries(perm, j0, j1,
-	                  [&](int n, unsigned int i) {return eng->EngType::GetVolt(n,pos[0][i],pos[1][i],pos[2][i]);});
+	                  [&](int n, unsigned int i) {return eng->EngType::GetVoltRaw(n,pos[0][i],pos[1][i],pos[2][i]);});
 }
 
 void Engine_Ext_DebyeMaterial::DoPreVoltageUpdates()
@@ -200,7 +200,7 @@ void Engine_Ext_DebyeMaterial::DoPostVoltageUpdatesImpl(EngType* eng, unsigned i
 #endif
 	unsigned int **pos = m_Op_Ext_Deb->m_LM_pos[0];
 	PostVoltageEntries(perm, j0, j1,
-	                   [&](int n, unsigned int i) {return eng->EngType::GetVolt(n,pos[0][i],pos[1][i],pos[2][i]);});
+	                   [&](int n, unsigned int i) {return eng->EngType::GetVoltRaw(n,pos[0][i],pos[1][i],pos[2][i]);});
 }
 
 void Engine_Ext_DebyeMaterial::DoPostVoltageUpdates()

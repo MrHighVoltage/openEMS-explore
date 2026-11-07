@@ -147,7 +147,7 @@ void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, int numTS, unsigned 
 	{
 		if (pos[0][pIdx] < startX || pos[0][pIdx] >= stopX)
 			continue;
-		Vd_0[pIdx] = eng->EngType::GetVolt(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx]);
+		Vd_0[pIdx] = eng->EngType::GetVoltRaw(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx]);
 	}
 
 	// Post process: Calculate node voltage with respect to the lumped RLC auxilliary quantity, J

@@ -264,11 +264,32 @@ inline void FastEnergyRowField4(const f8vector* fld, unsigned int b0, unsigned i
 }
 
 // Row (x,y) of the estimate: sum |V|^2 and sum |I|^2 over every z-vector.
+// Each accumulator takes the operations of FastEnergyRowField() in its order,
+// so the values are its values; one loop with two independent chains runs
+// about as fast as one of them alone.
 inline void FastEnergyRow(const f8vector* volt, const f8vector* curr, unsigned int base,
                           unsigned int nZv, double& e, double& h)
 {
-	e = (double)FastEnergyRowField(volt, base, nZv);
-	h = (double)FastEnergyRowField(curr, base, nZv);
+	__m256 accE = _mm256_setzero_ps();
+	__m256 accH = _mm256_setzero_ps();
+	for (unsigned int z = 0; z < nZv; ++z, base += 3)
+	{
+		const __m256 vx = _mm256_load_ps(volt[base].f);
+		const __m256 vy = _mm256_load_ps(volt[base + 1].f);
+		const __m256 vz = _mm256_load_ps(volt[base + 2].f);
+		accE = _mm256_fmadd_ps(vx, vx, accE);
+		accE = _mm256_fmadd_ps(vy, vy, accE);
+		accE = _mm256_fmadd_ps(vz, vz, accE);
+
+		const __m256 ix = _mm256_load_ps(curr[base].f);
+		const __m256 iy = _mm256_load_ps(curr[base + 1].f);
+		const __m256 iz = _mm256_load_ps(curr[base + 2].f);
+		accH = _mm256_fmadd_ps(ix, ix, accH);
+		accH = _mm256_fmadd_ps(iy, iy, accH);
+		accH = _mm256_fmadd_ps(iz, iz, accH);
+	}
+	e = (double)HorizontalSum(accE);
+	h = (double)HorizontalSum(accH);
 }
 }
 

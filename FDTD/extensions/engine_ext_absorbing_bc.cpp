@@ -231,8 +231,8 @@ void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int
 			pos_shift[m_nyPP] = pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
 			// E(i + s,n) - K1*E(i,n)
-			m_V_nyP (i,j) = eng->EngType::GetVolt(m_nyP ,pos_shift) - m_Op_ABC->m_K1_nyP (i,j) * eng->EngType::GetVolt(m_nyP ,pos);
-			m_V_nyPP(i,j) = eng->EngType::GetVolt(m_nyPP,pos_shift) - m_Op_ABC->m_K1_nyPP(i,j) * eng->EngType::GetVolt(m_nyPP,pos);
+			m_V_nyP (i,j) = eng->EngType::GetVoltRaw(m_nyP ,pos_shift) - m_Op_ABC->m_K1_nyP (i,j) * eng->EngType::GetVoltRaw(m_nyP ,pos);
+			m_V_nyPP(i,j) = eng->EngType::GetVoltRaw(m_nyPP,pos_shift) - m_Op_ABC->m_K1_nyPP(i,j) * eng->EngType::GetVoltRaw(m_nyPP,pos);
 		}
 
 	}
@@ -273,8 +273,8 @@ void Engine_Ext_Absorbing_BC::DoPostVoltageUpdatesImpl(EngType* eng, unsigned in
 
 			// E(i + s,n) - K1*E(i,n) + K1*E(i + s,n) =
 			// E(i + s,n) + [K1*E(i + s,n) - K1*E(i,n)]
-			m_V_nyP (i,j) += m_K1_nyP (i,j) * eng->EngType::GetVolt(m_nyP ,pos_shift);
-			m_V_nyPP(i,j) += m_K1_nyPP(i,j) * eng->EngType::GetVolt(m_nyPP,pos_shift);
+			m_V_nyP (i,j) += m_K1_nyP (i,j) * eng->EngType::GetVoltRaw(m_nyP ,pos_shift);
+			m_V_nyPP(i,j) += m_K1_nyPP(i,j) * eng->EngType::GetVoltRaw(m_nyPP,pos_shift);
 		}
 
 	}
@@ -356,8 +356,8 @@ void Engine_Ext_Absorbing_BC::DoPreCurrentUpdatesImpl(EngType* eng, unsigned int
 			pos_shift[m_nyPP] = pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
 			// H(i + s,n) - K1*H(i,n)
-			m_I_nyP (i,j) = eng->EngType::GetCurr(m_nyP ,pos_shift) - m_K1_nyP (i,j)*eng->EngType::GetCurr(m_nyP ,pos);
-			m_I_nyPP(i,j) = eng->EngType::GetCurr(m_nyPP,pos_shift) - m_K1_nyPP(i,j)*eng->EngType::GetCurr(m_nyPP,pos);
+			m_I_nyP (i,j) = eng->EngType::GetCurrRaw(m_nyP ,pos_shift) - m_K1_nyP (i,j)*eng->EngType::GetCurrRaw(m_nyP ,pos);
+			m_I_nyPP(i,j) = eng->EngType::GetCurrRaw(m_nyPP,pos_shift) - m_K1_nyPP(i,j)*eng->EngType::GetCurrRaw(m_nyPP,pos);
 		}
 	}
 
@@ -411,8 +411,8 @@ void Engine_Ext_Absorbing_BC::DoPostCurrentUpdatesImpl(EngType* eng, unsigned in
 			pos_shift[m_nyPP] = m_posStart[m_nyPP] + j;
 
 			// H(i + s,n) + K1*[H(i,n + 1) - H(i,n)]
-			m_I_nyP (i,j) += m_K1_nyP (i,j)*eng->EngType::GetCurr(m_nyP ,pos_shift);
-			m_I_nyPP(i,j) += m_K1_nyPP(i,j)*eng->EngType::GetCurr(m_nyPP,pos_shift);
+			m_I_nyP (i,j) += m_K1_nyP (i,j)*eng->EngType::GetCurrRaw(m_nyP ,pos_shift);
+			m_I_nyPP(i,j) += m_K1_nyPP(i,j)*eng->EngType::GetCurrRaw(m_nyPP,pos_shift);
 
 		}
 	}
@@ -453,8 +453,8 @@ void Engine_Ext_Absorbing_BC::Apply2CurrentImpl(EngType* eng, unsigned int iStar
 			pos[m_nyPP] = m_posStart[m_nyPP] + j;
 
 			// H(i + s,n) = (Hsa*K2 + Hc)/(1 + K2)
-			eng->EngType::SetCurr(m_nyP ,pos, (m_I_nyP (i,j)*m_K2_nyP (i,j) + eng->EngType::GetCurr(m_nyP ,pos))/(m_K2_nyP (i,j) + 1.0));
-			eng->EngType::SetCurr(m_nyPP,pos, (m_I_nyPP(i,j)*m_K2_nyPP(i,j) + eng->EngType::GetCurr(m_nyPP,pos))/(m_K2_nyPP(i,j) + 1.0));
+			eng->EngType::SetCurr(m_nyP ,pos, (m_I_nyP (i,j)*m_K2_nyP (i,j) + eng->EngType::GetCurrRaw(m_nyP ,pos))/(m_K2_nyP (i,j) + 1.0));
+			eng->EngType::SetCurr(m_nyPP,pos, (m_I_nyPP(i,j)*m_K2_nyPP(i,j) + eng->EngType::GetCurrRaw(m_nyPP,pos))/(m_K2_nyPP(i,j) + 1.0));
 
 
 		}

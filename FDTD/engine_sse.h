@@ -35,25 +35,31 @@ public:
 	virtual unsigned int GetNumberOfTimesteps() {return numTS;};
 
 	//this access functions muss be overloaded by any new engine using a different storage model
-	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return GetVoltRaw(n, x, y, z);}
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const {return GetVoltRaw(n, pos);}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return GetCurrRaw(n, x, y, z);}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const {return GetCurrRaw(n, pos);}
+
+	//! See Engine::GetVoltRaw().
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		ArrayLib::ArrayENG<f4vector>& f4_volt = *f4_volt_ptr;
 		return f4_volt(n, x, y, z%numVectors).f[z/numVectors];
 	}
 
-	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, const unsigned int pos[3]) const
 	{
 		ArrayLib::ArrayENG<f4vector>& f4_volt = *f4_volt_ptr;
 		return f4_volt(n, pos[0], pos[1], pos[2]%numVectors).f[pos[2]/numVectors];
 	}
 
-	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		ArrayLib::ArrayENG<f4vector>& f4_curr = *f4_curr_ptr;
 		return f4_curr(n, x, y, z%numVectors).f[z/numVectors];
 	}
 
-	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, const unsigned int pos[3]) const
 	{
 		ArrayLib::ArrayENG<f4vector>& f4_curr = *f4_curr_ptr;
 		return f4_curr(n, pos[0], pos[1], pos[2]%numVectors).f[pos[2]/numVectors];

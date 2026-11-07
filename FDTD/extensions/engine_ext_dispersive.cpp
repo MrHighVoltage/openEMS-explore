@@ -270,13 +270,13 @@ void Engine_Ext_Dispersive::Apply2VoltagesImpl(EngType* eng, unsigned int startX
 		{
 			const unsigned int i = perm ? perm[j] : j;
 			eng->EngType::SetVolt(0,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetVolt(0,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][0][i]
+				eng->EngType::GetVoltRaw(0,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][0][i]
 			);
 			eng->EngType::SetVolt(1,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetVolt(1,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][1][i]
+				eng->EngType::GetVoltRaw(1,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][1][i]
 			);
 			eng->EngType::SetVolt(2,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetVolt(2,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][2][i]
+				eng->EngType::GetVoltRaw(2,pos[0][i],pos[1][i],pos[2][i]) - volt_ADE[o][2][i]
 			);
 		}
 	}
@@ -347,13 +347,13 @@ void Engine_Ext_Dispersive::Apply2CurrentImpl(EngType* eng, unsigned int startX,
 		{
 			const unsigned int i = perm ? perm[j] : j;
 			eng->EngType::SetCurr(0,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetCurr(0,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][0][i]
+				eng->EngType::GetCurrRaw(0,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][0][i]
 			);
 			eng->EngType::SetCurr(1,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetCurr(1,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][1][i]
+				eng->EngType::GetCurrRaw(1,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][1][i]
 			);
 			eng->EngType::SetCurr(2,pos[0][i],pos[1][i],pos[2][i],
-				eng->EngType::GetCurr(2,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][2][i]
+				eng->EngType::GetCurrRaw(2,pos[0][i],pos[1][i],pos[2][i]) - curr_ADE[o][2][i]
 			);
 		}
 	}

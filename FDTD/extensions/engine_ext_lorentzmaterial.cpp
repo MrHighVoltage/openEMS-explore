@@ -152,15 +152,15 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng, unsigned 
 				const unsigned int i = perm ? perm[j] : j;
 				volt_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->v_Lor_ADE[o][0][i]*volt_ADE[o][0][i];
 				volt_ADE[o][0][i] *= m_Op_Ext_Lor->v_int_ADE[o][0][i];
-				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * (eng->EngType::GetVolt(0,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][0][i]);
+				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * (eng->EngType::GetVoltRaw(0,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][0][i]);
 
 				volt_Lor_ADE[o][1][i]+=m_Op_Ext_Lor->v_Lor_ADE[o][1][i]*volt_ADE[o][1][i];
 				volt_ADE[o][1][i] *= m_Op_Ext_Lor->v_int_ADE[o][1][i];
-				volt_ADE[o][1][i] += m_Op_Ext_Lor->v_ext_ADE[o][1][i] * (eng->EngType::GetVolt(1,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][1][i]);
+				volt_ADE[o][1][i] += m_Op_Ext_Lor->v_ext_ADE[o][1][i] * (eng->EngType::GetVoltRaw(1,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][1][i]);
 
 				volt_Lor_ADE[o][2][i]+=m_Op_Ext_Lor->v_Lor_ADE[o][2][i]*volt_ADE[o][2][i];
 				volt_ADE[o][2][i] *= m_Op_Ext_Lor->v_int_ADE[o][2][i];
-				volt_ADE[o][2][i] += m_Op_Ext_Lor->v_ext_ADE[o][2][i] * (eng->EngType::GetVolt(2,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][2][i]);
+				volt_ADE[o][2][i] += m_Op_Ext_Lor->v_ext_ADE[o][2][i] * (eng->EngType::GetVoltRaw(2,pos[0][i],pos[1][i],pos[2][i])-volt_Lor_ADE[o][2][i]);
 			}
 		}
 		else
@@ -169,13 +169,13 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng, unsigned 
 			{
 				const unsigned int i = perm ? perm[j] : j;
 				volt_ADE[o][0][i] *= m_Op_Ext_Lor->v_int_ADE[o][0][i];
-				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * eng->EngType::GetVolt(0,pos[0][i],pos[1][i],pos[2][i]);
+				volt_ADE[o][0][i] += m_Op_Ext_Lor->v_ext_ADE[o][0][i] * eng->EngType::GetVoltRaw(0,pos[0][i],pos[1][i],pos[2][i]);
 
 				volt_ADE[o][1][i] *= m_Op_Ext_Lor->v_int_ADE[o][1][i];
-				volt_ADE[o][1][i] += m_Op_Ext_Lor->v_ext_ADE[o][1][i] * eng->EngType::GetVolt(1,pos[0][i],pos[1][i],pos[2][i]);
+				volt_ADE[o][1][i] += m_Op_Ext_Lor->v_ext_ADE[o][1][i] * eng->EngType::GetVoltRaw(1,pos[0][i],pos[1][i],pos[2][i]);
 
 				volt_ADE[o][2][i] *= m_Op_Ext_Lor->v_int_ADE[o][2][i];
-				volt_ADE[o][2][i] += m_Op_Ext_Lor->v_ext_ADE[o][2][i] * eng->EngType::GetVolt(2,pos[0][i],pos[1][i],pos[2][i]);
+				volt_ADE[o][2][i] += m_Op_Ext_Lor->v_ext_ADE[o][2][i] * eng->EngType::GetVoltRaw(2,pos[0][i],pos[1][i],pos[2][i]);
 			}
 		}
 	}
@@ -273,15 +273,15 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng, unsigned 
 				const unsigned int i = perm ? perm[j] : j;
 				curr_Lor_ADE[o][0][i]+=m_Op_Ext_Lor->i_Lor_ADE[o][0][i]*curr_ADE[o][0][i];
 				curr_ADE[o][0][i] *= m_Op_Ext_Lor->i_int_ADE[o][0][i];
-				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * (eng->EngType::GetCurr(0,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][0][i]);
+				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * (eng->EngType::GetCurrRaw(0,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][0][i]);
 
 				curr_Lor_ADE[o][1][i]+=m_Op_Ext_Lor->i_Lor_ADE[o][1][i]*curr_ADE[o][1][i];
 				curr_ADE[o][1][i] *= m_Op_Ext_Lor->i_int_ADE[o][1][i];
-				curr_ADE[o][1][i] += m_Op_Ext_Lor->i_ext_ADE[o][1][i] * (eng->EngType::GetCurr(1,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][1][i]);
+				curr_ADE[o][1][i] += m_Op_Ext_Lor->i_ext_ADE[o][1][i] * (eng->EngType::GetCurrRaw(1,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][1][i]);
 
 				curr_Lor_ADE[o][2][i]+=m_Op_Ext_Lor->i_Lor_ADE[o][2][i]*curr_ADE[o][2][i];
 				curr_ADE[o][2][i] *= m_Op_Ext_Lor->i_int_ADE[o][2][i];
-				curr_ADE[o][2][i] += m_Op_Ext_Lor->i_ext_ADE[o][2][i] * (eng->EngType::GetCurr(2,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][2][i]);
+				curr_ADE[o][2][i] += m_Op_Ext_Lor->i_ext_ADE[o][2][i] * (eng->EngType::GetCurrRaw(2,pos[0][i],pos[1][i],pos[2][i])-curr_Lor_ADE[o][2][i]);
 			}
 		}
 		else
@@ -290,13 +290,13 @@ void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng, unsigned 
 			{
 				const unsigned int i = perm ? perm[j] : j;
 				curr_ADE[o][0][i] *= m_Op_Ext_Lor->i_int_ADE[o][0][i];
-				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * eng->EngType::GetCurr(0,pos[0][i],pos[1][i],pos[2][i]);
+				curr_ADE[o][0][i] += m_Op_Ext_Lor->i_ext_ADE[o][0][i] * eng->EngType::GetCurrRaw(0,pos[0][i],pos[1][i],pos[2][i]);
 
 				curr_ADE[o][1][i] *= m_Op_Ext_Lor->i_int_ADE[o][1][i];
-				curr_ADE[o][1][i] += m_Op_Ext_Lor->i_ext_ADE[o][1][i] * eng->EngType::GetCurr(1,pos[0][i],pos[1][i],pos[2][i]);
+				curr_ADE[o][1][i] += m_Op_Ext_Lor->i_ext_ADE[o][1][i] * eng->EngType::GetCurrRaw(1,pos[0][i],pos[1][i],pos[2][i]);
 
 				curr_ADE[o][2][i] *= m_Op_Ext_Lor->i_int_ADE[o][2][i];
-				curr_ADE[o][2][i] += m_Op_Ext_Lor->i_ext_ADE[o][2][i] * eng->EngType::GetCurr(2,pos[0][i],pos[1][i],pos[2][i]);
+				curr_ADE[o][2][i] += m_Op_Ext_Lor->i_ext_ADE[o][2][i] * eng->EngType::GetCurrRaw(2,pos[0][i],pos[1][i],pos[2][i]);
 			}
 		}
 	}

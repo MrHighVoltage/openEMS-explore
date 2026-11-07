@@ -55,6 +55,11 @@
 //
 // This is not pretty but it significantly reduces code duplication.
 //
+// The Impl functions read with eng->EngType::GetVoltRaw()/GetCurrRaw(), not
+// GetVolt()/GetCurr(): those test for in-batch sampling first, and the call
+// behind that test makes the compiler reload every member and coefficient
+// array at every cell of the loop (Engine::GetVoltRaw()).
+//
 // In the future, all Extensions should probably be eventually converted be
 // templates.
 

@@ -38,21 +38,39 @@ public:
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v;}
-		return m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+		return GetVoltRaw(n, x, y, z);
 	}
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
 	{
 		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(0, n, pos[0], pos[1], pos[2], v)) return v;}
-		return m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
+		return GetVoltRaw(n, pos);
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(1, n, x, y, z, v)) return v;}
-		return m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+		return GetCurrRaw(n, x, y, z);
 	}
 	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
 	{
 		if (OPENEMS_BS_UNLIKELY(m_bsMode != BS_OFF)) {FDTD_FLOAT v; if (BatchRead(1, n, pos[0], pos[1], pos[2], v)) return v;}
+		return GetCurrRaw(n, pos);
+	}
+
+	//! See Engine::GetVoltRaw(): without the test, for the extensions' updates.
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		return m_volt[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+	}
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, const unsigned int pos[3]) const
+	{
+		return m_volt[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
+	}
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	{
+		return m_curr[n + (z % numVectors) * m_vs_z + y * m_vs_y + x * m_vs_x].f[z / numVectors];
+	}
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, const unsigned int pos[3]) const
+	{
 		return m_curr[n + (pos[2] % numVectors) * m_vs_z + pos[1] * m_vs_y + pos[0] * m_vs_x].f[pos[2] / numVectors];
 	}
 

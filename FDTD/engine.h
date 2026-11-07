@@ -29,7 +29,7 @@
 
 #include "tools/arraylib/array_nijk.h"
 
-//! The test of GetVolt()/GetCurr() for in-batch sampling, off the hot path (dumps and extensions read through them too).
+//! The test of GetVolt()/GetCurr() for in-batch sampling, off the hot path (dumps read through them too; extensions use GetVoltRaw()/GetCurrRaw()).
 #if defined(__GNUC__)
 #define OPENEMS_BS_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
@@ -111,7 +111,8 @@ public:
 	    if (m_bsMode != BS_OFF) { FDTD_FLOAT v; if (BatchRead(0, n, x, y, z, v)) return v; }
 	    \endcode
 	    and its GetCurr() the same with field 1; its GetNumberOfTimesteps()
-	    is this one.
+	    is this one. Its GetVoltRaw()/GetCurrRaw() are the same without
+	    the test: the extensions' updates read through them.
 	  - IterateSampledTS(iterTS) runs iterTS timesteps like IterateTS(), and
 	    for every timestep t of the schedule (ScheduleBatchSamples()) stores
 	    - in BatchProbeSample(i), i the index of t in the probe list, for
@@ -202,25 +203,39 @@ public:
 	//@}
 
 	//this access functions muss be overloaded by any new engine using a different storage model
-	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return GetVoltRaw(n, x, y, z);}
+	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const {return GetVoltRaw(n, pos);}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return GetCurrRaw(n, x, y, z);}
+	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const {return GetCurrRaw(n, pos);}
+
+	//! The live field, without the in-batch sampling test of GetVolt()/GetCurr().
+	/*!
+	  For the updates of the extensions (engine_extension_dispatcher.h), which
+	  run inside IterateTS() only, where no probe is recorded or replayed. In
+	  their loops the test's possible call to BatchRead() would make the
+	  compiler reload every member and coefficient array at every cell.
+	  Not virtual: an engine with its own storage model defines them next to
+	  its GetVolt()/GetCurr(), or EngType::GetVoltRaw() reads the base storage.
+	*/
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt = *volt_ptr;
 		return volt(n,x,y,z);
 	}
 
-	inline virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const
+	inline FDTD_FLOAT GetVoltRaw(unsigned int n, const unsigned int pos[3]) const
 	{
 		ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt = *volt_ptr;
 		return volt(n, pos[0], pos[1], pos[2]);
 	}
 
-	inline virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
 	{
 		ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr = *curr_ptr;
 		return curr(n,x,y,z);
 	}
 
-	inline virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const
+	inline FDTD_FLOAT GetCurrRaw(unsigned int n, const unsigned int pos[3]) const
 	{
 		ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr = *curr_ptr;
 		return curr(n, pos[0], pos[1], pos[2]);

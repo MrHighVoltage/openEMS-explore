@@ -187,11 +187,11 @@ void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, unsigned int iSta
 			pos[m_nyPP] = j;
 			pos_shift[m_nyPP] = j;
 
-			m_volt_nyP(i,j) = eng->EngType::GetVolt(m_nyP, pos_shift) -
-				m_Op_mur->m_Mur_Coeff_nyP(i,j) * eng->EngType::GetVolt(m_nyP, pos);
+			m_volt_nyP(i,j) = eng->EngType::GetVoltRaw(m_nyP, pos_shift) -
+				m_Op_mur->m_Mur_Coeff_nyP(i,j) * eng->EngType::GetVoltRaw(m_nyP, pos);
 
-			m_volt_nyPP(i,j) = eng->EngType::GetVolt(m_nyPP, pos_shift) -
-				m_Op_mur->m_Mur_Coeff_nyPP(i,j) * eng->EngType::GetVolt(m_nyPP, pos);
+			m_volt_nyPP(i,j) = eng->EngType::GetVoltRaw(m_nyPP, pos_shift) -
+				m_Op_mur->m_Mur_Coeff_nyPP(i,j) * eng->EngType::GetVoltRaw(m_nyPP, pos);
 		}
 	}
 }
@@ -229,9 +229,9 @@ void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesImpl(EngType* eng, unsigned int iSt
 			pos_shift[m_nyPP] = j;
 
 			m_volt_nyP(i,j) +=
-				m_Op_mur->m_Mur_Coeff_nyP(i,j) * eng->EngType::GetVolt(m_nyP, pos_shift);
+				m_Op_mur->m_Mur_Coeff_nyP(i,j) * eng->EngType::GetVoltRaw(m_nyP, pos_shift);
 			m_volt_nyPP(i,j) +=
-				m_Op_mur->m_Mur_Coeff_nyPP(i,j) * eng->EngType::GetVolt(m_nyPP, pos_shift);
+				m_Op_mur->m_Mur_Coeff_nyPP(i,j) * eng->EngType::GetVoltRaw(m_nyPP, pos_shift);
 		}
 	}
 }

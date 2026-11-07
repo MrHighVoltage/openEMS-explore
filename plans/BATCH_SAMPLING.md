@@ -397,6 +397,13 @@ fields.
    `GetCurr()` the same with field 1. `BatchRead()` records in `BS_RECORD`
    (and returns false: read live), serves the sample in `BS_REPLAY`, and throws
    for a cell outside the footprint or a timestep without a probe sample.
+   `GetVoltRaw()`/`GetCurrRaw()` are the same reads without that test, and the
+   extensions' updates (`eng->EngType::GetVoltRaw()` in the dispatcher's Impl
+   functions) use them: they run only inside `IterateTS()`, where nothing is
+   recorded or replayed. With the test inlined into their loops, the possible
+   call to `BatchRead()` made the compiler reload every member and coefficient
+   array per cell. On the AVX2 engine the Mur ABC ran twice the instructions,
+   and flat runs with Mur were 6 % slower than at `1922d00`.
 3. `GetNumberOfTimesteps()` is `Engine`'s (the replayed timestep in a replay),
    or calls it.
 4. `IterateSampledTS(iterTS)` runs `iterTS` timesteps, leaving the fields
@@ -499,8 +506,9 @@ comment block "In-batch sampling inside the schedules"):
   slots `i, i+n, ...` into `SetBatchEnergySample()`. No barrier after: the next
   block writes rows only past its first update barrier. A sample is therefore
   `CalcFastEnergy()` of its timestep bit for bit, for every thread count, tile
-  and split. **The flat summation order is unchanged** (`FastEnergyRow()` now
-  calls the one-field helper twice; same operations per accumulator), and
+  and split. **The flat summation order is unchanged** (`FastEnergyRow()`
+  keeps its one loop with two accumulators, each with the one-field helper's
+  operations in its order; calling the helper twice was 5 % slower), and
   steady-state detection, which keeps `FastEnergyRows()`, is untouched.
 - **Flat schedule.** The flat worker samples after `Apply2Current()` of each
   timestep, every thread the footprint cells and rows of its own x-lines, then
