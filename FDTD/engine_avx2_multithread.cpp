@@ -103,6 +103,7 @@ Engine_AVX2_Multithread::Engine_AVX2_Multithread(const Operator_AVX2_Multithread
 	// cache; <k>:<W> sets both by hand. --avx2-temporal-block replaces it
 	// (openEMS::SetupFDTD()).
 	m_blk_quiet = false;
+	m_blk_announced = false;
 	if (const char* env = std::getenv("OPENEMS_AVX2_TEMPORAL_BLOCK"))
 	{
 		if (!TemporalBlockingRequest::Parse(env, m_blk_request))
@@ -310,6 +311,10 @@ void Engine_AVX2_Multithread::ConfigureTemporalBlocking(bool announce)
 		     << ", tile width " << m_blk_W << " x-lines, " << plan.detail << endl;
 	else if (!plan.why.empty())
 		cout << "AVX2 temporal blocking: disabled, " << plan.why << endl;
+	else if (m_blk_announced)
+		// switched off after the engine announced its default (--avx2-temporal-block=off)
+		cout << "AVX2 temporal blocking: off" << endl;
+	m_blk_announced = plan.active;
 }
 
 bool Engine_AVX2_Multithread::SetTemporalBlocking(const TemporalBlockingRequest& req, bool announce)

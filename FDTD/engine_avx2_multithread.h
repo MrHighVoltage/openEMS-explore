@@ -219,6 +219,7 @@ protected:
 	// --- temporal blocking state (read by every worker; fixed while a batch runs) ---
 	TemporalBlockingRequest m_blk_request; //!< as asked for: option or environment; AUTO is off
 	bool m_blk_quiet;        //!< resolve without printing (--benchmark switching schedules)
+	bool m_blk_announced;    //!< the last announcement said ACTIVE
 	unsigned int m_blk_k;    //!< timesteps advanced per block; 0 disables blocking
 	unsigned int m_blk_W;    //!< tile width in x-planes
 	//! Tile boundaries: cores are consecutive pairs, wedges the interior entries.
