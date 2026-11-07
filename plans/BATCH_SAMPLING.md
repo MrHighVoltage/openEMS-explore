@@ -126,6 +126,23 @@ merged with the core's review fixes (`2ad8c61`) and the AVX2 work (`aef7da4`):
     timesteps, the energy every timestep: old loop flat 3296, old blocked
     3283 (runs flat), new flat 3989, new blocked **8135**; Gaussian, probes
     every 6, 3000 timesteps: 5007, 9126, 5213, **10167**.
+- **Benchmarked on the RX 7900 XTX** (computeQ1, 2026-11-07, idle card;
+  `benchmark/tb-all-exc-20261106/computeq1-xtx/`): `1922d00` against `42d0aea`,
+  240³ Mur, 30 000 timesteps, 3 interleaved rounds, median MC/s:
+
+  | model | 1922d00 flat | 1922d00 blocked | old loop flat | new flat | new blocked |
+  |---|---|---|---|---|---|
+  | Dirac | 7259 | 7272 | 5627 (7224*) | 7630 | **21335** |
+  | step | 7258 | 7261 | 5624 | 7630 | **21355** |
+  | Gauss OS=8 | 9519 | 20508 | 9350 | 9717 | **24922** |
+  | Gauss OS=1 | 9591 | 22084 | 9414 (9580*) | 9729 | **24964** |
+  | sine+SSD | 9444 | 21899 | 9442 | 9557 | **24317** |
+
+  The new blocked runs are 2.57–2.94× `1922d00` flat and 1.11–2.94× its
+  blocked runs. Old and new loop, flat and blocked are bit-identical; against
+  `1922d00` every probe value is equal at the digits it prints. The old loop's
+  Dirac/step loss (also 15 % on the RX 6800) was the energy partials' uncached
+  memory, fixed by `d9a92c0` (* = with it; §8.1 B3).
 - **Not done.**
   - §6 below still describes the AVX2 state before its in-block sampler;
     §1 has the later results.
@@ -770,6 +787,9 @@ Known limitations (documented, not bugs):
   `2·(ring+1)·(footprint+energy)` floats within its 64 MB budget, and a
   footprint of millions of cells takes ring=1 (16 B/cell, which may exceed the
   budget) — allocation failure falls back to host sampling.
+- The steady-state checks' per-plane partials (`m_steadyEnergy`) are still in
+  the uncached type that cost the live energy 1 ms a check (§8.1 B3); they
+  are read once per period, as in `1922d00`. Not measured.
 - Cross-version behaviour changes vs master `1922d00`, all intended and kept
   (decided 2026-11-07): see §8.
 - The intermediate flushes of the `*_FD` files and the 4 s status come at
@@ -825,6 +845,14 @@ batch (`b3640ac`, `openems.cpp`, `primeChecked`).**
 - Effect: the last digits of every GPU energy change, in both loops, so a
   run whose criterion is met within rounding of a check can stop one check
   earlier or later than at `1922d00`.
+- Cost, found on the RX 7900 XTX and fixed in `d9a92c0`: a live check reads
+  `2·NX·ceil(NY·NZ/4096)` floats (7200 on 240³) where `1922d00` read 512, and
+  it read them from RADV's uncached `HOST_VISIBLE|HOST_COHERENT` type: about
+  1 ms per check. The old loop checks Dirac and step every timestep (the
+  first 60 s) and ran 22.5 % below `1922d00` (5627 against 7259 MC/s; 15 %
+  on the RX 6800). With the buffer in `HOST_CACHED` memory, as the sampling
+  rings already were, it runs at 7224, and the Gaussian at 9580 against 9587.
+  In-batch sampling never paid it: its partials come from the cached ring.
 - Why: a sample taken inside a batch must be the live value bit for bit, so
   sampled and live energy share one pipeline and one summation order.
 - Upstream: the general rule carries over to any engine: whatever
@@ -868,6 +896,10 @@ None of these changes a probe value; all are in §3 and §7 in detail.
   same way (`ENG_DISPATCH`), test on the probe side only.
 - **Bit identity needs one summation order** for live and sampled energy (B3)
   and the replay in the standard loop's order (B1).
+- **A finer summation order means more partials for the host to read.** Put
+  every buffer the host reads in host-cached memory where the device has such
+  a type: from uncached memory the per-plane partials cost 1 ms a check (B3).
+  Benchmark the old loop too: the regression showed only there.
 - **The footprint is recorded by a dry run of the processings.** A processing
   that reads a cell it did not read in the dry run throws in a replay
   (`std::logic_error`, the run is cancelled), so every probe type must read
