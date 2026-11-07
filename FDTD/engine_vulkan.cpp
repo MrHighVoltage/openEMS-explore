@@ -7577,9 +7577,17 @@ void Engine_Vulkan::SetupGPU_EnergyReduction()
 	                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	// The reduction writes a few KiB. Keep that output directly CPU-visible
-	// even when the large field buffers stay in device-local memory on a dGPU.
-	CreateGpuBuf(m_energyPartialBuf, partialSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVisible);
+	// even when the large field buffers stay in device-local memory on a dGPU,
+	// and cached where the device has such a type, as the sampling rings are
+	// (SetupBatchSampling(), also for why COHERENT stays required): the host
+	// reads every float of it at each live check, every timestep for Dirac and
+	// step in the old pipelined loop. From RADV's uncached type the 7200 floats
+	// of a 240^3 grid took about 1 ms per check on an RX 7900 XTX.
+	if (!TryCreateBufferWithMemory(partialSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	                               hostVisible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+	                               m_energyPartialBuf.buffer, m_energyPartialBuf.memory))
+		CreateGpuBuf(m_energyPartialBuf, partialSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVisible);
 	VK_CHECK(vkMapMemory(m_device, m_energyPartialBuf.memory, 0, partialSize, 0,
 	                     (void**)&m_energyMapped));
 	// Descriptor layout: 3 bindings (volt, curr, partials)
