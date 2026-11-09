@@ -89,13 +89,15 @@ This is the one-page answer. §2 onward is the detail and the method.
 
 ### 1.2 Where it does not help, or actively hurts
 
-- **The AVX2 multithreaded engine is 5–10% slower than upstream's SSE engine on
+- **The AVX2 multithreaded engine is 5–17% slower than upstream's SSE engine on
   PML models once the cores can saturate memory** — the i9-13900K at 8 threads
   and the Ryzen 5 5600G at 4, both without blocking. Both engines are
-  bandwidth-bound there and the wider footprint buys nothing. On the four-core
-  i7-6700K the comparison never inverts — AVX2 stays 9–13% ahead — so this is a
-  memory-system effect, not a kernel defect (§3.4). Practical guidance: on a
-  PML-dominated model with no blocking, prefer `--engine=multithreaded`.
+  bandwidth-bound there, and in the AVX2 layout the z-normal PML slabs touch
+  twice the bytes they touch in the SSE layout. On the four-core i7-6700K the
+  comparison never inverts — AVX2 stays 9–13% ahead. Temporal blocking, on by
+  default since `66e604b`, removes the cost (§3.4). Practical guidance: on a
+  PML-dominated model with blocking switched off, prefer
+  `--engine=multithreaded`.
 - **CPU temporal blocking needs a large, undivided last-level cache.** On the
   i7-6700K's 8 MB L3 the gains collapse to **1.05×–1.42×** and the Mur model
   **regresses 13%** (0.87×), because the tile shrinks to what the cache allows
@@ -458,8 +460,8 @@ The 1.51–2.59× on PEC is close to what doubling the vector width can give. On
 the i9-13900K the PML rows drop to 1.31–1.34× because the PML passes are a
 larger share of the work and vectorize less well — see §3.4, where this becomes
 a problem at high thread counts. On the i7-6700K the same rows hold
-1.65–1.77×, which is the clearest single sign that §3.4 is a memory-system
-effect and not a property of the kernel: the slower machine, with proportionally
+1.65–1.77×, which is the clearest single sign that the cost in §3.4 needs a
+saturated memory system to show: the slower machine, with proportionally
 more compute per byte of bandwidth, keeps the vector win the faster machine
 loses. The Ryzen 5 5600G sits between them at 1.42–1.58× on PML — and note that
 its *single-threaded* ratios are the lowest of the three on the large grids
@@ -543,26 +545,101 @@ single-threaded on the same model.
 | 224³ PML_8 | Ryzen 5 5600G, 4t | 164 | 152 | 354 |
 | 224³ PEC | Ryzen 5 5600G, 4t | 429 | 432 | 1062 |
 
-Both engines are bandwidth-bound there, and the AVX2 kernel's wider per-lane
-footprint buys nothing once DRAM sets the pace, while its PML passes cost
-slightly more. The Ryzen 5 5600G reproduces the i9-13900K's inversion almost
-exactly — **7% down** on both PML models, level on PEC — which is the useful
-part: it is not a many-core effect. Four Zen 3 cores on dual-channel DDR4
+The full fork-against-upstream benchmark of 2026-11-04 (§5.11, blocking off in
+every run) found the same at sizes M and L on the i9-13900K: **0.83–0.88×**
+upstream on the three PML cases (pml, inhomogeneous, antenna), 1.00× on the PEC
+case.
+
+Both engines are bandwidth-bound there; the PEC rows show that their main
+kernels then run level. The Ryzen 5 5600G reproduces the i9-13900K's inversion
+almost exactly — **7% down** on both PML models, level on PEC — which is the
+useful part: it is not a many-core effect. Four Zen 3 cores on dual-channel DDR4
 saturate their memory system as thoroughly as eight P-cores saturate DDR5, and
-the inversion follows the saturation, not the core count.
+the inversion follows the saturation, not the core count. The **i7-6700K never
+inverts** — 164 vs 146 and 183 vs 168 MC/s, the AVX2 engine ahead by 9–13% on
+exactly the models where it falls behind on the other two hosts. Four Skylake
+cores cannot saturate DDR4 the way four Zen 3 cores can, so the crossover never
+happens.
 
-That this is a memory-system effect and not a kernel defect is confirmed from
-the other side by the **i7-6700K, where the same comparison never inverts** —
-164 vs 146 and 183 vs 168 MC/s, the AVX2 engine ahead by 9–13% on exactly the
-models where it falls behind on the other two hosts. Four Skylake cores cannot
-saturate DDR4 the way four Zen 3 cores can, so the crossover never happens.
+**Why: the z-normal PML slabs touch twice the bytes.** This section first said
+only that the AVX2 kernel's "wider per-lane footprint" buys nothing once DRAM
+sets the pace. The bytes that make the difference are in the UPML passes. Both
+engines split the z axis into lanes: with nv vectors along z, one vector holds
+the cells z, z+nv, z+2nv, …, and the three components of a vector index sit
+side by side (I-J-K-N; upstream's `ArrayENG` is ordered the same way). A PML
+slab at z = 0…8 is therefore lane 0 of vectors 0…8, and the slab at the top is
+the last lane of the last nine vectors. A vector triple is 96 B in the AVX2
+layout and 48 B in the SSE one. Per x-y row of a 200-line grid (2400 B per
+field in both layouts), the two z-normal slabs touch:
 
-The right fix is not more vectorization — temporal blocking removes the
-constraint entirely and takes the same cases to 800–828 and 340–354 MC/s.
+| | bytes per row touched by the two z-slabs | of which PML cells |
+|---|---|---|
+| AVX2 (8 lanes) | 1728 (72 % of the row) | 216 |
+| SSE (4 lanes) | 864 (36 %) | 216 |
 
-**Practical guidance:** on a PML-dominated model, without temporal blocking, on
-any host whose cores can saturate its memory system, `--engine=multithreaded`
-is the better choice.
+The four x- and y-normal boxes span the full z range, so there both engines
+touch only PML cells, and the AVX2 engine updates them as whole vectors
+(`08fa968`). The two z-normal slabs stay scalar in both engines;
+`engine_ext_upml_avx2.cpp` explains why a masked vector path would save no
+instructions. It would not save the bytes either: they follow from the layout.
+
+UPML updates each box in four passes per timestep, before and after the E and
+the H update, apart from the main sweep. Between two passes the main sweep
+streams the whole grid through the cache, so the slab lines come from DRAM and
+go back dirty. Where the cores cannot saturate the DRAM, as single-threaded or
+on the i7-6700K, the extra bytes cost little and the wider vectors win. Once
+they do, the main kernels run level and the fork pays for the extra bytes.
+
+**How much of the gap that explains.** Estimated from the code and the measured
+speeds, not measured with counters: per row of the z-slabs the AVX2 layout
+touches 864 B more per pass, read and written back, in four passes, so about
+6.9 kB more per timestep. On the i9-13900K:
+
+| model | z-slab rows | extra bytes per timestep | measured gap per timestep | bandwidth that would take |
+|---|---|---|---|---|
+| pml M (200³), 2026-11-04 | 33 124 | 229 MB | 4.9 ms | 46 GB/s |
+| pml L (311³), 2026-11-04 | 85 849 | 593 MB | 13.4 ms | 44 GB/s |
+| inhomogeneous M, 2026-11-04 | 33 124 | 229 MB | 5.3 ms | 43 GB/s |
+| inhomogeneous L, 2026-11-04 | 85 849 | 593 MB | 14.6 ms | 41 GB/s |
+| 224³ PML_8, table above | 42 436 | 293 MB | 4.5 ms | 65 GB/s |
+| 160×128×192 PML_8, table above | 15 620 | 108 MB | 0.7 ms | 146 GB/s |
+
+The i9-13900K reads about 48 GB/s from DRAM (OPTIMIZATIONS.md §4.5). For the
+rows of 2026-11-04 the extra bytes at 85–96 % of that account for the whole
+gap. For the two older models the estimate is 1.4–3× the measured gap, so not
+all of those bytes reach DRAM there: each z-slab of the 160×128×192 model
+covers 13.5 MB of a field in the AVX2 layout, small enough for part of it to
+stay in the 36 MB L3. On the Ryzen 5 5600G both models would need about
+54 GB/s, more than the 51 GB/s peak of dual-channel DDR4-3200, the fastest
+memory that CPU supports, so the same holds there. The two older rows also come
+from older builds of both programs (upstream `d3d2a49`, the fork of September).
+What share of the slab traffic reaches DRAM was not measured. The antenna case
+of 2026-11-04 is not in the current case set, so its rows were not counted.
+
+**What removes it.** Not more vectorization. Temporal blocking runs every
+extension's hooks per slab while the slab is in cache, so the slab lines no
+longer come from DRAM. It takes the models above to 800–828 and 340–354 MC/s,
+and the 2026-11-04 cases to 2.9–3.9× upstream's speed in that benchmark
+(§5.11). Since `66e604b` blocking is on by default, and every extension on a
+Cartesian mesh supports the blocked schedule (the absorbing boundary on the
+domain faces, where it sits), so at M and L the flat sweep, and with it this
+deficit, is left mainly to runs with blocking switched off. Without blocking,
+running the UPML hooks per row or per x-slab inside the flat sweep would remove
+the separate passes over all six boxes. Upstream pays those passes too, so that
+should put the flat AVX2 engine ahead on PML, not just level. It is not
+implemented or measured.
+
+**For an upstream port.** The deficit comes with the AVX2 engine and its
+layout, not with blocking. Ported without blocking, the AVX2 engine would run
+PML models 12–17 % slower than upstream's SSE engine on grids that do not fit
+in the cache, on hosts whose cores saturate their memory, while it is faster
+everywhere else. So either port it together with temporal blocking, or fuse the
+UPML passes into the flat sweep first, or keep the SSE engine as the default for
+such models until one of the two lands.
+
+**Practical guidance:** on a PML-dominated model, with temporal blocking
+switched off, on any host whose cores can saturate its memory system,
+`--engine=multithreaded` is the better choice.
 
 ---
 
